@@ -13,7 +13,8 @@ export default defineConfig({
           index: resolve(dir, 'src/main/index.js'),
           engine: resolve(dir, 'src/main/engine.js'),
           bridge: resolve(dir, 'src/main/bridge.js'),
-          settings: resolve(dir, 'src/main/settings.js')
+          settings: resolve(dir, 'src/main/settings.js'),
+          logger: resolve(dir, 'src/main/logger.js')
         }
       }
     }

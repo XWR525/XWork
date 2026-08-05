@@ -1,10 +1,45 @@
 // preload：通过 contextBridge 向渲染进程暴露安全 API
 const { contextBridge, ipcRenderer, clipboard } = require('electron')
 
+// 渲染进程 console → 主进程日志（经 IPC 转发落盘）
+// 打包版仅转发 warn/error（避免 Vite/React 等第三方 log 噪音）；开发模式全量转发便于调试
+const IS_DEV = !!process.env.ELECTRON_RENDERER_URL
+const LOG_LEVELS = { log: 'INFO', info: 'INFO', warn: 'WARN', error: 'ERROR' }
+for (const [name, level] of Object.entries(LOG_LEVELS)) {
+  const fn = console[name]
+  if (typeof fn !== 'function') continue
+  console[name] = (...args) => {
+    if (IS_DEV || level !== 'INFO') {
+      try {
+        const text = args
+          .map((a) => {
+            if (typeof a === 'string') return a
+            if (a instanceof Error) return a.stack || String(a)
+            try {
+              return JSON.stringify(a)
+            } catch {
+              return String(a)
+            }
+          })
+          .join(' ')
+        ipcRenderer.send('log:write', { level, text })
+      } catch {
+        /* 转发失败不影响页面 */
+      }
+    }
+    fn.apply(console, args)
+  }
+}
+
 contextBridge.exposeInMainWorld('xwork', {
   engineStart: () => ipcRenderer.invoke('engine:start'),
   engineStatus: () => ipcRenderer.invoke('engine:status'),
   appInfo: () => ipcRenderer.invoke('app:info'),
+  openExternal: (url) => ipcRenderer.invoke('shell:open-external', url),
+  logOpen: () => ipcRenderer.invoke('log:open'),
+  updateCheck: () => ipcRenderer.invoke('update:check'),
+  updateDownload: () => ipcRenderer.invoke('update:download'),
+  updateInstall: () => ipcRenderer.invoke('update:install'),
   sessionList: () => ipcRenderer.invoke('session:list'),
   sessionCreate: (title, permission) => ipcRenderer.invoke('session:create', { title, permission }),
   sessionDelete: (sessionID) => ipcRenderer.invoke('session:delete', sessionID),
@@ -19,6 +54,8 @@ contextBridge.exposeInMainWorld('xwork', {
   messageAbort: (sessionID) => ipcRenderer.invoke('message:abort', sessionID),
   permissionRespond: (sessionID, permissionID, response) =>
     ipcRenderer.invoke('permission:respond', { sessionID, permissionID, response }),
+  questionReply: (requestID, answers) => ipcRenderer.invoke('question:reply', requestID, answers),
+  questionReject: (requestID) => ipcRenderer.invoke('question:reject', requestID),
   workspacePick: () => ipcRenderer.invoke('workspace:pick'),
   workspaceSwitch: (dir) => ipcRenderer.invoke('workspace:switch', dir),
   workspaceListDir: (dir) => ipcRenderer.invoke('workspace:list-dir', dir),

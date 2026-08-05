@@ -86,6 +86,28 @@ class Bridge {
     return res.ok
   }
 
+  // 回答 AI 的提问（ask 工具）：answers 为字符串数组，按问题顺序对应每题选中的选项 label
+  async answerQuestion(requestID, answers) {
+    const res = await fetch(`${this.base}/question/${requestID}/reply`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ answers })
+    })
+    if (!res.ok) {
+      console.error('[question:reply] FAILED', res.status, (await res.text()).slice(0, 200))
+    }
+    return res.ok
+  }
+
+  // 拒绝 AI 的提问（不回答，通知 AI 继续）
+  async rejectQuestion(requestID) {
+    const res = await fetch(`${this.base}/question/${requestID}/reject`, { method: 'POST' })
+    if (!res.ok) {
+      console.error('[question:reject] FAILED', res.status, (await res.text()).slice(0, 200))
+    }
+    return res.ok
+  }
+
   // 订阅全局事件流，onEvent 收到规范化后的 { type, properties }
   async watchGlobal(onEvent) {
     const res = await fetch(`${this.base}/global/event`, {

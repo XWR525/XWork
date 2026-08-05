@@ -4,6 +4,8 @@ dist/
 release/
 resources/engine/
 *.log
+# 开发模式日志目录（打包版日志在安装目录 logs/）
+logs/
 # 本地 Electron 构建缓存（115MB，clone 后按 PACKAGING.md 自行准备）
 build/electron-dist.zip
 # 开发过程中产生的 UI 截图

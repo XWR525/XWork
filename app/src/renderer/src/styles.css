@@ -342,10 +342,13 @@ body {
 }
 
 .session-item {
+  position: relative;
   padding: 10px 12px;
   border-radius: 8px;
   cursor: pointer;
-  margin-bottom: 2px;
+  /* 左侧 3px 始终占位（透明）：active 只变颜色，切换会话不会产生左右跳变 */
+  border-left: 3px solid transparent;
+  transition: border-left-color 0.22s ease, background-color 0.22s ease;
 }
 
 .session-item:hover {
@@ -354,7 +357,7 @@ body {
 
 .session-item.active {
   background: var(--panel2);
-  border-left: 3px solid var(--accent);
+  border-left-color: var(--accent);
 }
 
 .session-title {
@@ -374,25 +377,98 @@ body {
   gap: 6px;
 }
 
-.session-meta .del-btn {
+.session-meta .more-btn {
   border: none;
   background: transparent;
   color: var(--text-dim);
-  font-size: 14px;
+  font-size: 13px;
   line-height: 1;
-  padding: 0 2px;
+  padding: 0 4px;
   cursor: pointer;
   border-radius: 4px;
   visibility: hidden;
+  letter-spacing: 1px;
 }
 
-.session-item:hover .del-btn {
+.session-item:hover .more-btn,
+.session-item .more-btn.menu-open {
   visibility: visible;
 }
 
-.session-meta .del-btn:hover {
+.session-meta .more-btn:hover {
+  color: var(--text);
+  background: rgba(128, 128, 128, 0.18);
+}
+
+/* 置顶会话：显示 📌 标识，可拖动排序 */
+.session-item.pinned {
+  cursor: grab;
+}
+
+.session-item.pinned:active {
+  cursor: grabbing;
+}
+
+.pin-badge {
+  margin-right: 4px;
+}
+
+/* 拖动排序指示线：绝对定位于行间固定间隙内，不占文档流 → 出现/消失不产生列表跳变 */
+.session-row {
+  position: relative;
+  padding-bottom: 9px; /* 固定间隙 = 线总高（3px 线 + 上下各 3px） */
+}
+
+.drop-line {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--accent);
+  pointer-events: none;
+}
+
+.drop-line.before {
+  top: -6px; /* 上一行底部间隙内垂直居中 */
+}
+
+.drop-line.after {
+  bottom: 3px; /* 本行底部间隙内垂直居中 */
+}
+
+/* 会话操作菜单：fixed 定位（不随滚动容器裁剪），点击外部自动关闭 */
+.session-menu {
+  position: fixed;
+  z-index: 40;
+  min-width: 96px;
+  padding: 4px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.28);
+}
+
+.session-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.session-menu button:hover {
+  background: rgba(128, 128, 128, 0.18);
+}
+
+.session-menu button.danger {
   color: #e5484d;
-  background: rgba(229, 72, 77, 0.12);
 }
 
 .rename-input {
@@ -1608,6 +1684,95 @@ body {
   margin-bottom: 12px;
 }
 
+/* AI 提问弹窗（question.asked）：多问题可滚动，选项按钮 / 输入框二选一 */
+.question-card {
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+.q-item {
+  margin-bottom: 14px;
+}
+
+.q-item:last-child {
+  margin-bottom: 4px;
+}
+
+.q-header {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+.q-text {
+  font-size: 13px;
+  line-height: 1.55;
+  word-break: break-word;
+  margin-bottom: 8px;
+}
+
+.q-opts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.q-opt {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  text-align: left;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  background: transparent;
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.q-opt:hover {
+  border-color: var(--accent);
+}
+
+.q-opt.sel {
+  border-color: var(--accent);
+  background: rgba(79, 140, 255, 0.12);
+}
+
+/* 「其它（自行输入）」：虚线边框弱化，与预设选项区分 */
+.q-opt.other {
+  border-style: dashed;
+  color: var(--text-dim);
+}
+
+.q-opt.other:hover,
+.q-opt.other.sel {
+  color: var(--text);
+}
+
+.q-opt-desc {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.q-input {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel2);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+}
+
+.q-input:focus {
+  border-color: var(--accent);
+}
+
 .perm-desc {
   color: var(--text-dim);
   margin-bottom: 10px;
@@ -1850,6 +2015,54 @@ body {
   margin-bottom: 12px;
 }
 
+/* 应用名 + 版本垂直堆叠 */
+.about-id {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* 右侧检查更新控件：靠右对齐，状态文本与按钮紧凑 */
+.about-update {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+}
+
+.about-update-btn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.about-update-btn:hover {
+  background: rgba(128, 128, 128, 0.15);
+  border-color: var(--accent);
+}
+
+.about-update-btn.accent {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.about-update-btn.accent:hover {
+  background: var(--accent);
+  opacity: 0.9;
+}
+
+.about-update-hint {
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
 .about-logo {
   width: 48px;
   height: 48px;
@@ -1899,6 +2112,29 @@ body {
 .about-row span:last-child {
   color: var(--text);
   font-variant-numeric: tabular-nums;
+}
+
+.about-link {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  padding: 8px 0;
+  font-size: 13px;
+  color: var(--accent);
+  background: none;
+  border: none;
+  border-bottom: 1px dashed var(--border);
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.about-link:last-child {
+  border-bottom: none;
+}
+
+.about-link:hover {
+  color: var(--text);
 }
 
 /* 模型组卡片：一个 OpenAI 兼容 URL + 多个模型 ID */

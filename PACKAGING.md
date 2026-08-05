@@ -70,9 +70,56 @@ npm run build:dist
 1. `electron-vite build` 构建渲染层/主进程/预加载到 `out/`
 2. 图标 `build/icon.ico` 存在则跳过生成
 3. 从 npm 全局 `opencode-ai` 安装目录探测 `opencode.exe` 并复制到 `resources/engine/`（环境变量 `XWORK_OPENCODE_PATH` 可显式指定来源）
-4. `electron-builder --win nsis` 产出安装包到 `release/`
+4. `electron-builder --win nsis`（默认 `--publish never`，仅本地产出，不上传）生成安装包到 `release/`
 
 任一步失败脚本立即中止（非零退出码）。
+
+## 发布到 GitHub Releases（供「检查更新」使用）
+
+应用内置的「检查更新」（electron-updater）通过 GitHub Releases 读取 `latest.yml` 元数据并下载新安装包。因此**每次发新版本都要把产物发布到 Releases**。
+
+### 前置：GitHub Token
+
+- GitHub → Settings → Developer settings → Personal access tokens 创建 token
+- 权限：Classic token 勾选 `repo`；或 Fine-grained token 授予仓库 `Contents: Read and write`
+- 在发布终端设置环境变量（或 `setx GH_TOKEN "..."` 永久写入后重开终端）：
+
+```powershell
+$env:GH_TOKEN = "你的token"
+```
+
+### 发布步骤
+
+1. 修改 `app/package.json` 的 `version`（如 `0.2.0`）
+2. 发布打包（自动上传安装包 + blockmap + latest.yml 到 GitHub Releases）：
+
+```powershell
+cd app
+$env:GH_TOKEN = "你的token"
+$env:XWORK_PUBLISH = "always"
+npm run build:dist
+```
+
+- electron-builder 自动创建（或复用）tag `v0.2.0` 的 Release 并上传资产；同一版本不要重复发布（已存在则报 422/追加失败）
+- 产物对应关系：
+
+| Release 资产 | 客户端用途 |
+| --- | --- |
+| `XWork-Installer-0.2.0.exe` | 下载并安装的新版本安装包 |
+| `XWork-Installer-0.2.0.exe.blockmap` | 差分更新（只下载差异部分，加速更新） |
+| `latest.yml` | 更新元数据，客户端检查更新时读取 |
+
+3. 打开 GitHub Releases 页，编辑该版本的更新说明
+
+### 版本对比规则
+
+- tag 统一命名 `v<版本号>`（electron-updater 会自动去掉 `v` 前缀对比版本）
+- 仅当 Release tag 版本**高于**已安装版本时，客户端「检查更新」才会提示
+
+### 验证发布
+
+- GitHub Releases 页能看到新 Release 与三个资产
+- 已安装旧版本的应用 → 设置 → 关于 → 检查更新 → 发现新版本 → 立即下载 → 重启并安装（向导式安装器会弹出安装界面，属正常）
 
 ## 验证
 
@@ -92,5 +139,6 @@ npm run build:dist
 | 打包卡在 "unpacking default Electron distribution" | `npm install -D app-builder-bin` 补充二进制依赖 |
 | 下载超时（got 600s / 网络停滞） | 确认 `app/build/electron-dist.zip` 存在（已指向本地 zip）；或开代理后重跑 |
 | 提示找不到 opencode.exe | 设置环境变量 `XWORK_OPENCODE_PATH` 指向 opencode.exe 后重跑 |
-| 日志出现 "Implicit publishing triggered by CI detection" 警告 | 无碍，可忽略 |
+| 打包报 `GitHub Personal Access Token is not set` | 本地产包误设了 `XWORK_PUBLISH=always`（默认 never 不需要 token）；若确要发布，按上文配置 `GH_TOKEN` |
+| 发布报 422（release 已存在） | 该版本已发布过；需提升 `version` 或删除旧 Release 对应 tag 后重试 |
 | `npm prefix -w` exited code=1 | 无碍，可忽略 |

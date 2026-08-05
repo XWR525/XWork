@@ -58,6 +58,9 @@ fs.copyFileSync(srcExe, dstExe)
 console.log('==> opencode.exe 已复制: ' + srcExe + ' → ' + dstExe + ' (' + Math.round(fs.statSync(dstExe).size / 1024 / 1024) + ' MB)')
 
 // 4. electron-builder 产出 NSIS 安装包（产物在 release/）
-run('npx', ['electron-builder', '--win', 'nsis'], 'electron-builder 打包（首次会下载 Electron/NSIS，需联网）')
+// 默认 --publish never：本地构建不上传 GitHub Release（避免 CI 检测触发隐式发布而要求 GH_TOKEN）；
+// latest.yml 更新元数据仍会生成。发布到 GitHub 时设置环境变量 XWORK_PUBLISH=always（并配置 GH_TOKEN）
+const publishFlag = process.env.XWORK_PUBLISH === 'always' ? 'always' : 'never'
+run('npx', ['electron-builder', '--win', 'nsis', '--publish', publishFlag], 'electron-builder 打包（首次会下载 Electron/NSIS，需联网）')
 
 console.log('\n==> 打包完成，安装包位于 app/release/')

@@ -5,6 +5,10 @@ const fs = require('node:fs')
 const { Engine } = require('./engine')
 const { Bridge } = require('./bridge')
 const { Settings, applyToOpencode } = require('./settings')
+const logger = require('./logger')
+
+// 尽早初始化文件日志：补丁 console 后，后续所有主进程输出同时落盘
+logger.init()
 
 let win = null
 let engine = null
@@ -70,10 +74,40 @@ function startGlobalWatch() {
   loop()
 }
 
+// 从启动方式解析「以该文件夹为工作区」：
+// 1) 显式参数：xwork "D:\folder"（多段路径以引号包裹）
+// 2) cwd 检测：资源管理器地址栏/命令行启动时进程 cwd 即当前文件夹（跳过 dev、系统目录、安装目录）
+function resolveLaunchDir() {
+  const isDev = !!process.env.ELECTRON_RENDERER_URL
+  for (const a of process.argv.slice(1)) {
+    if (a === '--' || a.startsWith('-')) continue
+    try {
+      if (fs.statSync(a).isDirectory()) return a
+    } catch {
+      /* 非目录参数忽略 */
+    }
+  }
+  if (isDev) return null
+  try {
+    const cwd = process.cwd()
+    if (!fs.statSync(cwd).isDirectory()) return null
+    const sysRoot = (process.env.SystemRoot || 'C:\\Windows').toLowerCase()
+    const installDir = path.dirname(process.execPath).toLowerCase()
+    const c = cwd.toLowerCase()
+    if (c.startsWith(sysRoot) || c === installDir) return null
+    return cwd
+  } catch {
+    return null
+  }
+}
+
 app.whenReady().then(async () => {
+  const launchDir = resolveLaunchDir()
+  const cfg = settings.load()
+  if (launchDir && launchDir !== cfg.workspace) settings.save({ workspace: launchDir })
   engine = new Engine({
     xdgHome,
-    cwd: settings.load().workspace || null, // 工作区（上次打开/默认启动目录）
+    cwd: launchDir || cfg.workspace || null, // 工作区（地址栏启动目录 > 上次打开 > 默认启动目录）
     extraEnv: () => settings.env(), // 注入模型 API Key 环境变量
     onExit: (code) => {
       if (win && !win.isDestroyed()) {
@@ -116,6 +150,93 @@ ipcMain.handle('app:info', () => ({
   node: process.versions.node,
   platform: `${process.platform} ${process.arch}`
 }))
+
+// 渲染进程日志转发（preload 补丁 console 后经此写入主进程日志文件）
+ipcMain.on('log:write', (_e, { level, text }) => {
+  if (typeof text !== 'string' || !['INFO', 'WARN', 'ERROR'].includes(level)) return
+  logger.renderer(level, text)
+})
+
+// 在文件资源管理器中打开日志目录（设置页「日志」按钮）
+ipcMain.handle('log:open', async () => {
+  const dir = logger.dir()
+  if (!dir) return { ok: false }
+  const err = await shell.openPath(dir)
+  return err ? { ok: false } : { ok: true }
+})
+
+// 用系统默认浏览器打开外部链接（仅允许 http/https，防止打开本地文件等危险协议）
+ipcMain.handle('shell:open-external', async (_e, url) => {
+  if (typeof url !== 'string') return
+  try {
+    const u = new URL(url)
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return
+    await shell.openExternal(url)
+  } catch {
+    /* 忽略无效 URL */
+  }
+})
+
+// ===== 自动更新（electron-updater，仅打包版启用） =====
+let updater = null
+
+// 开发模式无 app-update.yml 且不宜联网检查，故仅打包版初始化
+if (app.isPackaged) {
+  const { autoUpdater } = require('electron-updater')
+  updater = autoUpdater
+  updater.autoDownload = false // 检测到新版本后由用户在 UI 点击「立即下载」，避免静默占用带宽
+  updater.logger = logger.updaterLogger() // 更新日志写入 logs/updater.log，便于排查更新问题
+  for (const evt of [
+    'checking-for-update',
+    'update-available',
+    'update-not-available',
+    'download-progress',
+    'update-downloaded',
+    'error'
+  ]) {
+    updater.on(evt, (data) => sendUpdateEvent(evt, data))
+  }
+}
+
+// 更新事件经现有 engine:event 通道推送渲染层（type 为 update.*，供设置页展示）
+function sendUpdateEvent(evt, data) {
+  if (!win || win.isDestroyed()) return
+  let properties = {}
+  if (evt === 'update-available' || evt === 'update-downloaded') {
+    properties = { version: data?.version }
+  } else if (evt === 'download-progress') {
+    properties = { percent: data?.percent ?? 0 }
+  } else if (evt === 'error') {
+    properties = { message: data?.message || String(data || '未知错误') }
+  }
+  win.webContents.send('engine:event', { type: `update.${evt}`, properties })
+}
+
+ipcMain.handle('update:check', async () => {
+  if (!updater) return { ok: false, disabled: true }
+  try {
+    await updater.checkForUpdates()
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, error: e.message || '检查更新失败' }
+  }
+})
+
+ipcMain.handle('update:download', async () => {
+  if (!updater) return { ok: false, disabled: true }
+  try {
+    await updater.downloadUpdate()
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, error: e.message || '下载更新失败' }
+  }
+})
+
+ipcMain.handle('update:install', () => {
+  if (!updater) return { ok: false, disabled: true }
+  updater.quitAndInstall()
+  return { ok: true }
+})
 
 // 选择工作区文件夹（系统目录选择对话框）
 ipcMain.handle('workspace:pick', async () => {
@@ -237,6 +358,28 @@ ipcMain.handle('message:abort', (_e, sessionID) => bridge.abortMessage(sessionID
 ipcMain.handle('permission:respond', (_e, { sessionID, permissionID, response }) =>
   bridge.respondPermission(sessionID, permissionID, response)
 )
+
+// 回答 AI 的提问（ask 工具）：answers 为每题答案的字符串数组
+ipcMain.handle('question:reply', async (_e, requestID, answers) => {
+  try {
+    if (!requestID || !Array.isArray(answers)) return { ok: false, error: '参数无效' }
+    await bridge.answerQuestion(requestID, answers)
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, error: e.message }
+  }
+})
+
+// 拒绝 AI 的提问（不回答，让 AI 继续）
+ipcMain.handle('question:reject', async (_e, requestID) => {
+  try {
+    if (!requestID) return { ok: false, error: '参数无效' }
+    await bridge.rejectQuestion(requestID)
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, error: e.message }
+  }
+})
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()

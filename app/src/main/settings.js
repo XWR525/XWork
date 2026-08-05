@@ -31,12 +31,15 @@ const DEFAULT_SETTINGS = {
     webfetch: 'allow',
     websearch: 'allow',
     task: 'allow',
-    external_directory: 'ask'
+    external_directory: 'ask',
+    question: 'ask'
   }
 }
 
 // 权限类型白名单：仅接受这些 key 的用户配置；其余类型由渲染层固定处理（内部低风险 allow / doom_loop ask）
 const PERMISSION_KEYS = Object.keys(DEFAULT_SETTINGS.permission)
+// 内部低风险权限类型固定放行（与渲染层 App.jsx 的 INTERNAL_ALLOW_PERMS 保持一致，需同步修改）
+const INTERNAL_ALLOW_PERMS = ['todowrite', 'todoread', 'skill', 'lsp', 'codesearch']
 const PERMISSION_ACTIONS = ['allow', 'ask', 'deny']
 
 // 校验并归一化权限配置：只保留合法 key 与合法取值，缺失项回退默认
@@ -111,7 +114,7 @@ class Settings {
       }
       if (raw.deepseek.model !== undefined) s.deepseek.model = raw.deepseek.model
     }
-    // 权限策略：校验归一化后整体替换（10 项齐全，缺失项回退默认）
+    // 权限策略：校验归一化后整体替换（11 项齐全，缺失项回退默认）
     if (raw.permission !== undefined) s.permission = sanitizePermission(raw.permission)
     // 模型组整体同步：新增/编辑/删除均以 raw.modelGroups 为准
     if (Array.isArray(raw.modelGroups)) {
@@ -206,6 +209,13 @@ function applyToOpencode(configFile, settings) {
       }
     }
   }
+  // 权限规则写入全局 permission：设置页 11 项 + 内部固定项 + doom_loop
+  // 新会话不再携带权限快照，引擎统一按此处全局规则判断；修改设置并重启引擎后即时生效
+  const permission = {}
+  for (const k of PERMISSION_KEYS) permission[k] = s.permission?.[k] || 'ask'
+  for (const k of INTERNAL_ALLOW_PERMS) permission[k] = 'allow'
+  permission.doom_loop = 'ask'
+  cfg.permission = permission
   fs.mkdirSync(path.dirname(configFile), { recursive: true })
   fs.writeFileSync(configFile, JSON.stringify(cfg, null, 2))
 }

@@ -37,26 +37,27 @@ const PERMISSION_ITEMS = [
   { key: 'webfetch', label: '网页抓取', desc: '抓取指定网页内容' },
   { key: 'websearch', label: '联网搜索', desc: '搜索互联网获取信息' },
   { key: 'task', label: '子任务', desc: 'AI 启动子 Agent 并行处理' },
-  { key: 'external_directory', label: '工作区外访问', desc: '访问当前工作区之外的路径' }
+  { key: 'external_directory', label: '工作区外访问', desc: '访问当前工作区之外的路径' },
+  { key: 'question', label: '向用户提问', desc: 'AI 主动向你提问，等待你的回答' }
 ]
-const PERMISSION_KEYS = PERMISSION_ITEMS.map((x) => x.key)
 
 // 预设档位：严格（全确认） / 标准（只读放行，改动确认） / 宽松（全部放行）
 const PERMISSION_PRESETS = {
-  严格: { read: 'ask', edit: 'ask', bash: 'ask', glob: 'ask', grep: 'ask', list: 'ask', webfetch: 'ask', websearch: 'ask', task: 'ask', external_directory: 'ask' },
-  标准: { read: 'allow', edit: 'ask', bash: 'ask', glob: 'allow', grep: 'allow', list: 'allow', webfetch: 'allow', websearch: 'allow', task: 'allow', external_directory: 'ask' },
-  宽松: { read: 'allow', edit: 'allow', bash: 'allow', glob: 'allow', grep: 'allow', list: 'allow', webfetch: 'allow', websearch: 'allow', task: 'allow', external_directory: 'allow' }
+  严格: { read: 'ask', edit: 'ask', bash: 'ask', glob: 'ask', grep: 'ask', list: 'ask', webfetch: 'ask', websearch: 'ask', task: 'ask', external_directory: 'ask', question: 'ask' },
+  标准: { read: 'allow', edit: 'ask', bash: 'ask', glob: 'allow', grep: 'allow', list: 'allow', webfetch: 'allow', websearch: 'allow', task: 'allow', external_directory: 'ask', question: 'ask' },
+  宽松: { read: 'allow', edit: 'allow', bash: 'allow', glob: 'allow', grep: 'allow', list: 'allow', webfetch: 'allow', websearch: 'allow', task: 'allow', external_directory: 'allow', question: 'allow' }
 }
 
 // 设置页不展示的内部类型：低风险固定放行；doom_loop 保留防死循环询问
-const INTERNAL_ALLOW_PERMS = ['question', 'todowrite', 'todoread', 'skill', 'lsp', 'codesearch']
+// （与主进程 settings.js 的 INTERNAL_ALLOW_PERMS 保持一致，需同步修改）
+const INTERNAL_ALLOW_PERMS = ['todowrite', 'todoread', 'skill', 'lsp', 'codesearch']
 
-// 权限配置对象 → opencode 会话规则数组（显式覆盖全部类型，未列出的类型会回退 ask 导致频繁确认）
-function buildPermissionArray(perm) {
-  const arr = PERMISSION_KEYS.map((k) => ({ permission: k, pattern: '*', action: perm?.[k] || 'ask' }))
-  for (const k of INTERNAL_ALLOW_PERMS) arr.push({ permission: k, pattern: '*', action: 'allow' })
-  arr.push({ permission: 'doom_loop', pattern: '*', action: 'ask' })
-  return arr
+// 权限类型 → 当前全局设置的动作（自动应答兜底与全局规则共用同一规则源）
+// 内部低风险固定 allow；doom_loop 固定 ask；其余按已保存设置，缺失回退 ask
+function globalPermAction(key, permCfg) {
+  if (INTERNAL_ALLOW_PERMS.includes(key)) return 'allow'
+  if (key === 'doom_loop') return 'ask'
+  return (permCfg && permCfg[key]) || 'ask'
 }
 
 // 文件树中默认隐藏的常见大目录/无关文件（避免误操作与列表冗长）
@@ -109,10 +110,12 @@ function normalize(list) {
   }))
 }
 
-function fmtTime(ts) {
+// 会话时间显示：MM-DD HH:MM（跨年仍只显示月日，足够区分活跃度）
+function fmtDateTime(ts) {
   if (!ts) return ''
   const d = new Date(ts)
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  const p = (n) => String(n).padStart(2, '0')
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
 const STATUS_LABEL = { pending: '等待', running: '执行中', completed: '完成', error: '失败' }
@@ -122,12 +125,29 @@ export default function App() {
   const [engineError, setEngineError] = useState('')
   const [sessions, setSessions] = useState([])
   const [currentID, setCurrentID] = useState(null)
+  // 置顶会话顺序：数组最前 = 显示最上；后置顶的 unshift 到最前；localStorage 持久化
+  const [pinnedOrder, setPinnedOrder] = useState(() => {
+    try {
+      const raw = JSON.parse(localStorage.getItem('xwork-pinned') || '[]')
+      return Array.isArray(raw) ? raw : []
+    } catch {
+      return []
+    }
+  })
+  const [menu, setMenu] = useState(null) // 会话操作菜单：{ sid, x, y }，null = 关闭
+  const dragIdRef = useRef(null) // 拖拽排序中的会话 id
+  const [dropPos, setDropPos] = useState(null) // 拖动时指示线的插入位置（置顶区索引，null = 无指示）
+  const pinItemRefs = useRef(new Map()) // 置顶会话项 DOM 引用（id -> node），用于拖动时坐标定位
   const [messages, setMessages] = useState([])
   const [busy, setBusy] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [input, setInput] = useState('')
   const [perm, setPerm] = useState(null) // 待处理的权限请求
   const [confirm, setConfirm] = useState(null) // 项目风格确认框 {title, message, danger?, confirmLabel?, onConfirm}
+  const [question, setQuestion] = useState(null) // AI 提问 {id, sessionID, questions[]}
+  const [qSel, setQSek] = useState([]) // 每题选中的选项 label（string[][]）
+  const [qText, setQText] = useState([]) // 每题输入框草稿（string[]）
+  const [qOther, setQOther] = useState([]) // 每题「其它（自行输入）」是否激活（boolean[]）
   const [templateActive, setTemplateActive] = useState(null) // 当前展开的模板 id
   const [templateTopic, setTemplateTopic] = useState('') // 模板表单输入
   const [toast, setToast] = useState('') // 操作提示
@@ -135,6 +155,8 @@ export default function App() {
   const [editingTitle, setEditingTitle] = useState('')
   const [settingsOpen, setSettingsOpen] = useState(false) // 设置面板
   const [settingsData, setSettingsData] = useState(null) // 脱敏后的设置
+  // 已保存的权限配置（自动应答兜底用）：onEvent 回调是 [ ] 闭包，必须经 ref 读取最新值
+  const permCfgRef = useRef(null)
   const [appInfo, setAppInfo] = useState(null) // 应用版本信息（「关于」面板）
   const [theme, setTheme] = useState('dark') // 界面主题：dark | light
   const [modelSel, setModelSel] = useState(null) // 当前会话选择的模型 {providerID, modelID}，null = 引擎默认
@@ -435,7 +457,7 @@ export default function App() {
           break
         }
         case 'permission.asked': {
-          // 模板会话的联网只读权限自动放行（如调研模板的 webfetch/websearch）
+          // 1) 模板会话的 autoApprove 白名单优先（如调研模板的联网只读操作）
           const allowed = autoSessions.current.get(p.sessionID)
           console.log('[perm.asked]', p.sessionID, p.permission, 'autoList=', JSON.stringify(allowed))
           if (allowed && allowed.includes(p.permission)) {
@@ -444,8 +466,33 @@ export default function App() {
               .then((ok) => console.log('[perm.asked] respond result:', ok))
               .catch((e) => console.error('[perm.asked] respond failed:', e.message))
           } else {
-            setPerm(p)
+            // 2) 全局权限兜底：历史会话仍按创建时策略弹 ask，此处按当前已保存的全局设置自动处理
+            // （新会话无权限快照，引擎按全局规则直接判断，不会走到这里）
+            const action = globalPermAction(p.permission, permCfgRef.current)
+            if (action === 'allow') {
+              console.log('[perm.asked] global allow, auto-approving', p.id)
+              api.permissionRespond(p.sessionID, p.id, 'once')
+                .then((ok) => console.log('[perm.asked] respond result:', ok))
+                .catch((e) => console.error('[perm.asked] respond failed:', e.message))
+            } else if (action === 'deny') {
+              console.log('[perm.asked] global deny, auto-rejecting', p.id)
+              api.permissionRespond(p.sessionID, p.id, 'reject')
+                .then((ok) => console.log('[perm.asked] respond result:', ok))
+                .catch((e) => console.error('[perm.asked] respond failed:', e.message))
+            } else {
+              setPerm(p)
+            }
           }
+          break
+        }
+        case 'question.asked': {
+          // AI 主动提问（ask 工具）：展示问题/选项弹窗，回答经 /question/{id}/reply 提交
+          console.log('[question.asked]', p.sessionID, JSON.stringify(p.questions || []).slice(0, 200))
+          const qs = p.questions || []
+          setQuestion({ id: p.id, sessionID: p.sessionID, questions: qs })
+          setQSek(qs.map(() => []))
+          setQText(qs.map(() => ''))
+          setQOther(qs.map(() => false))
           break
         }
         case 'engine.exited': {
@@ -579,9 +626,9 @@ export default function App() {
     let sid = currentID
     try {
       if (!sid) {
-        // 新会话采用设置页配置的权限策略（settingsData 未就绪时回退标准档）
-        const permCfg = (settingsData && settingsData.permission) || PERMISSION_PRESETS.标准
-        const created = await api.sessionCreate(text.slice(0, 24) || '新对话', buildPermissionArray(permCfg))
+        // 新会话不再携带权限快照：权限由引擎全局配置（opencode.json permission）统一判断，
+        // 修改权限设置并重启引擎后对所有会话生效；历史会话的兜底处理见 permission.asked
+        const created = await api.sessionCreate(text.slice(0, 24) || '新对话')
         sid = created.id
         setCurrentID(sid)
         refreshSessions()
@@ -652,6 +699,64 @@ export default function App() {
     setPerm(null)
   }
 
+  // 切换某题的选项选中状态（单选互斥，多选可多选）；点击预设选项时退出「其它」模式
+  const toggleQOption = (qi, label) => {
+    const multiple = question?.questions?.[qi]?.multiple
+    setQSek((cur) => {
+      const arr = cur[qi] ? [...cur[qi]] : []
+      const i = arr.indexOf(label)
+      if (i >= 0) arr.splice(i, 1)
+      else if (multiple) arr.push(label)
+      else return cur.map((a, j) => (j === qi ? [label] : a))
+      return cur.map((a, j) => (j === qi ? arr : a))
+    })
+    if (qOther[qi]) {
+      setQOther((cur) => cur.map((v, j) => (j === qi ? false : v)))
+      setQText((cur) => cur.map((v, j) => (j === qi ? '' : v)))
+    }
+  }
+
+  // 切换某题的「其它（自行输入）」：激活时清空已选选项；退出时清空输入草稿
+  const toggleQOther = (qi) => {
+    if (!qOther[qi]) {
+      setQSek((cur) => cur.map((a, j) => (j === qi ? [] : a)))
+    } else {
+      setQText((cur) => cur.map((v, j) => (j === qi ? '' : v)))
+    }
+    setQOther((cur) => cur.map((v, j) => (j === qi ? !v : v)))
+  }
+
+  // 提交 AI 提问的回答：每题生成答案数组（「其它」取输入文本；否则选项取选中 label），按题序汇总
+  const submitQuestion = async () => {
+    if (!question) return
+    const answers = question.questions.map((q, i) => {
+      if (qOther[i]) {
+        const t = (qText[i] || '').trim()
+        return t ? [t] : []
+      }
+      if ((q.options || []).length) return qSel[i] || []
+      const t = (qText[i] || '').trim()
+      return t ? [t] : []
+    })
+    if (!answers.some((a) => a.length)) return
+    const r = await api.questionReply(question.id, answers)
+    if (r.ok) setQuestion(null)
+    else setToast('提交回答失败: ' + (r.error || ''))
+  }
+
+  // 拒绝/取消 AI 的提问（不回答，让 AI 继续）
+  const cancelQuestion = async () => {
+    const q = question
+    setQuestion(null)
+    if (!q) return
+    try {
+      const r = await api.questionReject(q.id)
+      if (!r.ok) setToast('操作失败: ' + (r.error || ''))
+    } catch (e) {
+      setToast('操作失败: ' + e.message)
+    }
+  }
+
   // 复制消息文本到剪贴板
   const copyText = async (md) => {
     try {
@@ -691,7 +796,10 @@ export default function App() {
   // quiet=true：启动期引擎可能尚未就绪，失败属预期，静默等 server.connected 重试
   const loadModels = async (quiet = false) => {
     try {
-      setSettingsData(await api.getSettings())
+      const data = await api.getSettings()
+      setSettingsData(data)
+      // 同步权限配置到 ref（自动应答兜底实时读取）
+      permCfgRef.current = (data && data.permission) || PERMISSION_PRESETS.标准
     } catch (e) {
       console.error('load models failed', e)
       if (!quiet) setToast('加载设置失败: ' + e.message)
@@ -704,6 +812,22 @@ export default function App() {
     // 应用版本信息为静态数据，启动时加载一次
     api.appInfo().then(setAppInfo).catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // 置顶顺序持久化到 localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem('xwork-pinned', JSON.stringify(pinnedOrder))
+    } catch {
+      /* 存储不可用时忽略（置顶仅本次会话有效） */
+    }
+  }, [pinnedOrder])
+
+  // 点击页面任意处关闭会话操作菜单（菜单内点击已 stopPropagation）
+  useEffect(() => {
+    const close = () => setMenu(null)
+    window.addEventListener('click', close)
+    return () => window.removeEventListener('click', close)
   }, [])
 
   // 打开设置：刷新数据后展示面板
@@ -767,9 +891,75 @@ export default function App() {
     }
   }
 
-  // 会话-工作区一一对应：仅显示当前工作区创建的会话（directory 由 opencode 创建时记录）
-  // 工作区未就绪时为空，避免闪出其它工作区的历史会话
-  const visibleSessions = workspace ? sessions.filter((s) => normDir(s.directory) === normDir(workspace)) : []
+  // 会话列表排序：置顶区（按置顶顺序，不动）在前；普通区按「最新回复时间」降序，回复过的排上面
+  const byUpdatedDesc = (a, b) => (b.time?.updated || b.time?.created || 0) - (a.time?.updated || a.time?.created || 0)
+  const pinnedList = pinnedOrder.map((id) => sessions.find((s) => s.id === id)).filter(Boolean)
+  const normalList = sessions.filter((s) => !pinnedOrder.includes(s.id)).sort(byUpdatedDesc)
+  const orderedSessions = [...pinnedList, ...normalList]
+  const visibleSessions = workspace
+    ? orderedSessions.filter((s) => normDir(s.directory) === normDir(workspace))
+    : orderedSessions
+
+  // 拖拽排序语义（与 onScrollDragOver 坐标计算一致）：插入位置基于「剔除拖拽项后的置顶列表」
+  const dragIdx = dragIdRef.current != null ? pinnedOrder.indexOf(dragIdRef.current) : -1
+  const finalCount = pinnedOrder.filter((id, i) => i !== dragIdx && pinItemRefs.current.get(id)).length
+
+  // 置顶 / 取消置顶：后置顶的排最前；取消后回到按回复时间排序的普通区
+  const togglePin = (sid) => {
+    setPinnedOrder((prev) => (prev.includes(sid) ? prev.filter((id) => id !== sid) : [sid, ...prev]))
+    setMenu(null)
+  }
+
+  // 置顶会话拖动排序：拖动时仅在目标位置显示指示线（dropPos），松开鼠标（drop）后才真正移动
+  const onDragStart = (e, sid) => {
+    dragIdRef.current = sid
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', sid)
+    setDropPos(0) // 起始默认指示在最前
+  }
+  // 容器统一计算插入位置：按鼠标 Y 与各置顶项中线的相对位置判断，
+  // 与 dragover 的 target 元素无关 → 卡片间隙/空白/普通区微动不会产生跳变
+  const onScrollDragOver = (e) => {
+    const dragging = dragIdRef.current
+    if (!dragging) return
+    e.preventDefault() // 允许 drop
+    const items = pinnedOrder
+      .filter((id) => id !== dragging)
+      .map((id) => ({ id, el: pinItemRefs.current.get(id) }))
+      .filter((x) => x.el)
+    if (!items.length) {
+      setDropPos(0)
+      return
+    }
+    const y = e.clientY
+    let insertAt = items.length // 默认末尾
+    for (let i = 0; i < items.length; i++) {
+      const rect = items[i].el.getBoundingClientRect()
+      if (y < rect.top + rect.height / 2) {
+        insertAt = i
+        break
+      }
+    }
+    setDropPos(insertAt)
+  }
+  const onDrop = (e) => {
+    e.preventDefault()
+    const dragging = dragIdRef.current
+    if (dragging && dropPos !== null) {
+      setPinnedOrder((prev) => {
+        if (!prev.includes(dragging)) return prev
+        const next = prev.filter((id) => id !== dragging)
+        next.splice(Math.min(dropPos, next.length), 0, dragging)
+        return next
+      })
+    }
+    dragIdRef.current = null
+    setDropPos(null)
+  }
+  const onDragEnd = () => {
+    dragIdRef.current = null
+    setDropPos(null)
+  }
 
   // 任务执行面板：按时间顺序提取所有工具调用
   const toolSteps = []
@@ -910,7 +1100,7 @@ export default function App() {
       <div className="body">
         <aside className="sidebar">
           <button className="new-btn" onClick={newChat}>
-            ＋ 新对话
+            🗨️ 新对话
           </button>
           <div className="side-tabs">
             <button
@@ -923,7 +1113,7 @@ export default function App() {
               className={`side-tab ${sideTab === 'files' ? 'active' : ''}`}
               onClick={() => setSideTab('files')}
             >
-              📁 文件
+              📁 工作区
             </button>
           </div>
 
@@ -939,13 +1129,37 @@ export default function App() {
                 </span>
               </div>
               {/* key 随工作区变化：切换后新列表重挂载，触发淡入上滑动画 */}
-              <div className="session-scroll" key={workspace || 'none'}>
-              {visibleSessions.map((s) => (
-                <div
-                  key={s.id}
-                  className={`session-item ${s.id === currentID ? 'active' : ''}`}
-                  onClick={() => loadSession(s.id)}
-                >
+              <div
+                className="session-scroll"
+                key={workspace || 'none'}
+                onDragOver={onScrollDragOver}
+                onDrop={onDrop}
+              >
+              {visibleSessions.map((s) => {
+                // 该项在「剔除拖拽项后的置顶列表」中的位置；dropPos 与之同语义
+                const origIdx = pinnedOrder.indexOf(s.id)
+                const finalIdx =
+                  origIdx !== -1 && origIdx !== dragIdx ? origIdx - (dragIdx >= 0 && dragIdx < origIdx ? 1 : 0) : -1
+                // 指示线位置：finalIdx === dropPos 插到该项上方；dropPos 为末尾时插到最后一个置顶项下方
+                const lineBefore = dropPos !== null && finalIdx === dropPos
+                const lineAfter = dropPos !== null && finalIdx === finalCount - 1 && dropPos === finalCount
+                return (
+                    <div
+                      key={s.id}
+                      className="session-row"
+                      ref={(el) => {
+                        if (el) pinItemRefs.current.set(s.id, el)
+                        else pinItemRefs.current.delete(s.id)
+                      }}
+                    >
+                    {lineBefore && <div className="drop-line before" />}
+                    <div
+                      className={`session-item ${s.id === currentID ? 'active' : ''} ${pinnedOrder.includes(s.id) ? 'pinned' : ''}`}
+                      draggable={pinnedOrder.includes(s.id)}
+                      onDragStart={(e) => onDragStart(e, s.id)}
+                      onDragEnd={onDragEnd}
+                      onClick={() => loadSession(s.id)}
+                    >
                   {editingID === s.id ? (
                     <input
                       className="rename-input"
@@ -971,24 +1185,49 @@ export default function App() {
                         setEditingTitle(s.title || s.slug || '')
                       }}
                     >
+                      {pinnedOrder.includes(s.id) && <span className="pin-badge">📌</span>}
                       {s.title || s.slug || '未命名'}
                     </div>
                   )}
                   <div className="session-meta">
-                    <span>{fmtTime(s.time?.created)}</span>
+                    <span title="最新回复时间">{fmtDateTime(s.time?.updated || s.time?.created)}</span>
                     <button
-                      className="del-btn"
-                      title="删除会话"
+                      className={`more-btn ${menu && menu.sid === s.id ? 'menu-open' : ''}`}
+                      title="更多操作"
                       onClick={(e) => {
                         e.stopPropagation()
-                        removeSession(s.id)
+                        const rect = e.currentTarget.getBoundingClientRect()
+                        setMenu({ sid: s.id, x: rect.right - 104, y: rect.bottom + 4 })
                       }}
                     >
-                      ×
+                      ⋯
                     </button>
                   </div>
+                  {menu && menu.sid === s.id && (
+                    <div
+                      className="session-menu"
+                      style={{ left: menu.x, top: menu.y }}
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <button onClick={() => togglePin(s.id)}>
+                        {pinnedOrder.includes(s.id) ? '取消置顶' : '置顶'}
+                      </button>
+                      <button
+                        className="danger"
+                        onClick={() => {
+                          setMenu(null)
+                          removeSession(s.id)
+                        }}
+                      >
+                        删除
+                      </button>
+                    </div>
+                  )}
+                  </div>
+                  {lineAfter && <div className="drop-line after" />}
                 </div>
-              ))}
+                )
+              })}
               {visibleSessions.length === 0 && (
                 <div className="empty-hint">
                   {sessions.length === 0 ? '暂无会话' : '当前工作区暂无会话'}
@@ -1210,7 +1449,8 @@ export default function App() {
           <div className="perm-card">
             <div className="perm-title">需要你的确认</div>
             <div className="perm-desc">
-              AI 想要执行操作：<code>{perm.permission}</code>
+              AI 想要执行操作：
+              <code>{PERMISSION_ITEMS.find((x) => x.key === perm.permission)?.label || perm.permission}</code>
             </div>
             {perm.metadata?.command ? (
               // 实际命令最精确：bash 等权限的 patterns 内容就是命令本身，与 command 重复，只显示 command
@@ -1231,6 +1471,79 @@ export default function App() {
               <button onClick={() => respondPerm('once')}>允许一次</button>
               <button className="primary" onClick={() => respondPerm('always')}>
                 总是允许
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {question && (
+        <div className="perm-mask">
+          <div className="perm-card question-card">
+            <div className="perm-title">AI 向你提问</div>
+            {question.questions.map((q, i) => {
+              const opts = q.options || []
+              return (
+                <div className="q-item" key={i}>
+                  {q.header && <div className="q-header">{q.header}</div>}
+                  <div className="q-text">{q.question}</div>
+                  {opts.length > 0 ? (
+                    <div className="q-opts">
+                      {opts.map((o) => {
+                        const sel = (qSel[i] || []).includes(o.label)
+                        return (
+                          <button
+                            key={o.label}
+                            className={'q-opt' + (sel ? ' sel' : '')}
+                            onClick={() => toggleQOption(i, o.label)}
+                          >
+                            <span className="q-opt-label">{o.label}</span>
+                            {o.description && <span className="q-opt-desc">{o.description}</span>}
+                          </button>
+                        )
+                      })}
+                      <button
+                        className={'q-opt other' + (qOther[i] ? ' sel' : '')}
+                        onClick={() => toggleQOther(i)}
+                      >
+                        <span className="q-opt-label">其它（自行输入）</span>
+                      </button>
+                      {qOther[i] && (
+                        <input
+                          className="q-input"
+                          value={qText[i] || ''}
+                          placeholder="输入你的回答…"
+                          onChange={(e) =>
+                            setQText((cur) => cur.map((v, j) => (j === i ? e.target.value : v)))
+                          }
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') submitQuestion()
+                          }}
+                          autoFocus
+                        />
+                      )}
+                    </div>
+                  ) : (
+                    <input
+                      className="q-input"
+                      value={qText[i] || ''}
+                      placeholder="输入你的回答…"
+                      onChange={(e) =>
+                        setQText((cur) => cur.map((v, j) => (j === i ? e.target.value : v)))
+                      }
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') submitQuestion()
+                      }}
+                      autoFocus
+                    />
+                  )}
+                </div>
+              )
+            })}
+            <div className="perm-btns">
+              <button onClick={cancelQuestion}>取消</button>
+              <button className="primary" onClick={submitQuestion}>
+                提交回答
               </button>
             </div>
           </div>
@@ -1394,7 +1707,31 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, onThemeChang
   const [adding, setAdding] = useState(false) // 是否显示「添加模型组」表单
   const [editing, setEditing] = useState(null) // 正在编辑的模型组下标（null = 未编辑）
   const [draft, setDraft] = useState({ ...EMPTY_DRAFT }) // 添加/编辑模型组草稿
-  const [updateMsg, setUpdateMsg] = useState('') // 「关于」检查更新占位提示
+  // 检查更新状态机：idle | checking | available | downloading | downloaded | latest | error
+  const [update, setUpdate] = useState({ status: 'idle' })
+  // 订阅主进程推送的更新事件（update.*），驱动状态机
+  useEffect(() => {
+    const off = window.xwork.onEvent((evt) => {
+      if (!evt.type || !evt.type.startsWith('update.')) return
+      const t = evt.type.slice('update.'.length)
+      const p = evt.properties || {}
+      if (t === 'checking-for-update') setUpdate({ status: 'checking' })
+      else if (t === 'update-available') setUpdate({ status: 'available', version: p.version })
+      else if (t === 'update-not-available') setUpdate({ status: 'latest' })
+      else if (t === 'download-progress')
+        setUpdate((u) => ({ ...u, status: 'downloading', percent: Math.round(p.percent || 0) }))
+      else if (t === 'update-downloaded')
+        setUpdate((u) => ({ ...u, status: 'downloaded', version: p.version || u.version }))
+      else if (t === 'error') setUpdate({ status: 'error', message: p.message || '更新过程出错' })
+    })
+    return off
+  }, [])
+  // 手动检查更新；开发模式下主进程未启用 autoUpdater，返回 disabled 提示
+  const doCheckUpdate = async () => {
+    setUpdate({ status: 'checking' })
+    const r = await window.xwork.updateCheck()
+    if (!r.ok) setUpdate({ status: 'error', message: r.disabled ? '开发模式下不可用，请使用安装版验证' : r.error })
+  }
   const resetDraft = () => setDraft({ ...EMPTY_DRAFT })
   const setD = (k, v) => setForm((f) => ({ ...f, deepseek: { ...f.deepseek, [k]: v } }))
   const updateGroups = (updater) => setForm((f) => ({ ...f, modelGroups: updater(f.modelGroups || []) }))
@@ -1599,20 +1936,61 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, onThemeChang
               </div>
 
               <div className="set-hint">
-                权限配置在创建新会话时生效，已有会话保持创建时的策略。注意：「允许」后 AI 可直接执行该类操作（例如「执行命令」允许后删除文件不再确认），请按需选择。
+                权限配置保存并重启引擎后全局生效：新会话按全局规则执行；
+                <br />
+                注意：历史会话中曾被设为「禁止」的操作类型仍会直接拒绝，需新建会话才彻底放开。
               </div>
             </>
           ) : tab === 'about' ? (
             <>
               <div className="perm-title">关于</div>
 
-              {/* 基础版本信息 */}
+              {/* 基础版本信息：应用名 + 右侧检查更新入口（进设置第一眼可见） */}
               <div className="set-group">
                 <div className="about-head">
                   <div className="about-logo">X</div>
-                  <div>
+                  <div className="about-id">
                     <div className="about-name">{appInfo?.name || 'XWork'}</div>
                     <div className="about-ver">版本 {appInfo?.version || '—'}</div>
+                  </div>
+                  <div className="about-update" title={update.status === 'error' ? update.message : undefined}>
+                    {update.status === 'idle' && (
+                      <button className="about-update-btn accent" onClick={doCheckUpdate}>
+                        检查更新
+                      </button>
+                    )}
+                    {update.status === 'checking' && <span className="about-update-hint">检查中…</span>}
+                    {update.status === 'latest' && <span className="about-update-hint">已是最新版本</span>}
+                    {update.status === 'available' && (
+                      <button
+                        className="about-update-btn accent"
+                        onClick={async () => {
+                          const r = await window.xwork.updateDownload()
+                          if (!r.ok) setUpdate({ status: 'error', message: r.error })
+                        }}
+                      >
+                        下载 v{update.version}
+                      </button>
+                    )}
+                    {update.status === 'downloading' && (
+                      <span className="about-update-hint">下载中 {update.percent}%</span>
+                    )}
+                    {update.status === 'downloaded' && (
+                      <button
+                        className="about-update-btn accent"
+                        onClick={async () => {
+                          const r = await window.xwork.updateInstall()
+                          if (!r.ok) setUpdate({ status: 'error', message: r.error })
+                        }}
+                      >
+                        重启并安装
+                      </button>
+                    )}
+                    {update.status === 'error' && (
+                      <button className="about-update-btn" onClick={doCheckUpdate}>
+                        重试
+                      </button>
+                    )}
                   </div>
                 </div>
                 <div className="about-rows">
@@ -1639,13 +2017,39 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, onThemeChang
                 </div>
               </div>
 
-              {/* 检查更新（占位：尚未配置发布渠道） */}
+              {/* 项目链接：系统浏览器打开（shell.openExternal） */}
               <div className="set-group">
-                <div className="set-label">检查更新</div>
-                <button className="mg-add" onClick={() => setUpdateMsg('暂未配置发布渠道，检查更新功能即将上线')}>
-                  检查更新
+                <div className="set-label">项目链接</div>
+                <button
+                  className="about-link"
+                  onClick={() => window.xwork.openExternal('https://github.com/XWR525/XWork')}
+                >
+                  <span>GitHub 仓库</span>
+                  <span>↗</span>
                 </button>
-                {updateMsg && <div className="set-hint">{updateMsg}</div>}
+                <button
+                  className="about-link"
+                  onClick={() => window.xwork.openExternal('https://github.com/XWR525/XWork/issues')}
+                >
+                  <span>问题反馈（Issues）</span>
+                  <span>↗</span>
+                </button>
+              </div>
+
+              {/* 日志：打开真实写入的日志目录 */}
+              <div className="set-group">
+                <div className="set-label">日志</div>
+                <button
+                  className="about-link"
+                  onClick={async () => {
+                    const r = await window.xwork.logOpen()
+                    if (!r.ok) setToast('无法打开日志目录')
+                  }}
+                >
+                  <span>打开日志目录</span>
+                  <span>📂</span>
+                </button>
+                <div className="set-hint">应用运行日志（含报错）写入该目录，排查问题时可在此查看。</div>
               </div>
 
               {/* 许可与致谢 */}
