@@ -1,0 +1,21 @@
+node_modules/
+out/
+dist/
+release/
+resources/engine/
+*.log
+# 本地 Electron 构建缓存（115MB，clone 后按 PACKAGING.md 自行准备）
+build/electron-dist.zip
+# 开发过程中产生的 UI 截图
+shot-*.png
+# 一次性开发调试脚本（保留 dev.mjs / build-dist.mjs / gen-icon.mjs）
+accept-*.mjs
+check-*.mjs
+diag-*.mjs
+e2e-*.mjs
+test-*.cjs
+test-*.mjs
+verify-*.mjs
+ws-*.mjs
+get-messages.mjs
+obs-stream.mjs

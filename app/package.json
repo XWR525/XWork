@@ -1,0 +1,68 @@
+{
+  "name": "xwork",
+  "productName": "XWork",
+  "version": "0.1.0",
+  "description": "XWork - 基于 opencode 的可视化 AI 工作台",
+  "main": "out/main/index.js",
+  "author": "XWork",
+  "license": "MIT",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "electron-vite build",
+    "icon": "node scripts/gen-icon.mjs",
+    "build:dist": "node scripts/build-dist.mjs"
+  },
+  "build": {
+    "appId": "com.xwork.desktop",
+    "productName": "XWork",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "electronDist": "build/electron-dist.zip",
+    "files": [
+      "out/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/engine",
+        "to": "engine"
+      }
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "XWork",
+      "artifactName": "XWork-Installer-${version}.exe"
+    }
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "app-builder-bin": "^4.2.0",
+    "electron": "^33.2.0",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^2.3.0",
+    "vite": "^5.4.8"
+  },
+  "dependencies": {
+    "docx": "^9.7.1",
+    "marked": "^18.0.9",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

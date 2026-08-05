@@ -1,0 +1,6 @@
+# opencode 引擎数据目录（含模型 API Key，切勿提交）
+.opencode-home/
+# spike 临时脚本
+spike-*.mjs
+# 开发预览截图
+_composer-preview*.png
