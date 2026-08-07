@@ -4,3 +4,7 @@
 spike-*.mjs
 # 开发预览截图
 _composer-preview*.png
+package.bat
+# 官网嵌入用界面演示（单独文件夹）
+ui-mockup/
+website-design.md

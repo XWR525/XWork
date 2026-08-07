@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 title XWork
 cd /d "%~dp0app"
 if not exist "node_modules" call npm install

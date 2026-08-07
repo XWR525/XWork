@@ -1,4 +1,4 @@
-// 设置持久化：模型配置（内置 DeepSeek / 自定义模型组）
+// 设置持久化：模型配置（自定义模型组）
 // - apiKey 用 Electron safeStorage 加密存储（Windows DPAPI）
 // - 应用时写入 opencode.json 的 provider 段（apiKey 用 {env:VAR} 引用，规避明文落盘）
 // - 引擎启动时注入对应环境变量
@@ -14,9 +14,10 @@ try {
 }
 
 const DEFAULT_SETTINGS = {
-  deepseek: { apiKey: '', model: 'deepseek-v4-flash' },
   // 自定义模型组：{ id, name, baseURL, apiKey, models[] }，每组 = 一个 OpenAI 兼容 URL + 多个模型 ID
   modelGroups: [],
+  // 模型使用统计：providerID/modelID → 消息发送计数（新对话默认最常用模型）
+  modelUsage: {},
   workspace: '', // 当前工作区目录（空 = 默认启动目录）
   theme: 'dark', // 界面主题：dark | light（仅影响渲染层，不参与引擎配置）
   // 权限策略：AI 各操作类型的三档配置（创建会话时转为 opencode 规则数组）
@@ -100,6 +101,8 @@ class Settings {
     } catch {
       this.cache = structuredClone(DEFAULT_SETTINGS)
     }
+    // 迁移清理：内置 DeepSeek 已移除，删除旧版本遗留字段
+    delete this.cache.deepseek
     return this.cache
   }
 
@@ -108,12 +111,6 @@ class Settings {
     const s = this.load()
     if (raw.workspace !== undefined) s.workspace = raw.workspace
     if (raw.theme === 'dark' || raw.theme === 'light') s.theme = raw.theme
-    if (raw.deepseek) {
-      if (raw.deepseek.apiKey !== undefined && raw.deepseek.apiKey !== MASK) {
-        s.deepseek.apiKey = encrypt(raw.deepseek.apiKey)
-      }
-      if (raw.deepseek.model !== undefined) s.deepseek.model = raw.deepseek.model
-    }
     // 权限策略：校验归一化后整体替换（11 项齐全，缺失项回退默认）
     if (raw.permission !== undefined) s.permission = sanitizePermission(raw.permission)
     // 模型组整体同步：新增/编辑/删除均以 raw.modelGroups 为准
@@ -146,7 +143,6 @@ class Settings {
     return {
       theme: s.theme,
       permission: s.permission,
-      deepseek: { apiKey: s.deepseek.apiKey ? MASK : '', model: s.deepseek.model },
       modelGroups: (s.modelGroups || []).map((g) => ({
         id: g.id,
         name: g.name,
@@ -161,17 +157,42 @@ class Settings {
   env() {
     const s = this.load()
     const env = {}
-    if (s.deepseek.apiKey) env.DEEPSEEK_API_KEY = decrypt(s.deepseek.apiKey)
     for (const g of s.modelGroups || []) {
       if (g.apiKey) env[envVarOf(g.id)] = decrypt(g.apiKey)
     }
     return env
   }
 
-  // 未指定模型时发消息的默认模型（内置 DeepSeek）
-  currentModel() {
+  // 记录模型使用（每次消息发送成功后调用）：键 providerID/modelID → 计数
+  recordModelUsage(model) {
     const s = this.load()
-    return { providerID: 'deepseek', modelID: s.deepseek.model || 'deepseek-v4-flash' }
+    const key = (model.providerID || '?') + '/' + (model.modelID || '?')
+    s.modelUsage = s.modelUsage || {}
+    s.modelUsage[key] = (s.modelUsage[key] || 0) + 1
+    fs.mkdirSync(path.dirname(this.file), { recursive: true })
+    fs.writeFileSync(this.file, JSON.stringify(s, null, 2))
+    this.cache = s
+  }
+
+  // 最常用模型（计数最高；无任何使用记录返回 null）
+  frequentModel() {
+    const s = this.load()
+    const usage = s.modelUsage || {}
+    let bestKey = null
+    for (const key of Object.keys(usage)) {
+      if (!bestKey || usage[key] > usage[bestKey]) bestKey = key
+    }
+    if (!bestKey) return null
+    const i = bestKey.indexOf('/')
+    return { providerID: bestKey.slice(0, i), modelID: bestKey.slice(i + 1) }
+  }
+
+  // 按 id 取模型组（apiKey 解密为明文，仅供主进程测试连接等场景使用）
+  groupById(id) {
+    const s = this.load()
+    const g = (s.modelGroups || []).find((x) => x.id === id)
+    if (!g) return null
+    return { ...g, apiKey: g.apiKey ? decrypt(g.apiKey) : '' }
   }
 }
 
@@ -184,10 +205,13 @@ function applyToOpencode(configFile, settings) {
   } catch {
     /* 配置不存在或损坏则用默认 */
   }
-  // 先移除旧版本 xwork-custom 与当前所有模型组 provider（整体重写，保证删除的组被清除）
+  // 先移除旧版本遗留 provider（内置 deepseek / 旧 xwork-custom）与当前所有模型组 provider
+  // （整体重写，保证删除的组被清除；deepseek 已改由模型组配置）
   if (cfg.provider) {
     for (const key of Object.keys(cfg.provider)) {
-      if (key === 'xwork-custom' || key.startsWith(GROUP_PREFIX)) delete cfg.provider[key]
+      if (key === 'deepseek' || key === 'xwork-custom' || key.startsWith(GROUP_PREFIX)) {
+        delete cfg.provider[key]
+      }
     }
     if (!Object.keys(cfg.provider).length) delete cfg.provider
   }

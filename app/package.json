@@ -1,7 +1,7 @@
 {
   "name": "xwork",
   "productName": "XWork",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "XWork - 基于 opencode 的可视化 AI 工作台",
   "main": "out/main/index.js",
   "author": "XWork",
@@ -69,6 +69,7 @@
   "dependencies": {
     "docx": "^9.7.1",
     "electron-updater": "^6.8.9",
+    "jszip": "^3.10.1",
     "marked": "^18.0.9",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"

@@ -1,8 +1,6 @@
 // opencode HTTP API 桥：会话、消息、权限响应、全局事件流
 const { DEFAULT_PORT } = require('./engine')
 
-const DEFAULT_MODEL = { providerID: 'deepseek', modelID: 'deepseek-v4-flash' }
-
 class Bridge {
   constructor(port = DEFAULT_PORT) {
     this.port = port
@@ -51,11 +49,14 @@ class Bridge {
   }
 
   // 同步发送消息：等待完整回复返回；实时过程由全局事件流推送
-  async sendMessage(sessionID, text, model = DEFAULT_MODEL) {
+  // agent 为 opencode 模式（build/plan），随消息绑定到会话并持久化
+  async sendMessage(sessionID, text, model, agent) {
+    const body = { model, parts: [{ type: 'text', text }] }
+    if (agent) body.agent = agent
     const res = await fetch(`${this.base}/session/${sessionID}/message`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model, parts: [{ type: 'text', text }] })
+      body: JSON.stringify(body)
     })
     if (!res.ok) throw new Error(`POST message ${res.status}: ${await res.text()}`)
     return await res.json()
@@ -137,4 +138,4 @@ class Bridge {
   }
 }
 
-module.exports = { Bridge, DEFAULT_MODEL }
+module.exports = { Bridge }

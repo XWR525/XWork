@@ -2,29 +2,35 @@ import React, { useEffect, useRef, useState } from 'react'
 import { marked } from 'marked'
 marked.setOptions({ gfm: true, breaks: true })
 
-// 任务模板：预设的提示词与权限策略（模板会话自动批准联网，减少弹窗打断）
-const TEMPLATES = [
-  {
-    id: 'research',
-    title: '信息调研',
-    desc: '联网搜索资料，输出带数据与来源的 Markdown 报告',
-    icon: '🔍',
-    permission: [
-      { permission: 'bash', pattern: '*', action: 'ask' },
-      { permission: 'webfetch', pattern: '*', action: 'ask' },
-      { permission: 'websearch', pattern: '*', action: 'ask' }
-    ],
-    autoApprove: ['webfetch', 'websearch'], // 联网只读操作自动放行；bash 仍需确认
-    buildPrompt: (topic) =>
-      `请完成一次信息调研任务：
-调研主题：${topic}
-要求：
-1. 联网搜索权威信息（尽量多次搜索）
-2. 汇总提炼，输出简要的 Markdown 报告
-3. 报告结构：行业现状 / 主要趋势 / 关键数据 / 信息来源（列出实际访问过的链接）
-4. 全文控制在 600 字以内`
-  }
+// 空会话问候语：按时间段分组，随机取一条（localStorage 记录上次索引避免连续重复）
+const GREETINGS = [
+  { from: 5, to: 11, items: [
+    { title: '🌞 早安，开始今天的工作吧', sub: '把要做的事交给 AI，或先从一个新对话开始' },
+    { title: '🚀 新的一天，新的想法', sub: '想好要解决什么问题了吗？' }
+  ]},
+  { from: 12, to: 18, items: [
+    { title: '☕ 下午好，趁现在把想法落地', sub: '有什么需要帮忙处理的？' },
+    { title: '📌 下午好，继续推进', sub: '打开工作区，或直接聊聊你的计划' }
+  ]},
+  { from: 19, to: 23, items: [
+    { title: '🌙 晚上好，专注时刻', sub: '把白天的想法整理成行动' },
+    { title: '💡 晚间灵感最活跃', sub: '想聊点什么？AI 随时待命' }
+  ]},
+  { from: 0, to: 4, items: [
+    { title: '🕛 还在奋斗，注意休息', sub: '保持节奏，随时可以开始' },
+    { title: '🌌 深夜效率高，也别太晚', sub: '简短任务也可以先丢过来' }
+  ]}
 ]
+
+function pickGreeting() {
+  const h = new Date().getHours()
+  const group = GREETINGS.find((g) => h >= g.from && h <= g.to) || GREETINGS[0]
+  let idx = Math.floor(Math.random() * group.items.length)
+  const last = Number(localStorage.getItem('xwork-greeting') || -1)
+  if (group.items.length > 1 && idx === last) idx = (idx + 1) % group.items.length
+  localStorage.setItem('xwork-greeting', String(idx))
+  return group.items[idx]
+}
 
 // 权限设置：AI 各操作类型清单（设置面板展示，用户可配 允许/询问/禁止）
 const PERMISSION_ITEMS = [
@@ -91,6 +97,17 @@ function fileIcon(name) {
 // 路径归一化：统一分隔符与大小写，用于会话目录与当前工作区的比较（Windows 路径不区分大小写）
 const normDir = (p) => (p || '').replace(/\\/g, '/').toLowerCase()
 
+// 从引擎消息 info 提取可读错误信息（opencode 错误为 {name, data:{message}} 嵌套结构）；
+// abort 类错误由「已停止」徽标单独表达，不在此展示
+function extractError(info) {
+  const err = info?.error
+  if (!err) return ''
+  if (/abort/i.test(err.name || '')) return ''
+  const d = err.data
+  const msg = (d && (d.message || d.error?.message)) || err.message || err.name
+  return typeof msg === 'string' ? msg : JSON.stringify(msg)
+}
+
 // 将引擎返回的消息数组规范化为渲染结构
 // 从引擎加载的消息均为完整内容：直接渲染全文，不再走打字机逐字揭示
 function normalize(list) {
@@ -99,6 +116,7 @@ function normalize(list) {
     role: m.info.role,
     time: m.info.time?.created,
     aborted: !!(m.info.error && /abort/i.test(m.info.error.name || '')),
+    error: extractError(m.info),
     parts: (m.parts || []).map((p) => ({
       id: p.id,
       callID: p.callID,
@@ -148,18 +166,24 @@ export default function App() {
   const [qSel, setQSek] = useState([]) // 每题选中的选项 label（string[][]）
   const [qText, setQText] = useState([]) // 每题输入框草稿（string[]）
   const [qOther, setQOther] = useState([]) // 每题「其它（自行输入）」是否激活（boolean[]）
-  const [templateActive, setTemplateActive] = useState(null) // 当前展开的模板 id
-  const [templateTopic, setTemplateTopic] = useState('') // 模板表单输入
   const [toast, setToast] = useState('') // 操作提示
+  const [greeting, setGreeting] = useState(pickGreeting) // 空会话问候语（每次新对话重取）
   const [editingID, setEditingID] = useState(null) // 正在重命名的会话
   const [editingTitle, setEditingTitle] = useState('')
   const [settingsOpen, setSettingsOpen] = useState(false) // 设置面板
+  const [skillHubOpen, setSkillHubOpen] = useState(false) // SKILL HUB 弹窗
+  const [skills, setSkills] = useState([]) // 技能列表（来自本地技能服务，按 sort_order 升序）
+  const [skillLoading, setSkillLoading] = useState(false)
+  const [skillError, setSkillError] = useState('')
+  const [skillInstalled, setSkillInstalled] = useState({}) // 已安装技能 slug 集合（来自 .opencode/skills 扫描）
+  const [skillBusy, setSkillBusy] = useState(null) // 安装中的技能 id（按钮禁用防重复点击）
   const [settingsData, setSettingsData] = useState(null) // 脱敏后的设置
   // 已保存的权限配置（自动应答兜底用）：onEvent 回调是 [ ] 闭包，必须经 ref 读取最新值
   const permCfgRef = useRef(null)
   const [appInfo, setAppInfo] = useState(null) // 应用版本信息（「关于」面板）
   const [theme, setTheme] = useState('dark') // 界面主题：dark | light
-  const [modelSel, setModelSel] = useState(null) // 当前会话选择的模型 {providerID, modelID}，null = 引擎默认
+  const [modelSel, setModelSel] = useState(null) // 当前会话选择的模型 {providerID, modelID}，null = 未选择（发送前必须有效）
+  const [agent, setAgent] = useState('build') // 当前会话的模式（opencode agent：build 默认 / plan 只读规划）
 
   // 工作区：当前目录 + 文件树（懒加载）+ 已添加文件（相对路径清单）
   const [workspace, setWorkspace] = useState('')
@@ -168,7 +192,10 @@ export default function App() {
   const [addedFiles, setAddedFiles] = useState([]) // 已添加文件（相对工作区路径，发送时注入）
   const [ctxMenu, setCtxMenu] = useState(null) // 文件右键菜单 {x, y, abs, rel, type, name}
   const [sideTab, setSideTab] = useState('chat') // 侧栏分段：chat（对话历史）| files（工作区文件）
-  const [panelOpen, setPanelOpen] = useState(false) // 任务执行面板：默认折叠，执行中自动展开
+  const [panelOpen, setPanelOpen] = useState(false) // 任务执行面板：默认折叠，执行中由收起窄条上的圆点闪烁提示
+  const [sidebarW, setSidebarW] = useState(240) // 左边栏宽度（拖动边缘调整）
+  const [taskW, setTaskW] = useState(300) // 任务面板展开宽度（拖动边缘调整）
+  const [composerH, setComposerH] = useState(null) // 输入区高度（拖动上缘调整，null = 按内容自适应）
   const [wsSwitching, setWsSwitching] = useState(null) // 工作区切换中（= 目标目录，null = 空闲），驱动切换遮罩
 
   const listRef = useRef(null)
@@ -179,8 +206,7 @@ export default function App() {
   const expandedRef = useRef(expandedDirs) // 供事件处理器取最新展开目录
   expandedRef.current = expandedDirs
   const wsTimer = useRef(null) // 遮罩「已切换到」提示的收起定时器
-  // 模板会话 -> 自动批准的权限列表（会话创建时登记）
-  const autoSessions = useRef(new Map())
+  const wsPollBusy = useRef(false) // 文件树轮询防重入（上次未完成时跳过本次）
 
   const api = window.xwork
 
@@ -200,7 +226,15 @@ export default function App() {
     const s = sessions.find((x) => x.id === sid)
     if (s?.model?.providerID) setModelSel({ providerID: s.model.providerID, modelID: s.model.id })
     try {
-      setMessages(normalize(await api.messageList(sid)))
+      const msgs = await api.messageList(sid)
+      setMessages(normalize(msgs))
+      // 恢复该会话绑定的模式：优先会话字段，其次最后一条用户消息（opencode 在消息上记录 agent）
+      let ag = s?.agent
+      if (!ag) {
+        const users = (msgs || []).filter((m) => m.info?.role === 'user')
+        ag = users.length ? users[users.length - 1].info?.agent : ''
+      }
+      setAgent(ag === 'plan' ? 'plan' : 'build')
     } catch (e) {
       console.error('load messages failed', e)
     }
@@ -213,6 +247,7 @@ export default function App() {
       const ws = st.workspace || ''
       setWorkspace(ws)
       if (ws) {
+        refreshInstalled() // 打开工作区时扫描已安装技能
         const list = await api.workspaceListDir(ws)
         if (list && !list.error) setWsChildren((c) => ({ ...c, [ws]: list }))
       }
@@ -246,11 +281,28 @@ export default function App() {
     }
   }
 
-  // 选择并切换到新工作区（引擎重启，新 cwd）
-  const openWorkspace = async () => {
+  // 工作区文件树实时刷新：切到「工作区」Tab 立即刷新一次，此后每 2s 轮询根目录与已展开目录，
+  // 使资源管理器中的新增/删除同步显示（与 AI 写入后的即时刷新互补）
+  useEffect(() => {
+    if (sideTab !== 'files' || !workspace) return
+    const tick = async () => {
+      if (wsPollBusy.current) return
+      wsPollBusy.current = true
+      try {
+        await refreshWsTree()
+      } finally {
+        wsPollBusy.current = false
+      }
+    }
+    tick()
+    const timer = setInterval(tick, 2000)
+    return () => clearInterval(timer)
+  }, [sideTab, workspace])
+
+  // 切换到指定工作区（引擎重启，新 cwd）；「打开文件夹」与「所有工作区」共用
+  const switchTo = async (dir) => {
+    if (!dir || dir === workspace) return
     try {
-      const dir = await api.workspacePick()
-      if (!dir || dir === workspace) return
       if (wsTimer.current) clearTimeout(wsTimer.current)
       setWsSwitching({ dir, done: false }) // 遮罩淡入，覆盖引擎重启的等待期
       const r = await api.workspaceSwitch(dir)
@@ -282,6 +334,31 @@ export default function App() {
       setWsSwitching(null)
       console.error('switch workspace failed', e)
       setToast('切换工作区失败: ' + e.message)
+    }
+  }
+
+  // 选择并切换到新工作区（系统目录选择对话框）
+  const openWorkspace = async () => {
+    try {
+      const dir = await api.workspacePick()
+      if (dir) await switchTo(dir)
+    } catch (e) {
+      setToast('选择工作区失败: ' + e.message)
+    }
+  }
+
+  // 「所有工作区」折叠列表：展开时从会话数据聚合各工作区（目录名 + 会话数 + 最近使用）
+  const [wsAllOpen, setWsAllOpen] = useState(false)
+  const [allWs, setAllWs] = useState([])
+  const toggleWsAll = async () => {
+    const next = !wsAllOpen
+    setWsAllOpen(next)
+    if (next) {
+      try {
+        setAllWs(await api.workspaceList())
+      } catch {
+        setAllWs([])
+      }
     }
   }
 
@@ -329,11 +406,6 @@ export default function App() {
     }
   }, [ctxMenu])
 
-  // 任务开始执行时自动展开任务面板（空闲时可手动折叠）
-  useEffect(() => {
-    if (busy) setPanelOpen(true)
-  }, [busy])
-
   // 全局事件流处理
   useEffect(() => {
     const off = api.onEvent((evt) => {
@@ -366,9 +438,16 @@ export default function App() {
             // 已最终落定的消息不再追加 delta（避免 settle 后残留 delta 造成文本重复/不一致）
             if (m.settled) return ms
             const parts = m.parts.slice()
-            const ti = parts.findIndex((x) => x.type === 'text')
-            if (ti >= 0) parts[ti] = { ...parts[ti], text: (parts[ti].text || '') + (p.delta || '') }
-            else parts.unshift({ type: 'text', text: p.delta || '' })
+            // 增量优先按 partID 归属 reasoning part（思考文本也走 delta 流式），
+            // 使思考内容从首个字符起就在引用块内渲染，而不是先落入正文、结束后才归位
+            const ri = parts.findIndex((x) => x.id === p.partID && x.type === 'reasoning')
+            if (ri >= 0) {
+              parts[ri] = { ...parts[ri], text: (parts[ri].text || '') + (p.delta || '') }
+            } else {
+              const ti = parts.findIndex((x) => x.type === 'text')
+              if (ti >= 0) parts[ti] = { ...parts[ti], text: (parts[ti].text || '') + (p.delta || '') }
+              else parts.unshift({ type: 'text', text: p.delta || '' })
+            }
             // 无条件进入流式：无论消息当前是否标记流式，delta 都必须累积显示
             clone[i] = { ...m, parts, streaming: true, streamed: true }
             return clone
@@ -397,19 +476,19 @@ export default function App() {
               return clone
             })
           } else if (part.type === 'reasoning') {
-            // 思考过程更新（完整替换，引擎不推 reasoning 增量）；
-            // 标记流式使思考过程实时展开显示，避免「无反馈」等待
+            // 思考过程更新（完整替换当前文本；reasoning 增量经 delta 事件按 partID 路由到此处，
+            // 因此必须保留 part.id，使引用块从流式起点就开始累积显示）
             setMessages((ms) => {
               const i = ms.findIndex((m) => m.id === mid)
               if (i < 0) {
-                return [...ms, { id: mid, role: 'assistant', streaming: true, streamed: true, parts: [{ type: 'reasoning', text: part.text || '' }] }]
+                return [...ms, { id: mid, role: 'assistant', streaming: true, streamed: true, parts: [{ id: part.id, type: 'reasoning', text: part.text || '' }] }]
               }
               const clone = ms.slice()
               const m = clone[i]
               const parts = m.parts.slice()
               const ri = parts.findIndex((x) => x.type === 'reasoning')
-              if (ri >= 0) parts[ri] = { ...parts[ri], text: part.text }
-              else parts.unshift({ type: 'reasoning', text: part.text || '' })
+              if (ri >= 0) parts[ri] = { ...parts[ri], id: part.id, text: part.text }
+              else parts.unshift({ id: part.id, type: 'reasoning', text: part.text || '' })
               clone[i] = { ...m, parts, streaming: true, streamed: true }
               return clone
             })
@@ -456,32 +535,38 @@ export default function App() {
           loadSession(cur)
           break
         }
+        case 'session.error': {
+          // 任务失败（如 API Key 无效）：把错误标记到当前会话最后一条 assistant 消息，
+          // 避免失败回复渲染成「空气泡」；最终错误以 session.idle 后的权威重载为准
+          if (p.sessionID !== cur) break
+          const em = extractError({ error: p.error })
+          if (!em) break
+          setMessages((ms) => {
+            if (!ms.length) return ms
+            const last = ms[ms.length - 1]
+            if (last.role !== 'assistant') return ms
+            const clone = ms.slice()
+            clone[clone.length - 1] = { ...last, error: em }
+            return clone
+          })
+          break
+        }
         case 'permission.asked': {
-          // 1) 模板会话的 autoApprove 白名单优先（如调研模板的联网只读操作）
-          const allowed = autoSessions.current.get(p.sessionID)
-          console.log('[perm.asked]', p.sessionID, p.permission, 'autoList=', JSON.stringify(allowed))
-          if (allowed && allowed.includes(p.permission)) {
-            console.log('[perm.asked] auto-approving', p.id)
+          // 全局权限兜底：历史会话仍按创建时策略弹 ask，此处按当前已保存的全局设置自动处理
+          // （新会话无权限快照，引擎按全局规则直接判断，不会走到这里）
+          const action = globalPermAction(p.permission, permCfgRef.current)
+          if (action === 'allow') {
+            console.log('[perm.asked] global allow, auto-approving', p.id)
             api.permissionRespond(p.sessionID, p.id, 'once')
               .then((ok) => console.log('[perm.asked] respond result:', ok))
               .catch((e) => console.error('[perm.asked] respond failed:', e.message))
+          } else if (action === 'deny') {
+            console.log('[perm.asked] global deny, auto-rejecting', p.id)
+            api.permissionRespond(p.sessionID, p.id, 'reject')
+              .then((ok) => console.log('[perm.asked] respond result:', ok))
+              .catch((e) => console.error('[perm.asked] respond failed:', e.message))
           } else {
-            // 2) 全局权限兜底：历史会话仍按创建时策略弹 ask，此处按当前已保存的全局设置自动处理
-            // （新会话无权限快照，引擎按全局规则直接判断，不会走到这里）
-            const action = globalPermAction(p.permission, permCfgRef.current)
-            if (action === 'allow') {
-              console.log('[perm.asked] global allow, auto-approving', p.id)
-              api.permissionRespond(p.sessionID, p.id, 'once')
-                .then((ok) => console.log('[perm.asked] respond result:', ok))
-                .catch((e) => console.error('[perm.asked] respond failed:', e.message))
-            } else if (action === 'deny') {
-              console.log('[perm.asked] global deny, auto-rejecting', p.id)
-              api.permissionRespond(p.sessionID, p.id, 'reject')
-                .then((ok) => console.log('[perm.asked] respond result:', ok))
-                .catch((e) => console.error('[perm.asked] respond failed:', e.message))
-            } else {
-              setPerm(p)
-            }
+            setPerm(p)
           }
           break
         }
@@ -563,7 +648,7 @@ export default function App() {
     return () => clearTimeout(t)
   }, [toast])
 
-  // 将同步 POST 的最终结果落定到消息列表（send 与 launchTemplate 共用）
+  // 将同步 POST 的最终结果落定到消息列表
   const settle = (result) => {
     const aborted = !!(result.info?.error && /abort/i.test(result.info.error.name || ''))
     setMessages((ms) => {
@@ -572,6 +657,7 @@ export default function App() {
         id: result.info.id,
         role: 'assistant',
         aborted,
+        error: extractError(result.info),
         streamed: true,
         settled: true,
         parts: (result.parts || []).map((p) => ({
@@ -614,15 +700,20 @@ export default function App() {
   const send = async () => {
     const text = input.trim()
     if (!text || busy) return
-    // 已添加的工作区文件作为「关注清单」注入（AI 用 read/edit 工具实际操作，不塞入文件内容）
+    // 已添加的工作区文件以 opencode @引用语法注入提示词（与引擎原生「@文件名」交互方式一致）
     let finalText = text
     if (addedFiles.length) {
       finalText =
         text +
-        '\n\n【工作区文件】请优先使用 read/edit 工具处理以下文件（均为当前工作区内的相对路径）：\n' +
-        addedFiles.map((p) => '- ' + p).join('\n')
+        '\n\n【工作区文件】已引用以下文件（@ 引用），请读取其内容并基于此处理：\n' +
+        addedFiles.map((p) => '@' + p).join('\n')
     }
     setInput('')
+    // 模型必须显式选择（模型组下拉）；无有效模型时不发送
+    if (!modelValid) {
+      setToast('请先在设置中配置模型组并选择模型')
+      return
+    }
     let sid = currentID
     try {
       if (!sid) {
@@ -636,41 +727,12 @@ export default function App() {
       setMessages((ms) => [...ms, { id: 'local-' + Date.now(), role: 'user', parts: [{ type: 'text', text: finalText }] }])
       setBusy(true)
       // 同步等待首个 step 完成；期间实时过程（流式文本/工具/权限/后续 turn）由全局事件流推送
-      const result = await api.messageSend(sid, finalText, modelValid ? modelSel : null)
+      const result = await api.messageSend(sid, finalText, modelSel, agent)
       settle(result)
       checkDone(sid, result.info.id)
     } catch (e) {
       console.error('send failed', e)
       setEngineError('发送失败: ' + e.message)
-      setBusy(false)
-      setStopping(false)
-    } finally {
-      setStopping(false)
-    }
-  }
-
-  // 通过模板发起任务：新建带模板权限的会话，自动批准联网，发送预设提示词
-  const launchTemplate = async () => {
-    const tpl = TEMPLATES.find((t) => t.id === templateActive)
-    const topic = templateTopic.trim()
-    if (!tpl || !topic || busy) return
-    setTemplateTopic('')
-    setTemplateActive(null)
-    setBusy(true)
-    try {
-      const created = await api.sessionCreate(`${tpl.title}：${topic.slice(0, 16)}`, tpl.permission)
-      autoSessions.current.set(created.id, tpl.autoApprove || [])
-      setCurrentID(created.id)
-      refreshSessions()
-      setMessages([])
-      const prompt = tpl.buildPrompt(topic)
-      setMessages((ms) => [...ms, { id: 'local-' + Date.now(), role: 'user', parts: [{ type: 'text', text: prompt }] }])
-      const result = await api.messageSend(created.id, prompt, modelValid ? modelSel : null)
-      settle(result)
-      checkDone(created.id, result.info.id)
-    } catch (e) {
-      console.error('template launch failed', e)
-      setEngineError('任务发起失败: ' + e.message)
       setBusy(false)
       setStopping(false)
     } finally {
@@ -792,7 +854,7 @@ export default function App() {
     }
   }
 
-  // 加载设置快照（含模型组与 DeepSeek 默认模型）；启动与打开设置时调用
+  // 加载设置快照（含模型组）；启动与打开设置时调用
   // quiet=true：启动期引擎可能尚未就绪，失败属预期，静默等 server.connected 重试
   const loadModels = async (quiet = false) => {
     try {
@@ -836,6 +898,128 @@ export default function App() {
     await loadModels()
   }
 
+  // 打开 SKILL HUB：拉取技能列表（主进程经 IPC 请求本地技能服务，无 CORS 限制）
+  const openSkillHub = async () => {
+    setSkillHubOpen(true)
+    setSkillLoading(true)
+    setSkillError('')
+    refreshInstalled() // 打开弹窗时同步已安装状态（解压目录以磁盘实际为准）
+    try {
+      const r = await api.skillList()
+      if (r.ok) setSkills(r.skills)
+      else setSkillError(r.error || '技能加载失败')
+    } catch (e) {
+      setSkillError('技能加载失败: ' + e.message)
+    } finally {
+      setSkillLoading(false)
+    }
+  }
+
+  // 扫描工作区 .opencode/skills，得到已安装技能 slug 集合（文件夹名 = slug），驱动安装/卸载按钮
+  const refreshInstalled = async () => {
+    try {
+      const r = await api.skillInstalled()
+      if (r.ok) setSkillInstalled(Object.fromEntries((r.slugs || []).map((s) => [s, true])))
+    } catch {
+      /* 扫描失败忽略，视为未安装 */
+    }
+  }
+
+  // 安装技能：主进程下载 zip 并解压到工作区，成功后刷新已安装状态
+  const installSkill = async (s) => {
+    if (skillBusy) return
+    setSkillBusy(s.id)
+    try {
+      const r = await api.skillInstall(s.id)
+      if (r.ok) {
+        setToast(`「${s.name}」已安装，重启引擎后生效`)
+        refreshInstalled()
+      } else {
+        setToast(r.error || '安装失败')
+      }
+    } catch (e) {
+      setToast('安装失败: ' + e.message)
+    } finally {
+      setSkillBusy(null)
+    }
+  }
+
+  // 卸载技能：确认后删除 .opencode/skills/<slug> 整个文件夹（复用全局确认框）
+  const uninstallSkill = (s) => {
+    setConfirm({
+      title: '卸载技能',
+      message: `确定要卸载「${s.name}」吗？将删除工作区 .opencode/skills/${s.slug} 文件夹。`,
+      danger: true,
+      confirmLabel: '卸载',
+      onConfirm: async () => {
+        try {
+          const r = await api.skillUninstall(s.slug)
+          if (r.ok) {
+            setToast(`「${s.name}」已卸载`)
+            refreshInstalled()
+          } else {
+            setToast(r.error || '卸载失败')
+          }
+        } catch (e) {
+          setToast('卸载失败: ' + e.message)
+        }
+      }
+    })
+  }
+
+  // 重启引擎：安装新技能后需重启才能识别，经主进程 stop → 强制新进程
+  const restartEngine = async () => {
+    try {
+      const r = await api.engineRestart()
+      setToast(r.ok ? '引擎已重启，技能已生效' : '引擎重启失败: ' + (r.error || '未知错误'))
+    } catch (e) {
+      setToast('引擎重启失败: ' + e.message)
+    }
+  }
+
+  // 拖拽调整侧栏宽度：type = 'left'（左边栏右缘）/ 'task'（任务面板左缘）
+  // mousedown 记录起点，window mousemove 期间用函数式 setState 更新，mouseup 清理监听
+  const startResize = (type, e) => {
+    e.preventDefault()
+    const startX = e.clientX
+    const startW = type === 'left' ? sidebarW : taskW
+    const setter = type === 'left' ? setSidebarW : setTaskW
+    const min = type === 'left' ? 160 : 200
+    const max = type === 'left' ? 480 : 600
+    const onMove = (ev) => {
+      // 左边栏向右拉变宽；任务面板向左拉变宽
+      const delta = type === 'left' ? ev.clientX - startX : startX - ev.clientX
+      setter(Math.min(max, Math.max(min, startW + delta)))
+    }
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      document.body.classList.remove('resizing')
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+    document.body.classList.add('resizing')
+  }
+
+  // 拖拽调整输入区高度：向上拉变高（消息区自动腾出空间），最小 56px，最大不超过窗口一半
+  const startResizeV = (e) => {
+    e.preventDefault()
+    const startY = e.clientY
+    const startH = document.querySelector('.composer')?.offsetHeight ?? 120
+    const onMove = (ev) => {
+      const h = Math.min(window.innerHeight * 0.5, Math.max(56, startH + (startY - ev.clientY)))
+      setComposerH(Math.round(h))
+    }
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      document.body.classList.remove('resizing', 'resizing-v')
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+    document.body.classList.add('resizing', 'resizing-v')
+  }
+
   // 保存设置（主进程加密存储 + 写配置；restart=true 时重启引擎生效；note 可覆盖提示文案）
   const saveSettings = async (form, restart = true, note = '') => {
     try {
@@ -848,14 +1032,41 @@ export default function App() {
     }
   }
 
-  const newChat = () => {
+  // 应用最常用模型为当前选择（须仍存在于模型组中有效），无记录或已失效则置空让用户选择
+  const applyFrequentModel = async () => {
+    try {
+      const fm = await api.frequentModel()
+      if (
+        fm &&
+        availableModels.some((m) => m.providerID === fm.providerID && m.modelID === fm.modelID)
+      ) {
+        setModelSel(fm)
+      } else {
+        setModelSel(null)
+      }
+    } catch {
+      setModelSel(null)
+    }
+  }
+
+  const newChat = async () => {
     setCurrentID(null)
     setMessages([])
     setBusy(false)
     setStopping(false)
-    setTemplateActive(null)
-    setTemplateTopic('')
+    setGreeting(pickGreeting())
+    setAgent('build') // 新对话默认 build 模式
+    // 默认最常用模型（须仍存在于模型组中有效），无记录或已失效则置空让用户选择
+    await applyFrequentModel()
   }
+
+  // 打开程序时（空会话）默认选择最常用模型并回到 build 模式；有会话时由 loadSession 恢复，不覆盖
+  useEffect(() => {
+    if (currentID || !settingsData) return
+    applyFrequentModel()
+    setAgent('build')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentID, settingsData])
 
   // 删除历史会话（项目风格确认框确认后从引擎删除）
   const removeSession = async (sid) => {
@@ -870,6 +1081,33 @@ export default function App() {
           await api.sessionDelete(sid)
           if (sid === currentID) newChat()
           refreshSessions()
+        } catch (e) {
+          setToast('删除失败: ' + e.message)
+        }
+      }
+    })
+  }
+
+  // 删除工作区（仅路径不存在的条目显示 ×）：移除注册表条目 + 删除该目录下引擎会话
+  const removeWorkspace = (dir) => {
+    const w = allWs.find((x) => normDir(x.dir) === normDir(dir))
+    setConfirm({
+      title: '删除工作区',
+      message: `确定删除工作区「${(w && w.name) || ''}」？将同时删除该目录下的历史会话，此操作不可恢复。`,
+      danger: true,
+      confirmLabel: '删除',
+      onConfirm: async () => {
+        try {
+          const r = await api.workspaceDelete(dir)
+          if (r.ok) {
+            setAllWs((prev) => prev.filter((x) => normDir(x.dir) !== normDir(dir)))
+            setToast(
+              r.warning ||
+                (r.sessionsDeleted ? `已删除工作区及 ${r.sessionsDeleted} 个会话` : '已删除工作区')
+            )
+          } else {
+            setToast('删除失败: ' + (r.error || '未知错误'))
+          }
         } catch (e) {
           setToast('删除失败: ' + e.message)
         }
@@ -1040,19 +1278,17 @@ export default function App() {
     return { kind: 'working' }
   })()
 
-  // 可用模型列表（聊天框下拉）：DeepSeek 直接用设置中输入的默认模型 + 各自定义模型组
+  // 可用模型列表（聊天框下拉）：全部来自自定义模型组
   const availableModels = (() => {
     const list = []
     if (!settingsData) return list
-    const dsModel = settingsData.deepseek?.model
-    if (dsModel) list.push({ providerID: 'deepseek', modelID: dsModel, label: 'DeepSeek / ' + dsModel })
     for (const g of settingsData.modelGroups || []) {
       for (const m of g.models) list.push({ providerID: g.id, modelID: m, label: g.name + ' / ' + m })
     }
     return list
   })()
 
-  // 当前选择的模型是否仍可用（模型组被删除后回退引擎默认）
+  // 当前选择的模型是否仍可用（模型组被删除后视为未选择，发送被拦截）
   const modelValid =
     !!modelSel && availableModels.some((m) => m.providerID === modelSel.providerID && m.modelID === modelSel.modelID)
 
@@ -1081,6 +1317,9 @@ export default function App() {
           </div>
         )}
         <div className="tb-spacer" />
+        <button className="settings-btn" onClick={openSkillHub} title="技能中心（开发中）">
+          🧩 Skill Hub
+        </button>
         <button className="settings-btn" onClick={openSettings} title="模型与设置">
           ⚙ 设置
         </button>
@@ -1089,7 +1328,9 @@ export default function App() {
             ─
           </button>
           <button className="wc-btn" title="最大化 / 还原" onClick={() => api.windowMaximize()}>
-            □
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
+              <rect x="0.5" y="0.5" width="9" height="9" rx="1" />
+            </svg>
           </button>
           <button className="wc-btn wc-close" title="关闭" onClick={() => api.windowClose()}>
             ✕
@@ -1098,7 +1339,12 @@ export default function App() {
       </header>
 
       <div className="body">
-        <aside className="sidebar">
+        <aside className="sidebar" style={{ width: sidebarW }}>
+          <div
+            className="resize-handle"
+            title="拖动调整宽度"
+            onMouseDown={(e) => startResize('left', e)}
+          />
           <button className="new-btn" onClick={newChat}>
             🗨️ 新对话
           </button>
@@ -1255,6 +1501,53 @@ export default function App() {
                   </button>
                 </div>
               )}
+              {/* 所有工作区：底部可展开列表，聚合所有发生过会话的目录，点击切换 */}
+              <div className="ws-all">
+                <button
+                  className={`ws-all-btn ${wsAllOpen ? 'open' : ''}`}
+                  onClick={toggleWsAll}
+                  disabled={busy}
+                >
+                  <span>{wsAllOpen ? '📂' : '📁'} 所有工作区</span>
+                  <span className="caret">›</span>
+                </button>
+                <div className={`ws-all-list ${wsAllOpen ? 'open' : ''}`}>
+                  {allWs.length === 0 ? (
+                    <div className="empty-hint">暂无其他工作区</div>
+                  ) : (
+                    allWs.map((w) => (
+                      <div
+                        key={w.dir}
+                        className={`ws-all-item ${normDir(w.dir) === normDir(workspace) ? 'active' : ''} ${w.exists === false ? 'missing' : ''}`}
+                        title={w.dir}
+                        onClick={() => {
+                          setWsAllOpen(false)
+                          switchTo(w.dir)
+                        }}
+                      >
+                        <div className="ws-all-name">{w.name}</div>
+                        <div className="ws-all-path">{w.dir}</div>
+                        <div className="ws-all-meta">
+                          {w.count} 个会话 · 最近 {fmtDateTime(w.last)}
+                          {w.exists === false && ' · 路径不存在'}
+                        </div>
+                        {w.exists === false && (
+                          <button
+                            className="ws-all-del"
+                            title="删除工作区"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              removeWorkspace(w.dir)
+                            }}
+                          >
+                            ×
+                          </button>
+                        )}
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
               </div>
             </div>
           </div>
@@ -1263,40 +1556,9 @@ export default function App() {
         <main className="main">
           <div className="message-list" ref={listRef}>
             {!currentID && !busy && (
-              <div className="template-section">
-                <div className="tpl-title">开始一个任务</div>
-                <div className="tpl-grid">
-                  {TEMPLATES.map((t) => (
-                    <div
-                      key={t.id}
-                      className={`tpl-card ${templateActive === t.id ? 'active' : ''}`}
-                      onClick={() => setTemplateActive(templateActive === t.id ? null : t.id)}
-                    >
-                      <div className="tpl-icon">{t.icon}</div>
-                      <div className="tpl-name">{t.title}</div>
-                      <div className="tpl-desc">{t.desc}</div>
-                    </div>
-                  ))}
-                </div>
-                {templateActive && (
-                  <div className="tpl-form">
-                    <input
-                      value={templateTopic}
-                      placeholder="输入调研主题，例如：2026 年储能行业趋势"
-                      onChange={(e) => setTemplateTopic(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          e.preventDefault()
-                          launchTemplate()
-                        }
-                      }}
-                      autoFocus
-                    />
-                    <button className="send-btn" disabled={!templateTopic.trim()} onClick={launchTemplate}>
-                      开始
-                    </button>
-                  </div>
-                )}
+              <div className="greeting">
+                <div className="greet-title">{greeting.title}</div>
+                <div className="greet-sub">{greeting.sub}</div>
               </div>
             )}
             {messages.map((m) => (
@@ -1311,7 +1573,12 @@ export default function App() {
           </div>
 
           {/* 输入区：整个下部区域为一个圆角矩形输入框，右下角为发送按钮，其左侧为模型选择（向上弹出） */}
-          <div className="composer">
+          <div className="composer" style={composerH ? { height: composerH } : undefined}>
+            <div
+              className="composer-resize"
+              title="拖动调整高度"
+              onMouseDown={startResizeV}
+            />
             <div className="composer-box">
               {addedFiles.length > 0 && (
                 <div className="composer-files">
@@ -1325,7 +1592,7 @@ export default function App() {
               )}
               <textarea
                 value={input}
-                placeholder="输入任务，例如：调研 2026 年储能行业趋势并生成报告"
+                placeholder="想让我做什么？"
                 rows={2}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => {
@@ -1337,6 +1604,7 @@ export default function App() {
               />
               <div className="composer-foot">
                 <div className="composer-actions">
+                  <AgentPicker value={agent} onPick={setAgent} />
                   <ModelPicker
                     models={availableModels}
                     value={modelValid ? modelSel : null}
@@ -1376,7 +1644,19 @@ export default function App() {
         </main>
 
         {/* 任务面板：常驻容器，展开/收起用宽度过渡动画（窄条从右侧滑入滑出） */}
-        <aside className={`task-side ${panelOpen ? '' : 'closed'}`}>
+        <aside
+          className={`task-side ${panelOpen ? '' : 'closed'}`}
+          style={
+            panelOpen
+              ? { width: taskW, gridTemplateColumns: `${taskW}px 0px` }
+              : undefined
+          }
+        >
+          <div
+            className="resize-handle"
+            title="拖动调整宽度"
+            onMouseDown={(e) => startResize('task', e)}
+          />
           <div className="task-panel">
             <div className="panel-head">
               <span className="panel-title">任务执行过程</span>
@@ -1551,7 +1831,7 @@ export default function App() {
       )}
 
       {confirm && (
-        <div className="perm-mask">
+        <div className="perm-mask z-top">
           <div className="perm-card">
             <div className="perm-title">{confirm.title || '需要确认'}</div>
             <div className="perm-desc">{confirm.message}</div>
@@ -1566,6 +1846,61 @@ export default function App() {
                 }}
               >
                 {confirm.confirmLabel || '确认'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {skillHubOpen && (
+        <div className="perm-mask" onClick={() => setSkillHubOpen(false)}>
+          <div className="perm-card skill-hub-card" onClick={(e) => e.stopPropagation()}>
+            <div className="perm-title">🧩 Skill Hub</div>
+            {skillLoading ? (
+              <div className="skill-hub-state">技能加载中…</div>
+            ) : skillError ? (
+              <div className="skill-hub-state">
+                <div className="skill-hub-error">{skillError}</div>
+                <button className="primary" onClick={openSkillHub}>重试</button>
+              </div>
+            ) : skills.length === 0 ? (
+              <div className="skill-hub-state">暂无可用技能</div>
+            ) : (
+              <div className="skill-list">
+                {[...skills]
+                  .sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0))
+                  .map((s) => (
+                    <div className="skill-card" key={s.id} data-skill-id={s.id}>
+                      <div className="skill-icon">{s.icon || '🧩'}</div>
+                      <div className="skill-card-main">
+                        <div className="skill-card-head">
+                          <span className="skill-name">{s.name}</span>
+                          <span className="skill-slug">/{s.slug}</span>
+                        </div>
+                        <div className="skill-desc">{s.description}</div>
+                        <div className="skill-meta">{s.file_count ?? 0} 个文件</div>
+                      </div>
+                      {skillInstalled[s.slug] ? (
+                        <button className="skill-install" onClick={() => uninstallSkill(s)}>
+                          卸载
+                        </button>
+                      ) : (
+                        <button
+                          className="skill-install"
+                          disabled={skillBusy === s.id}
+                          onClick={() => installSkill(s)}
+                        >
+                          {skillBusy === s.id ? '安装中…' : '安装'}
+                        </button>
+                      )}
+                    </div>
+                  ))}
+              </div>
+            )}
+            <div className="perm-btns">
+              <button onClick={restartEngine}>重启引擎</button>
+              <button className="primary" onClick={() => setSkillHubOpen(false)}>
+                关闭
               </button>
             </div>
           </div>
@@ -1593,8 +1928,8 @@ export default function App() {
 // 模型组表单空草稿（添加/编辑共用）
 const EMPTY_DRAFT = { name: '', baseURL: '', apiKey: '', modelsText: '' }
 
-// 模型组表单字段（添加与编辑共用）：组名 / Base URL / API Key / 模型 ID
-function GroupFormFields({ draft, setDraft, apiKeyPlaceholder, onCancel, onSubmit, submitLabel }) {
+// 模型组表单字段（添加与编辑共用）：组名 / Base URL / API Key / 模型 ID + 测试连接
+function GroupFormFields({ draft, setDraft, apiKeyPlaceholder, test, onTest, onCancel, onSubmit, submitLabel }) {
   const valid = draft.name.trim() && draft.baseURL.trim() && draft.modelsText.trim()
   return (
     <>
@@ -1637,6 +1972,9 @@ function GroupFormFields({ draft, setDraft, apiKeyPlaceholder, onCancel, onSubmi
         />
       </div>
       <div className="mg-form-btns">
+        <button onClick={(e) => onTest(e)} disabled={!draft.baseURL.trim() || test?.status === 'testing'}>
+          {test?.status === 'testing' ? '测试中…' : '测试连接'}
+        </button>
         <button onClick={onCancel}>取消</button>
         <button className="primary" disabled={!valid} onClick={onSubmit}>
           {submitLabel}
@@ -1648,7 +1986,21 @@ function GroupFormFields({ draft, setDraft, apiKeyPlaceholder, onCancel, onSubmi
 
 // 模型组卡片（编辑⇄收起切换动画）：表单与卡片同 DOM 挂载、display 互斥切换，
 // 容器 height 由 JS 测量内容高度后 transition 平滑过渡（0fr 互斥 grid 的总高会跳变，不用）
-function GroupCard({ g, editing, draft, setDraft, onEdit, onRemove, onCancel, onSubmit }) {
+// test/onTest = 卡片测试（已保存配置）；formTest/onFormTest = 表单测试（当前草稿）
+function GroupCard({
+  g,
+  editing,
+  draft,
+  setDraft,
+  test,
+  onTest,
+  formTest,
+  onFormTest,
+  onEdit,
+  onRemove,
+  onCancel,
+  onSubmit
+}) {
   const boxRef = useRef(null)
   const formRef = useRef(null)
   const cardRef = useRef(null)
@@ -1673,6 +2025,8 @@ function GroupCard({ g, editing, draft, setDraft, onEdit, onRemove, onCancel, on
           draft={draft}
           setDraft={setDraft}
           apiKeyPlaceholder="sk-…（留空保留原值）"
+          test={formTest}
+          onTest={onFormTest}
           onCancel={onCancel}
           onSubmit={onSubmit}
           submitLabel="保存修改"
@@ -1682,6 +2036,14 @@ function GroupCard({ g, editing, draft, setDraft, onEdit, onRemove, onCancel, on
         <div className="mg-card-head">
           <span className="mg-name">{g.name}</span>
           <div className="mg-card-actions">
+            <button
+              className="mg-test"
+              onClick={(e) => onTest(e)}
+              disabled={test?.status === 'testing'}
+              title="测试该组已保存的 Base URL 与 API Key"
+            >
+              {test?.status === 'testing' ? '测试中…' : '测试'}
+            </button>
             <button className="mg-edit" onClick={onEdit}>
               编辑
             </button>
@@ -1707,6 +2069,12 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, onThemeChang
   const [adding, setAdding] = useState(false) // 是否显示「添加模型组」表单
   const [editing, setEditing] = useState(null) // 正在编辑的模型组下标（null = 未编辑）
   const [draft, setDraft] = useState({ ...EMPTY_DRAFT }) // 添加/编辑模型组草稿
+  const [cardTest, setCardTest] = useState({}) // 卡片测试状态：groupId -> {status:'testing'|'ok'|'fail', error?}
+  const [formTest, setFormTest] = useState(null) // 添加/编辑表单草稿测试状态（同一时刻只有一个表单）
+  const [bubble, setBubble] = useState(null) // 测试结果漂浮气泡：{top, right, status:'ok'|'fail', error?}
+  const bubbleTimer = useRef(null)
+  // 卸载时清理成功气泡的自动消失定时器
+  useEffect(() => () => { if (bubbleTimer.current) clearTimeout(bubbleTimer.current) }, [])
   // 检查更新状态机：idle | checking | available | downloading | downloaded | latest | error
   const [update, setUpdate] = useState({ status: 'idle' })
   // 订阅主进程推送的更新事件（update.*），驱动状态机
@@ -1733,7 +2101,6 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, onThemeChang
     if (!r.ok) setUpdate({ status: 'error', message: r.disabled ? '开发模式下不可用，请使用安装版验证' : r.error })
   }
   const resetDraft = () => setDraft({ ...EMPTY_DRAFT })
-  const setD = (k, v) => setForm((f) => ({ ...f, deepseek: { ...f.deepseek, [k]: v } }))
   const updateGroups = (updater) => setForm((f) => ({ ...f, modelGroups: updater(f.modelGroups || []) }))
   const removeGroup = (gi) => updateGroups((gs) => gs.filter((_, i) => i !== gi))
   // 开始添加：关闭编辑，清空草稿
@@ -1741,6 +2108,7 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, onThemeChang
     setAdding(true)
     setEditing(null)
     resetDraft()
+    setFormTest(null)
   }
   // 开始编辑：关闭添加，草稿预填该组数据（apiKey 留空 = 保存时保留原值）
   const startEdit = (gi) => {
@@ -1749,11 +2117,65 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, onThemeChang
     setAdding(false)
     setEditing(gi)
     setDraft({ name: g.name, baseURL: g.baseURL, apiKey: '', modelsText: g.models.join('\n') })
+    setFormTest(null)
   }
   const cancelForm = () => {
     setAdding(false)
     setEditing(null)
     resetDraft()
+    setFormTest(null)
+  }
+  // 在测试按钮附近弹出结果气泡：成功自动消失，失败手动关闭（✕）
+  const showBubble = (anchor, result) => {
+    const r = anchor.getBoundingClientRect()
+    // 下方空间不足时改为在按钮上方弹出
+    const below = window.innerHeight - r.bottom > 120
+    setBubble({
+      top: below ? r.bottom + 8 : undefined,
+      bottom: below ? undefined : window.innerHeight - r.top + 8,
+      right: Math.max(8, window.innerWidth - r.right),
+      status: result.ok ? 'ok' : 'fail',
+      error: result.error || ''
+    })
+    if (bubbleTimer.current) clearTimeout(bubbleTimer.current)
+    if (result.ok) {
+      // 成功：停留 2s 后淡出（leaving 触发 opacity 过渡），结束后卸载
+      bubbleTimer.current = setTimeout(() => {
+        setBubble((b) => (b ? { ...b, leaving: true } : b))
+        bubbleTimer.current = setTimeout(() => setBubble(null), 250)
+      }, 2000)
+    }
+  }
+  // 测试连接：卡片测已保存配置（key 由主进程解密）；表单测当前草稿（未保存的 baseURL/key）
+  const runCardTest = async (g, e) => {
+    if ((cardTest[g.id] || {}).status === 'testing') return
+    const anchor = e.currentTarget
+    setCardTest((m) => ({ ...m, [g.id]: { status: 'testing' } }))
+    try {
+      const r = await window.xwork.modelTest({ groupId: g.id })
+      const result = r && r.ok ? { ok: true } : { ok: false, error: (r && r.error) || '连接失败' }
+      setCardTest((m) => ({ ...m, [g.id]: result.ok ? { status: 'ok' } : { status: 'fail', error: result.error } }))
+      showBubble(anchor, result)
+    } catch (err) {
+      setCardTest((m) => ({ ...m, [g.id]: { status: 'fail', error: err.message } }))
+      showBubble(anchor, { ok: false, error: err.message })
+    }
+  }
+  const runFormTest = async (e) => {
+    if ((formTest || {}).status === 'testing' || !draft.baseURL.trim()) return
+    const anchor = e.currentTarget
+    setFormTest({ status: 'testing' })
+    // 编辑表单：传组 id，草稿 key 留空时主进程回退已保存 key（「留空保留原值」语义）
+    const gid = editing != null ? (form.modelGroups || [])[editing]?.id : undefined
+    try {
+      const r = await window.xwork.modelTest({ groupId: gid, baseURL: draft.baseURL, apiKey: draft.apiKey })
+      const result = r && r.ok ? { ok: true } : { ok: false, error: (r && r.error) || '连接失败' }
+      setFormTest(result.ok ? { status: 'ok' } : { status: 'fail', error: result.error })
+      showBubble(anchor, result)
+    } catch (err) {
+      setFormTest({ status: 'fail', error: err.message })
+      showBubble(anchor, { ok: false, error: err.message })
+    }
   }
   // 权限设置：单项三档切换 / 预设档位一键填充
   const setPermItem = (k, v) => setForm((f) => ({ ...f, permission: { ...f.permission, [k]: v } }))
@@ -1825,28 +2247,6 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, onThemeChang
             <>
               <div className="perm-title">模型设置</div>
 
-              {/* DeepSeek（内置，无需配置 URL） */}
-              <div className="set-group">
-                <div className="set-label">DeepSeek（内置）· API Key</div>
-                <input
-                  className="set-input"
-                  type="password"
-                  placeholder="sk-…（留空保留原值）"
-                  value={form.deepseek.apiKey === '••••••' ? '' : form.deepseek.apiKey}
-                  onChange={(e) => setD('apiKey', e.target.value)}
-                />
-              </div>
-              <div className="set-group">
-                <div className="set-label">DeepSeek 默认模型</div>
-                <input
-                  className="set-input"
-                  type="text"
-                  placeholder="deepseek-chat"
-                  value={form.deepseek.model}
-                  onChange={(e) => setD('model', e.target.value)}
-                />
-              </div>
-
               {/* 自定义模型组：每次添加 = 一个 OpenAI 兼容 URL + 多个模型 ID */}
               <div className="set-group">
                 <div className="set-label">模型组（自定义 OpenAI 兼容接口）</div>
@@ -1863,6 +2263,10 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, onThemeChang
                     editing={editing === gi}
                     draft={draft}
                     setDraft={setDraft}
+                    test={cardTest[g.id]}
+                    onTest={(e) => runCardTest(g, e)}
+                    formTest={formTest}
+                    onFormTest={runFormTest}
                     onEdit={() => startEdit(gi)}
                     onRemove={() => removeGroup(gi)}
                     onCancel={cancelForm}
@@ -1875,6 +2279,8 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, onThemeChang
                       draft={draft}
                       setDraft={setDraft}
                       apiKeyPlaceholder="sk-…"
+                      test={formTest}
+                      onTest={runFormTest}
                       onCancel={cancelForm}
                       onSubmit={confirmAdd}
                       submitLabel="添加模型组"
@@ -2098,7 +2504,7 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, onThemeChang
                 </label>
                 <label className="set-radio">
                   <input type="radio" name="theme" checked={theme === 'light'} onChange={() => onThemeChange('light')} />
-                  ☀️ 亮色
+                  🌞 亮色
                 </label>
               </div>
 
@@ -2119,6 +2525,77 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, onThemeChang
           </div>
         </div>
       </div>
+
+      {/* 测试连接结果漂浮气泡：跟随测试按钮弹出；成功自动消失，失败手动关闭 */}
+      {bubble && (
+        <div
+          className={`test-bubble ${bubble.status}${bubble.leaving ? ' leaving' : ''}`}
+          style={{ top: bubble.top, bottom: bubble.bottom, right: bubble.right }}
+          role="status"
+        >
+          <span>{bubble.status === 'ok' ? '✓ 连接正常' : '✗ ' + (bubble.error || '连接失败')}</span>
+          {bubble.status === 'fail' && (
+            <button className="test-bubble-close" onClick={() => setBubble(null)} title="关闭">
+              ✕
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// opencode 内置模式（agent）说明：build 全工具开发；plan 只读规划（禁 write/edit/patch/bash）
+const AGENT_OPTIONS = [
+  { id: 'build', label: '执行 - Build', desc: '可修改文件、执行命令（默认）' },
+  { id: 'plan', label: '规划 - Plan', desc: '只读权限：不能修改文件、不执行命令' }
+]
+
+// 模式选择器：与模型选择器同款交互（按钮 + 向上弹出的选项列表），位于模型选择器左侧
+function AgentPicker({ value, onPick }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef(null)
+  // 点击外部 / 失焦时关闭
+  useEffect(() => {
+    if (!open) return
+    const close = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false)
+    }
+    window.addEventListener('click', close)
+    window.addEventListener('blur', close)
+    return () => {
+      window.removeEventListener('click', close)
+      window.removeEventListener('blur', close)
+    }
+  }, [open])
+  const current = AGENT_OPTIONS.find((a) => a.id === value) || AGENT_OPTIONS[0]
+  return (
+    <div className="model-picker" ref={ref}>
+      <button
+        className="model-pick-btn"
+        onClick={() => setOpen(!open)}
+        title="本次对话的模式（build：可修改文件、执行命令；plan：只读，不能修改文件）"
+      >
+        <span className="mp-label">{current.label}</span>
+        <span className="mp-arrow">{open ? '▴' : '▾'}</span>
+      </button>
+      {open && (
+        <div className="model-pop">
+          {AGENT_OPTIONS.map((a) => (
+            <button
+              key={a.id}
+              className={`model-opt ${value === a.id ? 'active' : ''}`}
+              onClick={() => {
+                onPick(a.id)
+                setOpen(false)
+              }}
+            >
+              <div className="mp-opt-title">{a.label}</div>
+              <div className="mp-opt-desc">{a.desc}</div>
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -2251,34 +2728,33 @@ function MessageView({ m, onCopy }) {
     <div className="row assistant">
       <div className="bubble assistant">
         {m.aborted && <div className="aborted-badge">已停止（输出不完整）</div>}
+        {m.error && !m.aborted && <div className="msg-error">回复失败：{m.error}</div>}
         {m.parts.map((p, i) => {
           if (p.type === 'text') return null // 文本统一由下方 TextBlock 渲染
           if (p.type === 'reasoning') {
             return <ReasoningBlock key={i} text={p.text} streaming={m.streaming} />
           }
           if (p.type === 'tool') {
-            const input = p.state?.input
-            const summary = input
-              ? typeof input === 'string'
-                ? input
-                : JSON.stringify(input).slice(0, 100)
-              : ''
+            // 仅显示工具名与状态，隐藏输入参数（可能含文件路径 / 完整代码，避免信息泄露）
             const st = p.state?.status || ''
             return (
               <div key={i} className={`tool-chip ${st}`}>
-                [工具] {p.tool} {st && `· ${STATUS_LABEL[st] || st}`} {summary && `· ${summary}`}
+                [工具] {p.tool} {st && `· ${STATUS_LABEL[st] || st}`}
               </div>
             )
           }
           return null
         })}
         {mdText.trim() && <TextBlock key="text" text={mdText} streamed={m.streamed} />}
-        {mdText.trim() && !m.streaming && !m.aborted && (
-          <div className="msg-actions">
-            <button onClick={() => onCopy(mdText)}>复制</button>
-          </div>
-        )}
       </div>
+      {mdText.trim() && !m.streaming && !m.aborted && (
+        <button className="copy-btn" title="复制" onClick={() => onCopy(mdText)}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+          </svg>
+        </button>
+      )}
     </div>
   )
 }

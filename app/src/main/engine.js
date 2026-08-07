@@ -1,11 +1,51 @@
 // opencode 引擎进程管理：检测/启动/健康检查/退出监听
-const { spawn } = require('node:child_process')
+const { spawn, execSync } = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
 
 const DEFAULT_PORT = 4096
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// 结束占用指定端口的进程（Windows：netstat 找 PID → taskkill）
+// 用于「复用外部引擎」场景：应用启动时发现端口已有健康服务则复用（this.child 为 null，owned=false），
+// 此时 stop() 无法直接结束进程；但端口占用者是明确的 —— 只有结束它，重启/退出后新进程才能以新环境变量真正启动
+function killPortOwner(port) {
+  let killed = 0
+  try {
+    const out = execSync(`netstat -ano -p tcp | findstr "127.0.0.1:${port} "`, {
+      encoding: 'utf8',
+      windowsHide: true
+    })
+    for (const line of out.split(/\r?\n/)) {
+      const m = line.trim().match(/LISTENING\s+(\d+)\s*$/)
+      if (!m) continue
+      try {
+        execSync(`taskkill /F /PID ${m[1]}`, { stdio: 'ignore', windowsHide: true })
+        killed++
+      } catch {
+        /* 进程可能已退出，忽略 */
+      }
+    }
+  } catch {
+    /* netstat 无匹配输出 */
+  }
+  return killed > 0
+}
+
+// 等待端口不再有健康服务（taskkill 后进程释放端口需要一点时间，避免紧随其后的 spawn 端口冲突）
+function waitPortFree(port, timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    const start = Date.now()
+    const poll = async () => {
+      const h = await healthCheck(port, 400).catch(() => null)
+      if (!h || !h.healthy) return resolve(true)
+      if (Date.now() - start >= timeoutMs) return resolve(false)
+      setTimeout(poll, 150)
+    }
+    poll()
+  })
+}
 
 // 探测 opencode 可执行文件位置：打包版随应用分发 → 环境变量 → npm 全局安装目录
 function findOpencodeExe() {
@@ -98,17 +138,17 @@ class Engine {
     if (!force) {
       const existing = await healthCheck(this.port, 2000)
       if (existing && existing.healthy) {
-        console.log('[engine] start(): 复用已有健康引擎（未重启）')
+        console.log('[engine] start(): reusing healthy engine (no restart)')
         this.owned = false
         return await this.status()
       }
     }
     if (!this.exe) {
-      throw new Error('未找到 opencode 可执行文件，请设置环境变量 XWORK_OPENCODE_PATH 指向 opencode.exe')
+      throw new Error('opencode executable not found, set env XWORK_OPENCODE_PATH to opencode.exe')
     }
     // 回收残留 child（并发启动冲突进程等），避免多个 opencode 争抢端口
     if (this.child) {
-      console.log('[engine] start(): 清理残留 child pid=', this.child.pid)
+      console.log('[engine] start(): cleaning stale child pid=', this.child.pid)
       await this.stop()
     }
     for (const d of ['config', 'state', 'data']) {
@@ -126,13 +166,13 @@ class Engine {
     )
     this.child = child
     this.owned = true
-    console.log('[engine] start(): 已 spawn 新进程 pid=', child.pid, 'cwd=', this.cwd)
+    console.log('[engine] start(): spawned new process pid=', child.pid, 'cwd=', this.cwd)
     let outBuf = ''
     child.stdout?.on('data', (d) => (outBuf += d))
     child.stderr?.on('data', (d) => (outBuf += d))
     // exit 回调只在自己仍是当前 child 时才清引用（避免并发冲突进程退出时误清真正服务的进程）
     child.on('exit', (code, sig) => {
-      console.log('[engine] 子进程退出 pid=', child.pid, 'code=', code, 'sig=', sig)
+      console.log('[engine] child exited pid=', child.pid, 'code=', code, 'sig=', sig)
       if (this.child === child) this.child = null
       if (this.onExit) this.onExit(code)
     })
@@ -149,14 +189,21 @@ class Engine {
   async stop(timeoutMs = 5000) {
     const child = this.child
     console.log('[engine] stop() child=', child?.pid || null)
-    if (!child) return
+    if (!child) {
+      // 复用引擎（非自启）场景：无自有 child 可结束，但端口占用者是明确的 —— 结束它，
+      // 否则后续 force 重启 / 退出后旧进程仍以旧环境变量（旧 key）占着端口，新配置无法生效
+      const killed = killPortOwner(this.port)
+      console.log('[engine] stop(): no own child, killed port owner=', killed)
+      if (killed) await waitPortFree(this.port)
+      return
+    }
     this.child = null
     const exited = new Promise((resolve) => child.once('exit', () => resolve(true)))
     try {
       child.kill()
-      console.log('[engine] stop(): 已发送 kill 给 pid=', child.pid)
+      console.log('[engine] stop(): sent kill to pid=', child.pid)
     } catch (e) {
-      console.log('[engine] stop(): kill 抛错', e.message)
+      console.log('[engine] stop(): kill threw', e.message)
     }
     const exitedOk = await Promise.race([exited, sleep(timeoutMs).then(() => false)])
     if (!exitedOk) {

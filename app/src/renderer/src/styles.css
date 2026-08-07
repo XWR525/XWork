@@ -11,8 +11,8 @@
   --border: #262d3a;
   --text: #e6e9ef;
   --text-dim: #8b93a3;
-  --accent: #4f8cff;
-  --accent2: #3b6fd6;
+  --accent: #3f78e0;
+  --accent2: #3263c4;
   --danger: #e5534b;
   --ok: #3fb950;
   --user-bubble: #2a4d8f;
@@ -217,6 +217,48 @@ body {
   display: flex;
   flex: 1;
   min-height: 0;
+}
+
+/* ---------- 侧栏边缘拖拽调整大小 ---------- */
+.sidebar,
+.task-side {
+  position: relative;
+}
+.resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 30;
+  transition: background 0.12s;
+}
+/* 左边栏手柄居中对齐于右缘分隔线；任务面板手柄在其左缘（收起态隐藏） */
+.sidebar > .resize-handle {
+  right: -3px;
+}
+.task-side > .resize-handle {
+  left: 0;
+}
+.task-side.closed > .resize-handle {
+  display: none;
+}
+.resize-handle:hover {
+  background: var(--accent);
+  opacity: 0.35;
+}
+/* 拖动中：全局十字光标 + 禁用文本选择，避免拖拽误选文字 */
+body.resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+/* 拖动中禁用宽度过渡：否则任务面板的展开/收起动画会让宽度滞后于鼠标 */
+body.resizing .task-side {
+  transition: none;
+}
+/* 竖向拖拽（输入区高度）：覆盖横向光标 */
+body.resizing-v {
+  cursor: row-resize;
 }
 
 .sidebar {
@@ -534,6 +576,142 @@ body {
   cursor: not-allowed;
 }
 
+/* ---------- 所有工作区：文件面板底部可展开列表 ---------- */
+.ws-all {
+  flex-shrink: 0;
+  border-top: 1px solid var(--border);
+}
+
+.ws-all-btn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.ws-all-btn:hover:not(:disabled) {
+  background: var(--panel2);
+}
+
+.ws-all-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ws-all-btn .caret {
+  color: var(--text-dim);
+  font-size: 14px;
+  transition: transform 0.2s;
+}
+
+.ws-all-btn.open .caret {
+  transform: rotate(90deg);
+}
+
+.ws-all-list {
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  transform: translateY(8px);
+  border-top: 1px solid transparent;
+  transition: max-height 0.28s ease, opacity 0.22s ease, transform 0.28s ease, border-color 0.22s ease;
+}
+
+.ws-all-list.open {
+  max-height: 240px;
+  border-top-color: var(--border);
+  opacity: 1;
+  transform: translateY(0);
+  overflow-y: auto;
+}
+
+.ws-all-item {
+  position: relative;
+  padding: 7px 12px;
+  cursor: pointer;
+  border-left: 3px solid transparent;
+}
+
+.ws-all-item:hover {
+  background: var(--panel2);
+}
+
+.ws-all-item.active {
+  background: var(--panel2);
+  border-left-color: var(--accent);
+}
+
+.ws-all-name {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ws-all-path {
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 1px;
+}
+
+.ws-all-meta {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+/* 路径已不存在于当前电脑：删除线 + 整体降淡 */
+.ws-all-item.missing {
+  opacity: 0.7;
+}
+
+.ws-all-item.missing .ws-all-name,
+.ws-all-item.missing .ws-all-path {
+  text-decoration: line-through;
+  color: var(--text-dim);
+}
+
+.ws-all-item.missing:hover {
+  opacity: 1;
+}
+
+/* 缺失路径工作区的删除按钮（×）：右上角小叉，hover 变危险色 */
+.ws-all-del {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+
+.ws-all-del:hover {
+  background: var(--panel2);
+  color: var(--danger);
+}
+
 .ws-tree {
   flex: 1;
   overflow-y: auto;
@@ -580,7 +758,7 @@ body {
 
 .ws-file.added {
   color: var(--text);
-  background: rgba(79, 140, 255, 0.1);
+  background: rgba(63, 120, 224, 0.1);
 }
 
 .ws-add {
@@ -604,7 +782,7 @@ body {
 }
 
 .ws-add:hover {
-  background: rgba(79, 140, 255, 0.15);
+  background: rgba(63, 120, 224, 0.15);
 }
 
 .ws-name {
@@ -613,7 +791,10 @@ body {
 }
 
 .ws-empty {
-  padding: 10px 12px;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   color: var(--text-dim);
   font-size: 12px;
 }
@@ -933,6 +1114,19 @@ body {
   margin-bottom: 8px;
 }
 
+.msg-error {
+  display: inline-block;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #ff6b6b;
+  background: rgba(255, 107, 107, 0.1);
+  border: 1px solid rgba(255, 107, 107, 0.4);
+  border-radius: 6px;
+  padding: 4px 10px;
+  margin-bottom: 8px;
+  word-break: break-all;
+}
+
 .busy-hint {
   text-align: center;
   color: var(--text-dim);
@@ -947,6 +1141,23 @@ body {
   padding: 10px 16px 12px;
   border-top: 1px solid var(--border);
   background: var(--panel);
+  position: relative; /* 上缘拖拽手柄的定位基准 */
+}
+
+/* 输入区上缘拖拽手柄：居中于分隔线，向上拉高输入区 */
+.composer-resize {
+  position: absolute;
+  top: -3px;
+  left: 0;
+  right: 0;
+  height: 6px;
+  cursor: row-resize;
+  z-index: 30;
+  transition: background 0.12s;
+}
+.composer-resize:hover {
+  background: var(--accent);
+  opacity: 0.35;
 }
 
 .composer-box {
@@ -964,7 +1175,7 @@ body {
 
 .composer-box:focus-within {
   border-color: var(--accent);
-  box-shadow: 0 0 0 1px rgba(79, 140, 255, 0.25);
+  box-shadow: 0 0 0 1px rgba(63, 120, 224, 0.25);
 }
 
 .composer-box textarea {
@@ -1015,8 +1226,8 @@ body {
   max-width: 260px;
   font-size: 12px;
   color: var(--text);
-  background: rgba(79, 140, 255, 0.14);
-  border: 1px solid rgba(79, 140, 255, 0.4);
+  background: rgba(63, 120, 224, 0.14);
+  border: 1px solid rgba(63, 120, 224, 0.4);
   border-radius: 12px;
   padding: 2px 6px 2px 9px;
   white-space: nowrap;
@@ -1058,7 +1269,7 @@ body {
 }
 
 .model-pick-btn:hover {
-  background: rgba(79, 140, 255, 0.12);
+  background: rgba(63, 120, 224, 0.12);
 }
 
 .mp-label {
@@ -1112,19 +1323,35 @@ body {
   text-overflow: ellipsis;
 }
 
+.model-opt.active {
+  color: var(--accent);
+}
+
+/* 置于 :hover 之前：悬浮时同特异性下 :hover 后写生效，已选项文字变白（背景为强调色） */
 .model-opt:hover {
   background: var(--accent);
   color: #fff;
-}
-
-.model-opt.active {
-  color: var(--accent);
 }
 
 .model-pop-empty {
   padding: 8px 10px;
   font-size: 12px;
   color: var(--text-dim);
+}
+
+/* 模式选择（AgentPicker）选项：标题 + 说明两行 */
+.mp-opt-title {
+  font-size: 12px;
+}
+.mp-opt-desc {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+  white-space: normal;
+  line-height: 1.4;
+}
+.model-opt:hover .mp-opt-desc {
+  color: rgba(255, 255, 255, 0.85);
 }
 
 /* 发送 / 停止：圆角矩形右下角的圆形按钮 */
@@ -1220,11 +1447,23 @@ body {
   opacity: 0.5;
 }
 
+/* 执行中：绿-灰 渐变闪烁循环（仅收起窄条上可见，提示任务进行中） */
+@keyframes ts-busy-blink {
+  0%,
+  100% {
+    background: var(--ok);
+    box-shadow: 0 0 6px var(--ok);
+    opacity: 1;
+  }
+  50% {
+    background: var(--text-dim);
+    box-shadow: none;
+    opacity: 0.7;
+  }
+}
+
 .ts-dot.busy {
-  background: var(--accent);
-  opacity: 1;
-  box-shadow: 0 0 6px var(--accent);
-  animation: blink 1s infinite;
+  animation: ts-busy-blink 1.2s ease-in-out infinite;
 }
 
 .ts-text {
@@ -1306,8 +1545,8 @@ body {
 }
 
 .tool-card.running {
-  border-color: rgba(79, 140, 255, 0.4);
-  background: rgba(79, 140, 255, 0.06);
+  border-color: rgba(63, 120, 224, 0.4);
+  background: rgba(63, 120, 224, 0.06);
 }
 
 .tool-card.error {
@@ -1379,7 +1618,7 @@ body {
 
 .tool-status.running {
   color: var(--accent);
-  border-color: rgba(79, 140, 255, 0.5);
+  border-color: rgba(63, 120, 224, 0.5);
 }
 
 .tool-status.completed {
@@ -1431,90 +1670,26 @@ body {
   animation: blink 1s infinite;
 }
 
-/* ---------- 任务模板区 ---------- */
-.template-section {
+/* ---------- 空会话问候语 ---------- */
+.greeting {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 48px 24px;
-  min-height: 60%;
+  gap: 8px;
+  height: 100%;
+  text-align: center;
+  padding: 24px;
 }
 
-.tpl-title {
+.greet-title {
   font-size: 18px;
   font-weight: 700;
-  margin-bottom: 20px;
-  color: var(--text);
 }
 
-.tpl-grid {
-  display: flex;
-  gap: 14px;
-  flex-wrap: wrap;
-  justify-content: center;
-  max-width: 560px;
-}
-
-.tpl-card {
-  width: 220px;
-  background: var(--panel2);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 18px;
-  cursor: pointer;
-  transition: border-color 0.15s, transform 0.15s;
-}
-
-.tpl-card:hover {
-  border-color: var(--accent);
-  transform: translateY(-2px);
-}
-
-.tpl-card.active {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px rgba(79, 140, 255, 0.3);
-}
-
-.tpl-icon {
-  font-size: 28px;
-  margin-bottom: 10px;
-}
-
-.tpl-name {
-  font-size: 15px;
-  font-weight: 600;
-  margin-bottom: 6px;
-}
-
-.tpl-desc {
-  font-size: 12px;
+.greet-sub {
+  font-size: 13px;
   color: var(--text-dim);
-  line-height: 1.5;
-}
-
-.tpl-form {
-  display: flex;
-  gap: 10px;
-  margin-top: 20px;
-  width: 100%;
-  max-width: 560px;
-}
-
-.tpl-form input {
-  flex: 1;
-  background: var(--panel2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  color: var(--text);
-  padding: 10px 12px;
-  font-size: 14px;
-  font-family: inherit;
-}
-
-.tpl-form input:focus {
-  outline: none;
-  border-color: var(--accent);
 }
 
 /* ---------- Markdown 报告正文 ---------- */
@@ -1648,6 +1823,11 @@ body {
   animation: mask-in 0.15s ease-out;
 }
 
+/* 需要盖过其他弹窗（如 SKILL HUB 上的卸载确认框）的遮罩 */
+.perm-mask.z-top {
+  z-index: 120;
+}
+
 @keyframes mask-in {
   from {
     opacity: 0;
@@ -1739,7 +1919,7 @@ body {
 
 .q-opt.sel {
   border-color: var(--accent);
-  background: rgba(79, 140, 255, 0.12);
+  background: rgba(63, 120, 224, 0.12);
 }
 
 /* 「其它（自行输入）」：虚线边框弱化，与预设选项区分 */
@@ -1831,26 +2011,29 @@ body {
   opacity: 0.88;
 }
 
-/* ---------- 消息操作栏（复制，位于 AI 气泡右下角） ---------- */
-.msg-actions {
+/* ---------- 复制按钮：小图标，位于 AI 气泡外侧右下角（气泡右侧贴底） ---------- */
+.copy-btn {
+  align-self: flex-end;
+  flex-shrink: 0;
+  margin-left: 6px;
+  width: 24px;
+  height: 24px;
   display: flex;
-  justify-content: flex-end;
-  margin-top: 10px;
-}
-
-.msg-actions button {
-  padding: 4px 12px;
-  font-size: 12px;
+  align-items: center;
+  justify-content: center;
+  border: none;
   border-radius: 6px;
-  border: 1px solid var(--border);
   background: transparent;
   color: var(--text-dim);
   cursor: pointer;
+  opacity: 0.85;
+  transition: color 0.15s, background 0.15s, opacity 0.15s;
 }
 
-.msg-actions button:hover {
+.copy-btn:hover {
   color: var(--accent);
-  border-color: var(--accent);
+  background: var(--panel2);
+  opacity: 1;
 }
 
 /* ---------- 操作提示 ---------- */
@@ -1868,6 +2051,133 @@ body {
   max-width: 70vw;
   word-break: break-all;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+
+/* ---------- SKILL HUB 面板 ---------- */
+.skill-hub-card {
+  width: 880px;
+  height: 80vh;
+  max-height: none;
+  display: flex;
+  flex-direction: column;
+}
+
+.skill-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 10px;
+  align-content: start;
+  overflow-y: auto;
+  margin: 4px 0 2px;
+  padding-right: 4px;
+  flex: 1;
+  min-height: 0;
+}
+
+.skill-hub-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 40px 0;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.skill-hub-error {
+  max-width: 460px;
+  text-align: center;
+  line-height: 1.6;
+  word-break: break-all;
+}
+
+.skill-hub-state button {
+  padding: 7px 18px;
+  border-radius: 8px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  font-size: 13px;
+  transition: background 0.12s;
+}
+
+.skill-hub-state button:hover {
+  background: var(--accent2);
+}
+
+.skill-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px;
+  background: var(--panel2);
+}
+
+.skill-icon {
+  font-size: 26px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.skill-card-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.skill-card-head {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  margin-bottom: 6px;
+}
+
+.skill-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.skill-slug {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-family: Consolas, 'Courier New', monospace;
+}
+
+.skill-desc {
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+.skill-meta {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.skill-install {
+  flex-shrink: 0;
+  padding: 5px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  font-size: 12px;
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.skill-install:hover {
+  background: var(--accent2);
+  border-color: var(--accent2);
+}
+
+.skill-install:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 /* ---------- 设置面板 ---------- */
@@ -2197,7 +2507,85 @@ body {
 
 .mg-edit:hover {
   color: var(--accent);
-  background: rgba(79, 140, 255, 0.12);
+  background: rgba(63, 120, 224, 0.12);
+}
+
+/* 测试连接按钮（卡片操作区） */
+.mg-test {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 5px;
+}
+
+.mg-test:hover:not(:disabled) {
+  color: var(--accent);
+  background: rgba(63, 120, 224, 0.12);
+}
+
+.mg-test:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 测试结果漂浮气泡：fixed 定位跟随测试按钮；成功绿 / 失败红 */
+.test-bubble {
+  position: fixed;
+  z-index: 400;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 60vw;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  word-break: break-all;
+  color: #fff;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  animation: bubble-in 0.15s ease;
+  transition: opacity 0.25s ease;
+}
+
+.test-bubble.leaving {
+  opacity: 0;
+}
+
+.test-bubble.ok {
+  background: rgba(63, 185, 80, 0.95);
+}
+
+.test-bubble.fail {
+  background: rgba(217, 52, 59, 0.95);
+}
+
+.test-bubble-close {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px;
+}
+
+.test-bubble-close:hover {
+  color: #fff;
+}
+
+@keyframes bubble-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .mg-row {
@@ -2224,7 +2612,7 @@ body {
 
 .mg-add:hover {
   border-color: var(--accent);
-  background: rgba(79, 140, 255, 0.06);
+  background: rgba(63, 120, 224, 0.06);
 }
 
 /* 模型组卡片编辑切换动画：表单与卡片 display 互斥，容器 height 平滑过渡（JS 测量内容高度） */
@@ -2399,7 +2787,7 @@ body {
 .perm-opt input:checked + span[data-action='ask'] {
   color: var(--accent);
   border-color: var(--accent);
-  background: rgba(79, 140, 255, 0.12);
+  background: rgba(63, 120, 224, 0.12);
 }
 
 .perm-opt input:checked + span[data-action='deny'] {
