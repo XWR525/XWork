@@ -1,5 +1,14 @@
+// 统一配置（app/app.config.json）：技能服务地址、窗口尺寸、引擎端口、各超时/时长等
+// 用户可通过设置面板「配置」页覆盖部分字段（存于 xwork-settings.json 的 config 层）
+const { cfg, mergeConfig } = require('./config')
+
+// 有效配置 = app.config.json 默认值 + 用户覆盖层（设置面板保存）
+function effectiveConfig() {
+  return mergeConfig(cfg, settings.load().config || {})
+}
+
 // 主进程入口：窗口管理 + IPC 桥 + 引擎生命周期
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron')
+const { app, BrowserWindow, ipcMain, dialog, shell, Menu, Notification, Tray, nativeImage } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
 const { Engine } = require('./engine')
@@ -15,6 +24,74 @@ let win = null
 let engine = null
 let bridge = null
 let sseActive = false
+// 系统托盘（关闭时最小化到托盘功能）：tray 常驻、退出标志、首次托盘提示防重复
+let tray = null
+let isQuitting = false
+let trayNotified = false
+// 手动停止的会话：跳过该会话下一次 session.idle 的「已完成」通知（停止 ≠ 完成，避免误导）
+const skipIdleNotif = new Map()
+
+// 托盘图标：内嵌 16x16 PNG（蓝色圆角方块 + 白色 X），不依赖外部文件，开发/打包均可靠
+const TRAY_ICON = nativeImage.createFromDataURL(
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWElEQVR4nGNgoDawr3jwHx/Gq/n///94NYMwCODUDAP4NMMAVmfjMwSbHFZ/Y1OIy2CcAYcL4AxQQv7FFS60M4AiL1AUiPhswyZHvYRElaSML0aIzkzkAACTrxDPgW0/SAAAAABJRU5ErkJggg=='
+)
+// 显示主窗口：最小化则恢复，然后显示并聚焦
+function showMainWindow() {
+  if (!win || win.isDestroyed()) return
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+}
+
+// Windows 通知：点击恢复主窗口；系统不支持通知时静默忽略
+function notify(body) {
+  try {
+    const n = new Notification({ title: 'XWork', body })
+    n.on('click', showMainWindow)
+    n.show()
+  } catch {
+    /* 系统不支持通知时忽略 */
+  }
+}
+
+// 任务通知：仅当窗口不在前台（失焦/隐藏/最小化）且设置开启时弹系统通知。
+// 前台时回复文字与提问弹窗用户直接可见，系统通知是打扰；
+// 手动停止的任务不弹「已完成」（skipIdleNotif 标志区分，避免误导）
+function maybeNotify(evt) {
+  if (!settings.load().notifyTask) return
+  if (win && !win.isDestroyed() && win.isFocused()) return
+  const sid = evt.properties?.sessionID
+  if (evt.type === 'session.idle') {
+    if (sid && skipIdleNotif.has(sid)) {
+      skipIdleNotif.delete(sid)
+      return
+    }
+    notify('AI 已完成回复')
+  } else if (evt.type === 'question.asked') {
+    const q = (evt.properties?.questions || [])[0]
+    if (q?.question) notify('AI 向你提问：' + String(q.question).slice(0, 40))
+  }
+}
+// 创建系统托盘：单击恢复窗口；右键菜单「显示主窗口 / 退出」
+function createTray() {
+  if (tray) return
+  tray = new Tray(TRAY_ICON)
+  tray.setToolTip('XWork')
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: '显示主窗口', click: showMainWindow },
+      { type: 'separator' },
+      {
+        label: '退出',
+        click: () => {
+          isQuitting = true
+          app.quit()
+        }
+      }
+    ])
+  )
+  tray.on('click', showMainWindow)
+}
 
 const xdgHome =
   process.env.XWORK_OPCODE_HOME || path.join(app.getPath('userData'), 'opencode')
@@ -59,15 +136,16 @@ function wsRecord(dir) {
 }
 
 function createWindow() {
+  const w = effectiveConfig().window
   win = new BrowserWindow({
-    width: 1180,
-    height: 780,
-    minWidth: 900,
-    minHeight: 600,
+    width: w.width,
+    height: w.height,
+    minWidth: w.minWidth,
+    minHeight: w.minHeight,
     title: 'XWork',
     // 无边框自绘标题栏（与暗色 UI 统一），窗口控制由渲染层按钮 + IPC 完成
     frame: false,
-    backgroundColor: '#0f1115',
+    backgroundColor: w.backgroundColor,
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
@@ -85,6 +163,21 @@ function createWindow() {
   win.webContents.on('did-finish-load', () => {
     win.webContents.send('engine:event', { type: 'app.ready', properties: {} })
   })
+  // 关闭时动作：设置开启「最小化到托盘」时拦截关闭 → 隐藏窗口（引擎继续后台运行）；
+  // 从托盘「退出」或真正退出时 isQuitting=true，放行关闭
+  win.on('close', (e) => {
+    if (isQuitting || settings.load().closeAction !== 'tray') return
+    e.preventDefault()
+    win.hide()
+    if (!trayNotified) {
+      trayNotified = true
+      try {
+        new Notification({ title: 'XWork', body: '已最小化到系统托盘，点击托盘图标可恢复窗口' }).show()
+      } catch {
+        /* 系统不支持通知时忽略 */
+      }
+    }
+  })
 }
 
 // 全局事件流转发到渲染进程（异常后自动重连）
@@ -98,13 +191,14 @@ function startGlobalWatch() {
         await bridge.watchGlobal((evt) => {
           console.log('[sse] event:', evt.type)
           if (win && !win.isDestroyed()) win.webContents.send('engine:event', evt)
+          maybeNotify(evt)
         })
         console.log('[sse] stream closed')
       } catch (e) {
         console.error('[sse] disconnected:', e.message)
       }
       if (!sseActive) break
-      await new Promise((r) => setTimeout(r, 2000))
+      await new Promise((r) => setTimeout(r, cfg.timings.sseReconnectMs))
     }
   }
   loop()
@@ -115,6 +209,7 @@ app.whenReady().then(async () => {
   engine = new Engine({
     xdgHome,
     cwd: cfg.workspace || null, // 工作区（上次打开的目录）
+    port: effectiveConfig().enginePort, // 引擎端口（用户可在设置面板「配置」页覆盖，重启应用后生效）
     extraEnv: () => settings.env(), // 注入模型 API Key 环境变量
     onExit: (code) => {
       if (win && !win.isDestroyed()) {
@@ -125,8 +220,9 @@ app.whenReady().then(async () => {
       }
     }
   })
-  bridge = new Bridge()
+  bridge = new Bridge(effectiveConfig().enginePort)
   createWindow()
+  createTray()
   try {
     applyToOpencode(opencodeConfig, settings) // 保证 provider 段与设置一致
     await engine.start()
@@ -170,6 +266,43 @@ ipcMain.handle('app:info', () => ({
   node: process.versions.node,
   platform: `${process.platform} ${process.arch}`
 }))
+
+// 有效配置（默认值 + 用户覆盖层）：渲染层取隐藏列表/时长；设置面板「配置」页取全部可编辑字段
+ipcMain.handle('config:get', () => effectiveConfig())
+
+// 配置表单 → 用户覆盖层：仅接受已知字段并做类型/范围校验，非法键丢弃
+function sanitizeConfigOverrides(raw) {
+  const out = {}
+  if (!raw || typeof raw !== 'object') return out
+  if (typeof raw.skillApiBase === 'string' && raw.skillApiBase.trim()) {
+    out.skillApiBase = raw.skillApiBase.trim()
+  }
+  const port = Number(raw.enginePort)
+  if (Number.isInteger(port) && port >= 1 && port <= 65535) out.enginePort = port
+  if (raw.window && typeof raw.window === 'object') {
+    const w = {}
+    for (const k of ['width', 'height', 'minWidth', 'minHeight']) {
+      const v = Number(raw.window[k])
+      if (Number.isInteger(v) && v > 0) w[k] = v
+    }
+    if (Object.keys(w).length) out.window = w
+  }
+  for (const k of ['hideDirs', 'hideFiles']) {
+    // 数组整体替换：空数组也保存（清空 = 不再隐藏任何目录/文件，覆盖默认列表）
+    if (Array.isArray(raw[k])) {
+      out[k] = raw[k].map((x) => String(x).trim()).filter(Boolean)
+    }
+  }
+  return out
+}
+
+// 保存配置覆盖层：写入 settings（引擎端口/窗口尺寸需重启应用后生效）
+ipcMain.handle('config:save', (_e, raw) => {
+  const overrides = sanitizeConfigOverrides(raw)
+  settings.save({ config: overrides })
+  console.log('[config] saved overrides:', JSON.stringify(overrides))
+  return { ok: true }
+})
 
 // 渲染进程日志转发（preload 补丁 console 后经此写入主进程日志文件）
 ipcMain.on('log:write', (_e, { level, text }) => {
@@ -458,6 +591,22 @@ ipcMain.handle('settings:apply-theme', (_e, theme) => {
   return { ok: true }
 })
 
+// 关闭时动作：quit = 关闭程序 | tray = 最小化到托盘（仅持久化，主进程读取后即时生效）
+ipcMain.handle('settings:apply-close-action', (_e, action) => {
+  if (action !== 'tray' && action !== 'quit') return { ok: false }
+  settings.save({ closeAction: action })
+  console.log('[settings] closeAction =', action)
+  return { ok: true }
+})
+
+// 任务通知开关：仅持久化，主进程读取后即时生效
+ipcMain.handle('settings:apply-notify-task', (_e, on) => {
+  if (typeof on !== 'boolean') return { ok: false }
+  settings.save({ notifyTask: on })
+  console.log('[settings] notifyTask =', on)
+  return { ok: true }
+})
+
 // 保存设置：写入存储 + 应用 opencode.json；restart=true（「保存并重启引擎」）时无条件重启引擎，
 // 不以配置是否变化为条件——按钮语义即「显式重启」，即使未改动配置也应真正重启
 ipcMain.handle('settings:save', async (_e, raw, restart = true) => {
@@ -492,7 +641,25 @@ ipcMain.handle('message:send', async (_e, sessionID, text, model, agent) => {
 
 ipcMain.handle('message:list', (_e, sessionID) => bridge.getMessages(sessionID))
 
-ipcMain.handle('message:abort', (_e, sessionID) => bridge.abortMessage(sessionID))
+ipcMain.handle('message:abort', (_e, sessionID) => {
+  if (sessionID) skipIdleNotif.set(sessionID, true) // 手动停止 ≠ 完成：跳过该会话的「已完成」通知
+  return bridge.abortMessage(sessionID)
+})
+
+// 压缩会话：委托引擎原生 summarize（等效 TUI /compact，需指定总结所用模型，异步执行，进度经全局事件流推送）
+ipcMain.handle('session:compact', async (_e, sessionID, model) => {
+  if (!sessionID || typeof sessionID !== 'string') return { ok: false, error: '无效的会话 ID' }
+  if (!model || typeof model.providerID !== 'string' || typeof model.modelID !== 'string') {
+    return { ok: false, error: '缺少总结所用模型' }
+  }
+  try {
+    await bridge.compactSession(sessionID, model)
+    return { ok: true }
+  } catch (e) {
+    console.error('[session:compact] failed:', e.message)
+    return { ok: false, error: e.message || '压缩会话失败' }
+  }
+})
 
 ipcMain.handle('permission:respond', (_e, { sessionID, permissionID, response }) =>
   bridge.respondPermission(sessionID, permissionID, response)
@@ -521,13 +688,13 @@ ipcMain.handle('question:reject', async (_e, requestID) => {
 })
 
 // SKILL HUB：从本地技能服务拉取可用技能列表（JSON 数组），5s 超时防卡死
-// 必须用 localhost：技能服务只监听 localhost（IPv6），127.0.0.1:4321 是另一程序占用（404）
-const SKILL_API = 'http://localhost:4321/api/skill/list'
+// 注意：技能服务只监听 localhost（IPv6），127.0.0.1:4321 是另一程序占用（404）
 ipcMain.handle('skill:list', async () => {
+  const base = effectiveConfig().skillApiBase
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), 5000)
   try {
-    const res = await fetch(SKILL_API, { signal: ctrl.signal })
+    const res = await fetch(`${base}/api/skill/list`, { signal: ctrl.signal })
     if (!res.ok) return { ok: false, error: `技能服务响应异常（HTTP ${res.status}）` }
     const list = await res.json()
     console.log(`[skill] fetch ok, items=${Array.isArray(list) ? list.length : 'non-array'}`)
@@ -536,7 +703,7 @@ ipcMain.handle('skill:list', async () => {
     console.warn('[skill] fetch failed:', e.name, e.message)
     return {
       ok: false,
-      error: e.name === 'AbortError' ? '技能服务连接超时' : '无法连接技能服务（localhost:4321）'
+      error: e.name === 'AbortError' ? '技能服务连接超时' : `无法连接技能服务（${base}）`
     }
   } finally {
     clearTimeout(timer)
@@ -559,20 +726,20 @@ function safeZipRel(name) {
   return out.join('/')
 }
 
-// SKILL 安装：确保 .opencode/skills 存在（opencode 约定，无则创建）→ 下载 zip（自带 .opencode/skills 前缀结构）
+// SKILL 安装：确保 .agents/skills 存在（无则创建）→ 下载 zip（自带 .agents/skills 前缀结构）
 // → 直接解压到工作区根目录，自动覆盖旧文件（10s 超时）
 ipcMain.handle('skill:install', async (_e, id) => {
   if (!Number.isInteger(id)) return { ok: false, error: '无效的技能 ID' }
   const ws = settings.load().workspace || engine.workspace()
   if (!ws) return { ok: false, error: '未找到当前工作区，请先打开一个工作区' }
-  const skillsDir = path.join(ws, '.opencode', 'skills')
+  const skillsDir = path.join(ws, '.agents', 'skills')
   try {
     if (!fs.existsSync(skillsDir)) fs.mkdirSync(skillsDir, { recursive: true })
     const ctrl = new AbortController()
     const timer = setTimeout(() => ctrl.abort(), 10000)
     let res
     try {
-      res = await fetch(`http://localhost:4321/api/skill/${id}/download`, { signal: ctrl.signal })
+      res = await fetch(`${effectiveConfig().skillApiBase}/api/skill/${id}/download`, { signal: ctrl.signal })
     } finally {
       clearTimeout(timer)
     }
@@ -600,11 +767,11 @@ ipcMain.handle('skill:install', async (_e, id) => {
   }
 })
 
-// SKILL 已安装检测：扫描工作区 .opencode/skills 下的子文件夹名（= slug），返回列表
+// SKILL 已安装检测：扫描工作区 .agents/skills 下的子文件夹名（= slug），返回列表
 ipcMain.handle('skill:installed', async () => {
   const ws = settings.load().workspace || engine.workspace()
   if (!ws) return { ok: true, slugs: [] }
-  const dir = path.join(ws, '.opencode', 'skills')
+  const dir = path.join(ws, '.agents', 'skills')
   try {
     if (!fs.existsSync(dir)) return { ok: true, slugs: [] }
     const slugs = fs
@@ -618,7 +785,7 @@ ipcMain.handle('skill:installed', async () => {
   }
 })
 
-// SKILL 卸载：按 slug 删除工作区 .opencode/skills/<slug> 整个文件夹
+// SKILL 卸载：按 slug 删除工作区 .agents/skills/<slug> 整个文件夹
 // slug 校验：仅字母数字/._-（无路径分隔符，杜绝路径穿越）
 ipcMain.handle('skill:uninstall', async (_e, slug) => {
   if (typeof slug !== 'string' || !/^[a-z0-9][a-z0-9._-]*$/i.test(slug)) {
@@ -626,7 +793,7 @@ ipcMain.handle('skill:uninstall', async (_e, slug) => {
   }
   const ws = settings.load().workspace || engine.workspace()
   if (!ws) return { ok: false, error: '未找到当前工作区，请先打开一个工作区' }
-  const dir = path.join(ws, '.opencode', 'skills', slug)
+  const dir = path.join(ws, '.agents', 'skills', slug)
   try {
     if (!fs.existsSync(dir)) return { ok: false, error: `技能「${slug}」不存在` }
     fs.rmSync(dir, { recursive: true, force: true })
@@ -643,6 +810,7 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
+  isQuitting = true
   sseActive = false
   engine?.stop()
 })

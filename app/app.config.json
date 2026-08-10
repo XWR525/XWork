@@ -1,0 +1,41 @@
+{
+  "skillApiBase": "http://localhost:4321",
+  "enginePort": 4096,
+  "window": {
+    "width": 1180,
+    "height": 780,
+    "minWidth": 900,
+    "minHeight": 600,
+    "backgroundColor": "#0f1115"
+  },
+  "hideDirs": [
+    ".opencode",
+    ".agents",
+    "node_modules",
+    ".git",
+    ".svn",
+    ".next",
+    "dist",
+    "build",
+    "out",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".idea",
+    ".vscode"
+  ],
+  "hideFiles": [".DS_Store", "Thumbs.db", "desktop.ini"],
+  "timings": {
+    "workspacePollMs": 2000,
+    "enginePollMs": 4000,
+    "toastMs": 4000,
+    "wsSwitchShowMs": 1200,
+    "wsSwitchFadeMs": 220,
+    "sseReconnectMs": 2000,
+    "engineStartTimeoutMs": 20000,
+    "engineStopTimeoutMs": 5000,
+    "engineKillWaitMs": 2000,
+    "engineHealthTimeoutMs": 1500,
+    "portFreeTimeoutMs": 3000
+  }
+}

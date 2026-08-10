@@ -8,3 +8,6 @@ package.bat
 # 官网嵌入用界面演示（单独文件夹）
 ui-mockup/
 website-design.md
+/.trae
+CHANGELOG.md
+/.agents

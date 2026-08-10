@@ -20,6 +20,8 @@ const DEFAULT_SETTINGS = {
   modelUsage: {},
   workspace: '', // 当前工作区目录（空 = 默认启动目录）
   theme: 'dark', // 界面主题：dark | light（仅影响渲染层，不参与引擎配置）
+  closeAction: 'quit', // 点击关闭按钮时的动作：quit = 关闭程序（默认）| tray = 最小化到托盘
+  notifyTask: true, // 任务通知：AI 完成回复 / 向你提问时弹系统通知（仅窗口不在前台时）
   // 权限策略：AI 各操作类型的三档配置（创建会话时转为 opencode 规则数组）
   // 标准档：只读/搜索/联网/子任务放行，改文件/执行命令/工作区外访问需确认
   permission: {
@@ -34,7 +36,10 @@ const DEFAULT_SETTINGS = {
     task: 'allow',
     external_directory: 'ask',
     question: 'ask'
-  }
+  },
+  // 应用配置的用户覆盖层：设置面板「配置」页保存的字段（skillApiBase/enginePort/window/hideDirs/hideFiles），
+  // 与 app/app.config.json 默认值合并后生效（合并逻辑见 config.js mergeConfig）
+  config: {}
 }
 
 // 权限类型白名单：仅接受这些 key 的用户配置；其余类型由渲染层固定处理（内部低风险 allow / doom_loop ask）
@@ -111,8 +116,12 @@ class Settings {
     const s = this.load()
     if (raw.workspace !== undefined) s.workspace = raw.workspace
     if (raw.theme === 'dark' || raw.theme === 'light') s.theme = raw.theme
+    if (raw.closeAction === 'tray' || raw.closeAction === 'quit') s.closeAction = raw.closeAction
+    if (typeof raw.notifyTask === 'boolean') s.notifyTask = raw.notifyTask
     // 权限策略：校验归一化后整体替换（11 项齐全，缺失项回退默认）
     if (raw.permission !== undefined) s.permission = sanitizePermission(raw.permission)
+    // 应用配置用户覆盖层：整体替换（配置内容已由主进程 config:save 校验）
+    if (raw.config && typeof raw.config === 'object') s.config = raw.config
     // 模型组整体同步：新增/编辑/删除均以 raw.modelGroups 为准
     if (Array.isArray(raw.modelGroups)) {
       s.modelGroups = raw.modelGroups
@@ -142,6 +151,8 @@ class Settings {
     const s = this.load()
     return {
       theme: s.theme,
+      closeAction: s.closeAction,
+      notifyTask: s.notifyTask,
       permission: s.permission,
       modelGroups: (s.modelGroups || []).map((g) => ({
         id: g.id,

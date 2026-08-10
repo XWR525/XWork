@@ -1,4 +1,5 @@
 // opencode HTTP API 桥：会话、消息、权限响应、全局事件流
+const { net } = require('electron')
 const { DEFAULT_PORT } = require('./engine')
 
 class Bridge {
@@ -50,10 +51,13 @@ class Bridge {
 
   // 同步发送消息：等待完整回复返回；实时过程由全局事件流推送
   // agent 为 opencode 模式（build/plan），随消息绑定到会话并持久化
+  // 注意：这里用 Electron net.fetch（Chromium 网络栈）而非全局 fetch——
+  // 全局 fetch（undici）有 300s 的 headers/body 默认超时，长任务首个 step 等待快照时会被掐断，
+  // 导致「等待超时」被误报为发送失败（任务实际仍在推进，由事件流继续推送）
   async sendMessage(sessionID, text, model, agent) {
     const body = { model, parts: [{ type: 'text', text }] }
     if (agent) body.agent = agent
-    const res = await fetch(`${this.base}/session/${sessionID}/message`, {
+    const res = await net.fetch(`${this.base}/session/${sessionID}/message`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body)
@@ -72,6 +76,19 @@ class Bridge {
   async abortMessage(sessionID) {
     const res = await fetch(`${this.base}/session/${sessionID}/abort`, { method: 'POST' })
     if (!res.ok) throw new Error(`POST abort ${res.status}`)
+    return res.ok
+  }
+
+  // 压缩会话（等效 opencode TUI 的 /compact）：引擎将历史总结为摘要并替换（保留近期内容）
+  // 走 v1 summarize 接口（v2 的 /api/session/{id}/compact 是未实现存根，恒返回 503），需指定总结所用模型
+  // 异步执行，进度经全局事件流推送（message.updated / session.idle）
+  async compactSession(sessionID, model) {
+    const res = await fetch(`${this.base}/session/${sessionID}/summarize`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ providerID: model.providerID, modelID: model.modelID })
+    })
+    if (!res.ok) throw new Error(`POST summarize ${res.status}`)
     return res.ok
   }
 

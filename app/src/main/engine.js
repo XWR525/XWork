@@ -2,8 +2,9 @@
 const { spawn, execSync } = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
+const { cfg } = require('./config')
 
-const DEFAULT_PORT = 4096
+const DEFAULT_PORT = cfg.enginePort
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -34,7 +35,7 @@ function killPortOwner(port) {
 }
 
 // 等待端口不再有健康服务（taskkill 后进程释放端口需要一点时间，避免紧随其后的 spawn 端口冲突）
-function waitPortFree(port, timeoutMs = 3000) {
+function waitPortFree(port, timeoutMs = cfg.timings.portFreeTimeoutMs) {
   return new Promise((resolve) => {
     const start = Date.now()
     const poll = async () => {
@@ -75,7 +76,7 @@ function xdgEnv(xdgHome) {
   }
 }
 
-async function healthCheck(port, timeoutMs = 1500) {
+async function healthCheck(port, timeoutMs = cfg.timings.engineHealthTimeoutMs) {
   const ctrl = new AbortController()
   const t = setTimeout(() => ctrl.abort(), timeoutMs)
   try {
@@ -176,7 +177,8 @@ class Engine {
       if (this.child === child) this.child = null
       if (this.onExit) this.onExit(code)
     })
-    for (let i = 0; i < 40; i++) {
+    const startDeadline = Date.now() + cfg.timings.engineStartTimeoutMs
+    while (Date.now() < startDeadline) {
       await sleep(500)
       const h = await healthCheck(this.port, 1000)
       if (h && h.healthy) return await this.status()
@@ -186,7 +188,7 @@ class Engine {
 
   // 停止引擎并等待进程真正退出。Windows 上 kill() 是异步终止，必须等 'exit' 事件，
   // 否则紧随其后的 start() 会因旧进程仍占端口而命中健康检查直接复用（cwd 不会生效）
-  async stop(timeoutMs = 5000) {
+  async stop(timeoutMs = cfg.timings.engineStopTimeoutMs) {
     const child = this.child
     console.log('[engine] stop() child=', child?.pid || null)
     if (!child) {
@@ -213,7 +215,7 @@ class Engine {
       } catch {
         /* ignore */
       }
-      await Promise.race([exited, sleep(2000)])
+      await Promise.race([exited, sleep(cfg.timings.engineKillWaitMs)])
     }
   }
 }

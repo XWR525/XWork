@@ -67,8 +67,18 @@ function globalPermAction(key, permCfg) {
 }
 
 // 文件树中默认隐藏的常见大目录/无关文件（避免误操作与列表冗长）
+// 默认值，可被 app/app.config.json 的 hideDirs/hideFiles 覆盖
 const HIDE_DIRS = new Set(['node_modules', '.git', '.svn', '.next', 'dist', 'build', 'out', '.venv', 'venv', '__pycache__', '.idea', '.vscode'])
 const HIDE_FILES = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini'])
+
+// 各轮询/提示时长默认值，可被 app/app.config.json 的 timings 覆盖
+const DEFAULT_TIMINGS = {
+  workspacePollMs: 2000,
+  enginePollMs: 4000,
+  toastMs: 4000,
+  wsSwitchShowMs: 1200,
+  wsSwitchFadeMs: 220
+}
 
 // 文件图标：按扩展名映射到 emoji（资源管理器风格，按文件类型显示）
 const FILE_ICONS = {
@@ -128,6 +138,26 @@ function normalize(list) {
   }))
 }
 
+// 当前上下文 token 量：最近一条带统计的 assistant 消息的 info.tokens（引擎实际返回位置），
+// input + cache.read 即实际发送给模型的上下文量；无任何统计（新会话/未完成）返回 null
+function ctxTokenCount(rawMsgs) {
+  const list = rawMsgs || []
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i]
+    if (m.info?.role !== 'assistant') continue
+    const t = m.info?.tokens
+    if (t) return (t.input || 0) + ((t.cache && t.cache.read) || 0)
+  }
+  return null
+}
+
+// token 数格式化：千 → k（一位小数），百万 → M
+function fmtTokens(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M'
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k'
+  return String(Math.round(n || 0))
+}
+
 // 会话时间显示：MM-DD HH:MM（跨年仍只显示月日，足够区分活跃度）
 function fmtDateTime(ts) {
   if (!ts) return ''
@@ -136,7 +166,32 @@ function fmtDateTime(ts) {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
+// 工具调用开始时刻：epoch 毫秒 → HH:MM:SS（任务面板工具卡片用；引擎 state.time.start）
+function fmtClock(ts) {
+  if (!ts) return ''
+  const d = new Date(ts)
+  const p = (n) => String(n).padStart(2, '0')
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
+// 工具调用耗时：end - start → 人类可读（0.4s / 12.3s / 2m 05s）；进行中或无 end 返回空
+function fmtDur(start, end) {
+  if (!start || !end) return ''
+  const ms = end - start
+  if (ms < 0) return ''
+  if (ms < 1000) return ms + 'ms'
+  const s = ms / 1000
+  if (s < 60) return s.toFixed(1) + 's'
+  const m = Math.floor(s / 60)
+  const rs = Math.round(s % 60)
+  return `${m}m ${String(rs).padStart(2, '0')}s`
+}
+
 const STATUS_LABEL = { pending: '等待', running: '执行中', completed: '完成', error: '失败' }
+
+// 任务执行面板分页：默认展示最近 TOOL_PAGE 条工具步骤（执行中最关心的是底部最新条目），
+// 点击「加载更早」每次追加 TOOL_PAGE 条；有界 DOM 保证展开/收起动画每帧重排成本恒定，长任务不卡顿
+const TOOL_PAGE = 20
 
 export default function App() {
   const [engine, setEngine] = useState({ running: false, version: null, port: 4096 })
@@ -175,9 +230,12 @@ export default function App() {
   const [skills, setSkills] = useState([]) // 技能列表（来自本地技能服务，按 sort_order 升序）
   const [skillLoading, setSkillLoading] = useState(false)
   const [skillError, setSkillError] = useState('')
-  const [skillInstalled, setSkillInstalled] = useState({}) // 已安装技能 slug 集合（来自 .opencode/skills 扫描）
+  const [skillInstalled, setSkillInstalled] = useState({}) // 已安装技能 slug 集合（来自 .agents/skills 扫描）
   const [skillBusy, setSkillBusy] = useState(null) // 安装中的技能 id（按钮禁用防重复点击）
   const [settingsData, setSettingsData] = useState(null) // 脱敏后的设置
+  const [appConfig, setAppConfig] = useState(null) // 有效应用配置（设置面板「配置」页表单）
+  const [compacting, setCompacting] = useState(false) // 压缩会话进行中（引擎总结并替换历史，等效 /compact）
+  const [ctxTokens, setCtxTokens] = useState(null) // 当前上下文 token 量（最近 assistant 消息 info.tokens 的 input+cache.read，null = 无数据）
   // 已保存的权限配置（自动应答兜底用）：onEvent 回调是 [ ] 闭包，必须经 ref 读取最新值
   const permCfgRef = useRef(null)
   const [appInfo, setAppInfo] = useState(null) // 应用版本信息（「关于」面板）
@@ -195,7 +253,12 @@ export default function App() {
   const [panelOpen, setPanelOpen] = useState(false) // 任务执行面板：默认折叠，执行中由收起窄条上的圆点闪烁提示
   const [sidebarW, setSidebarW] = useState(240) // 左边栏宽度（拖动边缘调整）
   const [taskW, setTaskW] = useState(300) // 任务面板展开宽度（拖动边缘调整）
+  const [toolVisible, setToolVisible] = useState(TOOL_PAGE) // 任务面板已展示的工具步骤数（分页：从最新向前展示，按钮加载更早）
   const [composerH, setComposerH] = useState(null) // 输入区高度（拖动上缘调整，null = 按内容自适应）
+  // 渲染层配置（来自 app/app.config.json，经 config:get IPC 获取）：文件树隐藏列表 + 各时长
+  const [hideDirs, setHideDirs] = useState(HIDE_DIRS)
+  const [hideFiles, setHideFiles] = useState(HIDE_FILES)
+  const [timings, setTimings] = useState(DEFAULT_TIMINGS)
   const [wsSwitching, setWsSwitching] = useState(null) // 工作区切换中（= 目标目录，null = 空闲），驱动切换遮罩
 
   const listRef = useRef(null)
@@ -228,6 +291,7 @@ export default function App() {
     try {
       const msgs = await api.messageList(sid)
       setMessages(normalize(msgs))
+      setCtxTokens(ctxTokenCount(msgs)) // 刷新上下文 token 统计
       // 恢复该会话绑定的模式：优先会话字段，其次最后一条用户消息（opencode 在消息上记录 agent）
       let ag = s?.agent
       if (!ag) {
@@ -237,6 +301,7 @@ export default function App() {
       setAgent(ag === 'plan' ? 'plan' : 'build')
     } catch (e) {
       console.error('load messages failed', e)
+      setCtxTokens(null)
     }
   }
 
@@ -295,9 +360,9 @@ export default function App() {
       }
     }
     tick()
-    const timer = setInterval(tick, 2000)
+    const timer = setInterval(tick, timings.workspacePollMs)
     return () => clearInterval(timer)
-  }, [sideTab, workspace])
+  }, [sideTab, workspace, timings])
 
   // 切换到指定工作区（引擎重启，新 cwd）；「打开文件夹」与「所有工作区」共用
   const switchTo = async (dir) => {
@@ -327,8 +392,8 @@ export default function App() {
       setWsSwitching({ dir: ws, done: true })
       wsTimer.current = setTimeout(() => {
         setWsSwitching({ dir: ws, done: true, leaving: true })
-        wsTimer.current = setTimeout(() => setWsSwitching(null), 220)
-      }, 1200)
+        wsTimer.current = setTimeout(() => setWsSwitching(null), timings.wsSwitchFadeMs)
+      }, timings.wsSwitchShowMs)
     } catch (e) {
       if (wsTimer.current) clearTimeout(wsTimer.current)
       setWsSwitching(null)
@@ -532,6 +597,7 @@ export default function App() {
           if (p.sessionID !== cur) break
           setBusy(false)
           setStopping(false)
+          setCompacting(false) // 压缩会话完成
           loadSession(cur)
           break
         }
@@ -539,6 +605,7 @@ export default function App() {
           // 任务失败（如 API Key 无效）：把错误标记到当前会话最后一条 assistant 消息，
           // 避免失败回复渲染成「空气泡」；最终错误以 session.idle 后的权威重载为准
           if (p.sessionID !== cur) break
+          setCompacting(false) // 压缩失败也复位，避免按钮卡在「压缩中…」
           const em = extractError({ error: p.error })
           if (!em) break
           setMessages((ms) => {
@@ -583,6 +650,9 @@ export default function App() {
         case 'engine.exited': {
           // 引擎进程退出事件。可能是瞬态（如冷启动端口瞬占），延迟复查：
           // 复查仍健康则忽略并恢复状态；否则提示用户
+          // 引擎进程退出后任何进行中的任务必然中断，立即复位 busy，避免 UI 卡在「执行中」
+          setBusy(false)
+          setStopping(false)
           setEngine((e) => ({ ...e, running: false }))
           setTimeout(async () => {
             try {
@@ -617,6 +687,23 @@ export default function App() {
     return off
   }, [])
 
+  // 拉取渲染层配置（app/app.config.json，经 config:get IPC）：覆盖隐藏列表与时长默认值
+  // 提取为可复用函数：启动时与「配置」页保存后都会刷新（隐藏列表/时长即时生效）
+  const applyRendererConfig = (c) => {
+    if (!c) return
+    setHideDirs(new Set(c.hideDirs || []))
+    setHideFiles(new Set(c.hideFiles || []))
+    setTimings((t) => ({ ...t, ...(c.timings || {}) }))
+  }
+  useEffect(() => {
+    api
+      .getConfig()
+      .then(applyRendererConfig)
+      .catch(() => {
+        /* 获取失败则使用默认值 */
+      })
+  }, [])
+
   // 引擎未就绪时轮询，保证 UI 状态最终与引擎同步（冷启动引擎可能晚于窗口就绪）
   useEffect(() => {
     if (engine.running) return
@@ -632,9 +719,9 @@ export default function App() {
       } catch {
         /* 查询失败则继续轮询 */
       }
-    }, 4000)
+    }, timings.enginePollMs)
     return () => clearInterval(timer)
-  }, [engine.running])
+  }, [engine.running, timings])
 
   // 自动滚动到底部
   useEffect(() => {
@@ -644,9 +731,9 @@ export default function App() {
   // 操作提示自动消失
   useEffect(() => {
     if (!toast) return
-    const t = setTimeout(() => setToast(''), 4000)
+    const t = setTimeout(() => setToast(''), timings.toastMs)
     return () => clearTimeout(t)
-  }, [toast])
+  }, [toast, timings])
 
   // 将同步 POST 的最终结果落定到消息列表
   const settle = (result) => {
@@ -699,7 +786,7 @@ export default function App() {
 
   const send = async () => {
     const text = input.trim()
-    if (!text || busy) return
+    if (!text || busy || compacting) return // 压缩进行中禁止发送
     // 已添加的工作区文件以 opencode @引用语法注入提示词（与引擎原生「@文件名」交互方式一致）
     let finalText = text
     if (addedFiles.length) {
@@ -715,6 +802,9 @@ export default function App() {
       return
     }
     let sid = currentID
+    // 记录发送前最后一条 assistant 消息时间：POST 失败时据此判断引擎是否已受理本次消息（任务是否在推进）
+    const assts = messages.filter((m) => m.role === 'assistant')
+    const baselineAsstTime = assts.length ? assts[assts.length - 1].time || 0 : 0
     try {
       if (!sid) {
         // 新会话不再携带权限快照：权限由引擎全局配置（opencode.json permission）统一判断，
@@ -731,10 +821,29 @@ export default function App() {
       settle(result)
       checkDone(sid, result.info.id)
     } catch (e) {
-      console.error('send failed', e)
-      setEngineError('发送失败: ' + e.message)
-      setBusy(false)
-      setStopping(false)
+      // POST 失败 ≠ 任务失败：可能只是「等待快照」的通道断开/超时，引擎已受理消息、任务仍在推进。
+      // 取证：引擎健康且出现了发送时刻之后的新 assistant 消息 → 静默继续（busy 交由 session.idle 事件复位）；
+      // 否则才是真正的发送失败
+      let progressed = false
+      try {
+        const st = await api.engineStatus()
+        if (st.running) {
+          const msgs = await api.messageList(sid)
+          const assistants = (msgs || []).filter((m) => m.info?.role === 'assistant')
+          const lastAsst = assistants[assistants.length - 1]
+          progressed = !!(lastAsst && (lastAsst.info?.time?.created || 0) > baselineAsstTime)
+        }
+      } catch {
+        progressed = false
+      }
+      if (progressed) {
+        console.warn('message:send 快照等待超时，任务仍在进行，交由事件流处理:', e.message)
+      } else {
+        console.error('send failed', e)
+        setEngineError('发送失败: ' + e.message)
+        setBusy(false)
+        setStopping(false)
+      }
     } finally {
       setStopping(false)
     }
@@ -853,6 +962,20 @@ export default function App() {
       api.applyTheme(t).catch(() => setToast('主题保存失败'))
     }
   }
+  // 关闭时动作（quit=关闭程序 / tray=最小化到托盘）：即时保存并同步本地状态
+  const applyCloseAction = (v) => {
+    if (typeof api.applyCloseAction === 'function') {
+      api.applyCloseAction(v).catch(() => setToast('关闭行为保存失败'))
+    }
+    setSettingsData((d) => (d ? { ...d, closeAction: v } : d))
+  }
+  // 任务通知开关：即时保存并同步本地状态
+  const applyNotifyTask = (v) => {
+    if (typeof api.applyNotifyTask === 'function') {
+      api.applyNotifyTask(v).catch(() => setToast('任务通知设置保存失败'))
+    }
+    setSettingsData((d) => (d ? { ...d, notifyTask: v } : d))
+  }
 
   // 加载设置快照（含模型组）；启动与打开设置时调用
   // quiet=true：启动期引擎可能尚未就绪，失败属预期，静默等 server.connected 重试
@@ -892,10 +1015,53 @@ export default function App() {
     return () => window.removeEventListener('click', close)
   }, [])
 
+  // 压缩当前会话：引擎将历史总结为摘要并替换（等效 opencode /compact），不可逆，需确认
+  // 使用当前会话绑定的模型做总结；异步执行，完成后 session.idle 自动重载消息
+  const doCompact = () => {
+    if (!currentID || busy || compacting) return
+    if (!modelSel) {
+      setToast('请先选择要使用的模型')
+      return
+    }
+    setConfirm({
+      title: '压缩会话',
+      message: '将把当前会话的历史对话压缩为一段摘要并替换（保留近期内容）。压缩后无法恢复完整历史，确定继续吗？',
+      confirmLabel: '压缩',
+      danger: true,
+      onConfirm: async () => {
+        setCompacting(true)
+        try {
+          const r = await api.compactSession(currentID, modelSel)
+          if (!r.ok) throw new Error(r.error || '压缩失败')
+          setToast('压缩中，完成后自动刷新…')
+        } catch (e) {
+          setToast('压缩失败: ' + e.message)
+          setCompacting(false)
+        }
+      }
+    })
+  }
+
   // 打开设置：刷新数据后展示面板
   const openSettings = async () => {
     setSettingsOpen(true)
     await loadModels()
+    // 加载有效应用配置（默认值 + 用户覆盖层），供「配置」页表单展示
+    api.getConfig().then(setAppConfig).catch(() => {})
+  }
+
+  // 保存「配置」页表单：写入用户覆盖层，刷新渲染层即时生效字段；端口/窗口尺寸重启应用后生效
+  const saveAppConfig = async (vals) => {
+    try {
+      const r = await api.saveConfig(vals)
+      if (!r.ok) throw new Error(r.error || '保存失败')
+      const fresh = await api.getConfig()
+      setAppConfig(fresh)
+      applyRendererConfig(fresh) // 隐藏列表/时长立即生效（文件树与轮询无需重启）
+      setToast('配置已保存（引擎端口 / 窗口尺寸重启应用后生效）')
+    } catch (e) {
+      setToast('保存配置失败: ' + e.message)
+    }
   }
 
   // 打开 SKILL HUB：拉取技能列表（主进程经 IPC 请求本地技能服务，无 CORS 限制）
@@ -915,7 +1081,7 @@ export default function App() {
     }
   }
 
-  // 扫描工作区 .opencode/skills，得到已安装技能 slug 集合（文件夹名 = slug），驱动安装/卸载按钮
+  // 扫描工作区 .agents/skills，得到已安装技能 slug 集合（文件夹名 = slug），驱动安装/卸载按钮
   const refreshInstalled = async () => {
     try {
       const r = await api.skillInstalled()
@@ -944,11 +1110,11 @@ export default function App() {
     }
   }
 
-  // 卸载技能：确认后删除 .opencode/skills/<slug> 整个文件夹（复用全局确认框）
+  // 卸载技能：确认后删除 .agents/skills/<slug> 整个文件夹（复用全局确认框）
   const uninstallSkill = (s) => {
     setConfirm({
       title: '卸载技能',
-      message: `确定要卸载「${s.name}」吗？将删除工作区 .opencode/skills/${s.slug} 文件夹。`,
+      message: `确定要卸载「${s.name}」吗？将删除工作区 .agents/skills/${s.slug} 文件夹。`,
       danger: true,
       confirmLabel: '卸载',
       onConfirm: async () => {
@@ -1001,13 +1167,13 @@ export default function App() {
     document.body.classList.add('resizing')
   }
 
-  // 拖拽调整输入区高度：向上拉变高（消息区自动腾出空间），最小 56px，最大不超过窗口一半
+  // 拖拽调整输入区高度：向上拉变高（消息区自动腾出空间），最小 100px（手柄到窗口底边的距离），最大不超过窗口一半
   const startResizeV = (e) => {
     e.preventDefault()
     const startY = e.clientY
     const startH = document.querySelector('.composer')?.offsetHeight ?? 120
     const onMove = (ev) => {
-      const h = Math.min(window.innerHeight * 0.5, Math.max(56, startH + (startY - ev.clientY)))
+      const h = Math.min(window.innerHeight * 0.5, Math.max(100, startH + (startY - ev.clientY)))
       setComposerH(Math.round(h))
     }
     const onUp = () => {
@@ -1215,7 +1381,7 @@ export default function App() {
   const renderWsTree = (nodes, parentAbs, depth) => {
     if (!nodes) return <div className="ws-empty">加载中…</div>
     const visible = nodes.filter(
-      (n) => !(n.type === 'dir' && HIDE_DIRS.has(n.name)) && !(n.type === 'file' && HIDE_FILES.has(n.name))
+      (n) => !(n.type === 'dir' && hideDirs.has(n.name)) && !(n.type === 'file' && hideFiles.has(n.name))
     )
     if (!visible.length) return <div className="ws-empty">（空）</div>
     return visible.map((n) => {
@@ -1387,8 +1553,14 @@ export default function App() {
                 const finalIdx =
                   origIdx !== -1 && origIdx !== dragIdx ? origIdx - (dragIdx >= 0 && dragIdx < origIdx ? 1 : 0) : -1
                 // 指示线位置：finalIdx === dropPos 插到该项上方；dropPos 为末尾时插到最后一个置顶项下方
-                const lineBefore = dropPos !== null && finalIdx === dropPos
-                const lineAfter = dropPos !== null && finalIdx === finalCount - 1 && dropPos === finalCount
+                // finalIdx !== -1 限定仅置顶项显示（被拖项与普通区排除）：
+                // 否则仅 1 个置顶项被拖时 finalCount-1 === -1 会让所有 finalIdx=-1 的普通会话都亮线
+                const lineBefore = dropPos !== null && finalIdx !== -1 && finalIdx === dropPos
+                const lineAfter =
+                  dropPos !== null &&
+                  finalIdx !== -1 &&
+                  finalIdx === finalCount - 1 &&
+                  dropPos === finalCount
                 return (
                     <div
                       key={s.id}
@@ -1604,6 +1776,23 @@ export default function App() {
               />
               <div className="composer-foot">
                 <div className="composer-actions">
+                  {/* 当前上下文 token 统计：最近 assistant 消息的 info.tokens（input + cache.read），完成时刷新 */}
+                  {ctxTokens !== null && (
+                    <span className="ctx-tokens" title="当前会话上下文长度(Token)">
+                      {fmtTokens(ctxTokens)}
+                    </span>
+                  )}
+                  {/* 压缩会话：引擎将历史总结为摘要并替换（等效 opencode /compact），位于模式切换左侧 */}
+                  {currentID && (
+                    <button
+                      className="compact-btn"
+                      onClick={doCompact}
+                      disabled={busy || compacting}
+                      title={compacting ? '压缩中…' : '将历史对话压缩为摘要，以降低信息精度换取更多可用上下文空间'}
+                    >
+                      {compacting ? '压缩中…' : '压缩'}
+                    </button>
+                  )}
                   <AgentPicker value={agent} onPick={setAgent} />
                   <ModelPicker
                     models={availableModels}
@@ -1658,30 +1847,52 @@ export default function App() {
             onMouseDown={(e) => startResize('task', e)}
           />
           <div className="task-panel">
+            {/* 标题行在滚动区之外，天然固定于顶部，内容滚动不会从其后方穿越 */}
             <div className="panel-head">
               <span className="panel-title">任务执行过程</span>
-              <button className="panel-toggle" title="折叠" onClick={() => setPanelOpen(false)}>
+              {/* 折叠时重置分页：重新展开始终只渲染最近 TOOL_PAGE 条，避免累积加载的历史持续占据 DOM */}
+              <button
+                className="panel-toggle"
+                title="折叠"
+                onClick={() => {
+                  setPanelOpen(false)
+                  setToolVisible(TOOL_PAGE)
+                }}
+              >
                 »
               </button>
             </div>
-            {busy && currentStep && (
-              <div className="current-step">
-                {currentStep.kind === 'tool' && <div className="cs-text">正在执行 {currentStep.tool}</div>}
-                {currentStep.kind === 'thinking' && <div className="cs-text">正在思考…</div>}
-                {currentStep.kind === 'writing' && (
-                  <>
-                    <div className="cs-text">正在生成回复</div>
-                    <div className="cs-preview">{currentStep.text.slice(-200)}</div>
-                  </>
-                )}
-                {currentStep.kind === 'working' && <div className="cs-text">任务进行中…</div>}
-              </div>
-            )}
-            {toolSteps.length === 0 ? (
-              <div className="empty-hint">暂无执行记录</div>
-            ) : (
-              toolSteps.map((s) => <ToolCard key={s.key} step={s} />)
-            )}
+            <div className="task-body">
+              {busy && currentStep && (
+                <div className="current-step">
+                  {currentStep.kind === 'tool' && <div className="cs-text">正在执行 {currentStep.tool}</div>}
+                  {currentStep.kind === 'thinking' && <div className="cs-text">正在思考…</div>}
+                  {currentStep.kind === 'writing' && (
+                    <>
+                      <div className="cs-text">正在生成回复</div>
+                      <div className="cs-preview">{currentStep.text.slice(-200)}</div>
+                    </>
+                  )}
+                  {currentStep.kind === 'working' && <div className="cs-text">任务进行中…</div>}
+                </div>
+              )}
+              {toolSteps.length === 0 ? (
+                <div className="empty-hint">暂无执行记录</div>
+              ) : (
+                <>
+                  {/* 分页：倒序展示（最新在上、更早在下），只渲染最近 toolVisible 条；
+                      隐藏的是最早的记录，底部按钮向下逐批加载更早的 */}
+                  {toolSteps.slice(-toolVisible).reverse().map((s) => (
+                    <ToolCard key={s.key} step={s} />
+                  ))}
+                  {toolSteps.length > toolVisible && (
+                    <button className="load-more" onClick={() => setToolVisible((v) => v + TOOL_PAGE)}>
+                      加载更早的 {toolSteps.length - toolVisible} 条
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
           </div>
           <div className="task-strip" title="任务执行过程" onClick={() => setPanelOpen(true)}>
             <span className={`ts-dot ${busy ? 'busy' : ''}`} />
@@ -1916,9 +2127,13 @@ export default function App() {
           theme={theme}
           appInfo={appInfo}
           engineVersion={engine.version}
+          appConfig={appConfig}
           onThemeChange={applyTheme}
+          onCloseActionChange={applyCloseAction}
+          onNotifyTaskChange={applyNotifyTask}
           onClose={() => setSettingsOpen(false)}
           onSave={saveSettings}
+          onSaveConfig={saveAppConfig}
         />
       )}
     </div>
@@ -2062,10 +2277,22 @@ function GroupCard({
 }
 
 // 设置面板：总览式（左侧导航 + 右侧内容），含「模型设置」「界面设置」「权限设置」「关于」
-function SettingsPanel({ data, busy, theme, appInfo, engineVersion, onThemeChange, onClose, onSave }) {
-  const [tab, setTab] = useState('model') // model | appearance | permission | about
+function SettingsPanel({ data, busy, theme, appInfo, engineVersion, appConfig, onThemeChange, onCloseActionChange, onNotifyTaskChange, onClose, onSave, onSaveConfig }) {
+  const [tab, setTab] = useState('model') // model | appearance | permission | config | about
   const [form, setForm] = useState(data)
   useEffect(() => setForm(data), [data])
+  // 「配置」页表单草稿：由有效配置（默认值 + 用户覆盖层）异步到达后填充；多行字段以文本承载便于编辑
+  const [configForm, setConfigForm] = useState(null)
+  useEffect(() => {
+    if (!appConfig) return
+    setConfigForm({
+      skillApiBase: appConfig.skillApiBase || '',
+      enginePort: appConfig.enginePort ?? '',
+      window: { ...(appConfig.window || {}) },
+      hideDirsText: (appConfig.hideDirs || []).join('\n'),
+      hideFilesText: (appConfig.hideFiles || []).join('\n')
+    })
+  }, [appConfig])
   const [adding, setAdding] = useState(false) // 是否显示「添加模型组」表单
   const [editing, setEditing] = useState(null) // 正在编辑的模型组下标（null = 未编辑）
   const [draft, setDraft] = useState({ ...EMPTY_DRAFT }) // 添加/编辑模型组草稿
@@ -2213,10 +2440,21 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, onThemeChang
     cancelForm()
   }
 
-  // 「保存」：模型设置与权限设置仅写配置不重启（权限在创建会话时读取）；界面设置主题已即时保存；关于页无表单
+  // 「保存」：模型/权限/配置仅写设置不关闭（可见保存提示）；界面设置主题已即时保存；关于页无表单
   const handleSave = () => {
     if (tab === 'model') onSave(form, false)
     else if (tab === 'permission') onSave(form, false, '权限设置已保存，将应用于之后新建的会话')
+    else if (tab === 'config') {
+      if (!configForm) return
+      // 多行字段按行拆分还原为数组；数值字段原样传递（主进程 sanitize 做类型/范围校验）
+      onSaveConfig({
+        skillApiBase: configForm.skillApiBase,
+        enginePort: configForm.enginePort,
+        window: configForm.window,
+        hideDirs: configForm.hideDirsText.split('\n').map((x) => x.trim()).filter(Boolean),
+        hideFiles: configForm.hideFilesText.split('\n').map((x) => x.trim()).filter(Boolean)
+      })
+    }
     else onClose()
   }
 
@@ -2234,6 +2472,9 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, onThemeChang
           </button>
           <button className={`settings-nav-item ${tab === 'permission' ? 'active' : ''}`} onClick={() => setTab('permission')}>
             🛡️ 权限设置
+          </button>
+          <button className={`settings-nav-item ${tab === 'config' ? 'active' : ''}`} onClick={() => setTab('config')}>
+            📄 配置
           </button>
           <button className={`settings-nav-item ${tab === 'about' ? 'active' : ''}`} onClick={() => setTab('about')}>
             ℹ️ 关于
@@ -2294,6 +2535,87 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, onThemeChang
               </div>
 
               <div className="set-hint">模型设置保存并重启引擎后生效；任务执行中不可保存。</div>
+            </>
+          ) : tab === 'config' ? (
+            <>
+              <div className="perm-title">配置</div>
+
+              {/* 技能服务地址：Skill Hub 列表 / 下载接口所在服务 */}
+              <div className="set-group">
+                <div className="set-label">技能服务地址</div>
+                <input
+                  className="set-input"
+                  placeholder="http://localhost:4321"
+                  value={configForm?.skillApiBase || ''}
+                  onChange={(e) => setConfigForm((c) => (c ? { ...c, skillApiBase: e.target.value } : c))}
+                />
+                <div className="set-hint">Skill Hub 技能列表与下载接口的地址。</div>
+              </div>
+
+              {/* 引擎端口：opencode 引擎监听端口 */}
+              <div className="set-group">
+                <div className="set-label">opencode 引擎端口</div>
+                <input
+                  className="set-input"
+                  type="number"
+                  min={1}
+                  max={65535}
+                  value={configForm?.enginePort ?? ''}
+                  onChange={(e) => setConfigForm((c) => (c ? { ...c, enginePort: e.target.value } : c))}
+                />
+              </div>
+
+              {/* 窗口尺寸：宽/高/最小宽/最小高 */}
+              <div className="set-group">
+                <div className="set-label">窗口尺寸（重启应用后生效）</div>
+                <div className="cfg-row">
+                  {[
+                    ['width', '宽'],
+                    ['height', '高'],
+                    ['minWidth', '最小宽'],
+                    ['minHeight', '最小高']
+                  ].map(([k, label]) => (
+                    <div key={k} className="cfg-cell">
+                      <input
+                        className="set-input"
+                        type="number"
+                        min={1}
+                        value={configForm?.window?.[k] ?? ''}
+                        onChange={(e) =>
+                          setConfigForm((c) => (c ? { ...c, window: { ...c.window, [k]: e.target.value } } : c))
+                        }
+                      />
+                      <div className="set-label">{label}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* 文件树隐藏目录 / 隐藏文件：每行一个 */}
+              <div className="set-group">
+                <div className="set-label">文件树隐藏目录（每行一个）</div>
+                <textarea
+                  className="set-input"
+                  rows={4}
+                  placeholder={'node_modules\n.git\ndist'}
+                  value={configForm?.hideDirsText || ''}
+                  onChange={(e) => setConfigForm((c) => (c ? { ...c, hideDirsText: e.target.value } : c))}
+                />
+              </div>
+              <div className="set-group">
+                <div className="set-label">文件树隐藏文件（每行一个）</div>
+                <textarea
+                  className="set-input"
+                  rows={3}
+                  placeholder={'.DS_Store\nThumbs.db'}
+                  value={configForm?.hideFilesText || ''}
+                  onChange={(e) => setConfigForm((c) => (c ? { ...c, hideFilesText: e.target.value } : c))}
+                />
+              </div>
+
+              <div className="set-hint">
+                保存后即时生效（文件树隐藏列表）；引擎端口与窗口尺寸需重启应用后生效。
+              </div>
             </>
           ) : tab === 'permission' ? (
             <>
@@ -2497,7 +2819,8 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, onThemeChang
               <div className="perm-title">界面设置</div>
 
               <div className="set-group">
-                <div className="set-label">界面风格</div>
+                <div className="set-title">界面风格</div>
+                <div className="set-desc">界面主题即时生效并自动保存，无需重启引擎。</div>
                 <label className="set-radio">
                   <input type="radio" name="theme" checked={theme === 'dark'} onChange={() => onThemeChange('dark')} />
                   🌙 暗色
@@ -2508,7 +2831,28 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, onThemeChang
                 </label>
               </div>
 
-              <div className="set-hint">界面主题即时生效并自动保存，无需重启引擎。</div>
+              <div className="set-group">
+                <div className="set-title">关闭窗口时</div>
+                <div className="set-desc">「最小化到托盘」时，关闭窗口不会退出程序，AI 任务在后台继续运行；点击托盘图标恢复窗口，右键托盘菜单可退出。</div>
+                <label className="set-radio">
+                  <input type="radio" name="closeAction" checked={(data.closeAction || 'quit') === 'quit'} onChange={() => onCloseActionChange('quit')} />
+                  ❌ 关闭程序
+                </label>
+                <label className="set-radio">
+                  <input type="radio" name="closeAction" checked={(data.closeAction || 'quit') === 'tray'} onChange={() => onCloseActionChange('tray')} />
+                  🚩 最小化到系统托盘
+                </label>
+              </div>
+
+              <div className="set-group">
+                <div className="set-title">任务通知</div>
+                <div className="set-desc">AI 完成回复或向你提问时，在系统托盘弹出通知（仅窗口不在前台时）。</div>
+                <label className="set-toggle">
+                  <input type="checkbox" checked={data.notifyTask !== false} onChange={(e) => onNotifyTaskChange(e.target.checked)} />
+                  <span className="set-toggle-track" />
+                  <span className="set-toggle-label">{data.notifyTask !== false ? '开启' : '关闭'}</span>
+                </label>
+              </div>
             </>
           )}
           </div>
@@ -2661,6 +3005,10 @@ function ToolCard({ step }) {
   const st = step.state?.status || 'pending'
   const input = step.state?.input
   const output = step.state?.output ?? step.state?.metadata?.output ?? ''
+  // 引擎为每个工具调用记录 state.time = { start, end }（epoch 毫秒）；进行中只有 start
+  const t = step.state?.time || {}
+  const clock = fmtClock(t.start)
+  const dur = fmtDur(t.start, t.end)
   const fmt = (v) => {
     const s = typeof v === 'string' ? v : JSON.stringify(v, null, 2)
     return s.length > 800 ? s.slice(0, 800) + '\n…（已截断）' : s
@@ -2670,6 +3018,12 @@ function ToolCard({ step }) {
       <div className="tool-head" onClick={() => setOpen(!open)}>
         <span className={`tool-dot ${st}`} />
         <span className="tool-name">{step.tool}</span>
+        {clock && (
+          <span className="tool-time" title={`开始 ${clock}${dur ? ' · 耗时 ' + dur : ''}`}>
+            {clock}
+            {dur ? ` · ${dur}` : ''}
+          </span>
+        )}
         <span className={`tool-status ${st}`}>{STATUS_LABEL[st] || st}</span>
         <span className="tool-arrow">{open ? '▾' : '▸'}</span>
       </div>
@@ -2716,6 +3070,14 @@ function ReasoningBlock({ text, streaming }) {
 function MessageView({ m, onCopy }) {
   const mdText = m.parts.filter((p) => p.type === 'text').map((p) => p.text || '').join('\n')
   if (m.role === 'user') {
+    // 压缩会话产生的 compaction 消息：本身无正文，仅标记"此前的历史已被压缩"，显示为提示条而非空气泡
+    if (m.parts.some((p) => p.type === 'compaction')) {
+      return (
+        <div className="row compact">
+          <div className="compact-marker">历史对话已压缩</div>
+        </div>
+      )
+    }
     return (
       <div className="row user">
         <div className="bubble user">
