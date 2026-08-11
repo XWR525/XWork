@@ -56,6 +56,9 @@ contextBridge.exposeInMainWorld('xwork', {
   messageList: (sessionID) => ipcRenderer.invoke('message:list', sessionID),
   messageAbort: (sessionID) => ipcRenderer.invoke('message:abort', sessionID),
   compactSession: (sessionID, model) => ipcRenderer.invoke('session:compact', sessionID, model),
+  // 撤销「回退至此」：回退指定 user 消息及其后的变更，返回实际影响清单；git:ensure 检测/初始化 git
+  undoTo: (sessionID, messageID) => ipcRenderer.invoke('session:undo-to', sessionID, messageID),
+  gitEnsure: (dir, opts) => ipcRenderer.invoke('git:ensure', dir, opts),
   permissionRespond: (sessionID, permissionID, response) =>
     ipcRenderer.invoke('permission:respond', { sessionID, permissionID, response }),
   questionReply: (requestID, answers) => ipcRenderer.invoke('question:reply', requestID, answers),

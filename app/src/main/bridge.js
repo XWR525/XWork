@@ -92,6 +92,23 @@ class Bridge {
     return res.ok
   }
 
+  // 撤销到指定 user 消息之前（等效 opencode TUI 的 /undo）：回退该消息及之后的全部文件变更与会话状态
+  // 静默失败兜底：引擎在非 git 工作区（或系统无 git）时，revert 返回 200 但不会产生快照（body.revert 无 snapshot），
+  // 此时文件并不会回滚 —— 检测到该情况返回 { ok:false, reason:'no_git_snapshot' }，避免 UI 误报成功
+  async revertMessage(sessionID, messageID) {
+    const res = await fetch(`${this.base}/session/${sessionID}/revert`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messageID })
+    })
+    if (!res.ok) throw new Error(`POST revert ${res.status}`)
+    const body = await res.json()
+    if (!body || !body.revert || !body.revert.snapshot) {
+      return { ok: false, reason: 'no_git_snapshot' }
+    }
+    return { ok: true, revert: body.revert }
+  }
+
   async respondPermission(sessionID, permissionID, response) {
     const res = await fetch(`${this.base}/session/${sessionID}/permissions/${permissionID}`, {
       method: 'POST',

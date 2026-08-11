@@ -978,6 +978,28 @@ body.resizing-v {
   flex: 1;
   overflow-y: auto;
   padding: 20px 24px;
+  position: relative;
+}
+
+/* 「↓ 新消息」悬浮提示：上滑停止跟随期间有新内容时出现，点击回到底部并恢复跟随 */
+.new-hint {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 14px;
+  padding: 6px 14px;
+  font-size: 12px;
+  color: var(--accent);
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.28);
+  user-select: none;
+}
+
+.new-hint:hover {
+  filter: brightness(1.15);
 }
 
 .row {
@@ -2106,7 +2128,7 @@ body.resizing-v {
   opacity: 0.88;
 }
 
-/* ---------- 复制按钮：小图标，位于 AI 气泡外侧右下角（气泡右侧贴底） ---------- */
+/* ---------- 复制按钮：小图标，位于 AI 气泡外侧右下角（气泡右侧贴底）；hover 该气泡时显示 ---------- */
 .copy-btn {
   align-self: flex-end;
   flex-shrink: 0;
@@ -2121,14 +2143,98 @@ body.resizing-v {
   background: transparent;
   color: var(--text-dim);
   cursor: pointer;
-  opacity: 0.85;
+  opacity: 0;
   transition: color 0.15s, background 0.15s, opacity 0.15s;
+}
+
+.row.assistant:hover .copy-btn {
+  opacity: 1;
 }
 
 .copy-btn:hover {
   color: var(--accent);
   background: var(--panel2);
   opacity: 1;
+}
+
+/* ---------- 「回退至此」按钮：位于用户气泡左侧、底部对齐（与复制按钮位置一致），hover 该气泡时显示 ---------- */
+.undo-btn {
+  align-self: flex-end;
+  flex-shrink: 0;
+  margin-right: 8px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+  cursor: pointer;
+  opacity: 0;
+  transition: color 0.15s, background 0.15s, opacity 0.15s;
+}
+.row.user:hover .undo-btn {
+  opacity: 1;
+}
+.undo-btn:hover {
+  color: var(--accent);
+  background: var(--panel2);
+}
+/* 置灰：无变更 / 无 git / 操作进行中；仍随气泡 hover 显示（半透明）以便 tooltip 解释原因 */
+.undo-btn.disabled {
+  cursor: not-allowed;
+  opacity: 0.35;
+}
+.undo-btn.disabled:hover {
+  color: var(--text-dim);
+  background: transparent;
+}
+
+/* ---------- 回退完成后：实际影响清单（undoResult 面板） ---------- */
+.undo-impact {
+  margin: 10px 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel2);
+  max-height: 240px;
+  overflow-y: auto;
+}
+.undo-impact-head {
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--panel2);
+}
+.undo-impact-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+}
+.undo-impact-item + .undo-impact-item {
+  border-top: 1px solid var(--border);
+}
+.undo-impact-icon {
+  flex-shrink: 0;
+}
+.undo-impact-path {
+  font-family: Consolas, 'Courier New', monospace;
+  word-break: break-all;
+  min-width: 0;
+}
+.undo-impact-note {
+  margin-left: auto;
+  flex-shrink: 0;
+  color: var(--text-dim);
+  white-space: nowrap;
 }
 
 /* ---------- 操作提示 ---------- */

@@ -138,15 +138,18 @@ function normalize(list) {
   }))
 }
 
-// 当前上下文 token 量：最近一条带统计的 assistant 消息的 info.tokens（引擎实际返回位置），
-// input + cache.read 即实际发送给模型的上下文量；无任何统计（新会话/未完成）返回 null
+// 当前上下文 token 量：最近一条带有效统计的 assistant 消息的 info.tokens（引擎实际返回位置），
+// input + cache.read 即实际发送给模型的上下文量；回复失败/未完成时引擎写入全 0 统计，
+// 此时向上跳过、沿用上一条成功回复的统计；无任何有效统计（新会话/从未成功）返回 null
 function ctxTokenCount(rawMsgs) {
   const list = rawMsgs || []
   for (let i = list.length - 1; i >= 0; i--) {
     const m = list[i]
     if (m.info?.role !== 'assistant') continue
     const t = m.info?.tokens
-    if (t) return (t.input || 0) + ((t.cache && t.cache.read) || 0)
+    if (!t) continue
+    const n = (t.input || 0) + ((t.cache && t.cache.read) || 0)
+    if (n > 0) return n // 全 0 统计（失败/未完成）跳过，继续向上找上一条成功的上下文量
   }
   return null
 }
@@ -188,6 +191,23 @@ function fmtDur(start, end) {
 }
 
 const STATUS_LABEL = { pending: '等待', running: '执行中', completed: '完成', error: '失败' }
+
+// 目标 user 消息之后是否存在 AI 工具调用（决定「回退至此」按钮是否可用）
+function hasToolChangeAfter(messages, idx) {
+  for (let i = idx + 1; i < messages.length; i++) {
+    const m = messages[i]
+    if (m.role !== 'assistant') continue
+    if ((m.parts || []).some((p) => p.type === 'tool')) return true
+  }
+  return false
+}
+
+// undo 后「实际影响清单」的类型文案（主进程 collectUndoImpact 分类：delete/restore/recover，见 undo功能设计.md §6.3）
+const UNDO_IMPACT_META = {
+  delete: { icon: '❌', note: '已删除（本轮新建）' },
+  restore: { icon: '✏️', note: '已还原到本轮之前' },
+  recover: { icon: '✅', note: '已找回（本轮被删/改名，undo 后恢复）' }
+}
 
 // 任务执行面板分页：默认展示最近 TOOL_PAGE 条工具步骤（执行中最关心的是底部最新条目），
 // 点击「加载更早」每次追加 TOOL_PAGE 条；有界 DOM 保证展开/收起动画每帧重排成本恒定，长任务不卡顿
@@ -236,6 +256,11 @@ export default function App() {
   const [appConfig, setAppConfig] = useState(null) // 有效应用配置（设置面板「配置」页表单）
   const [compacting, setCompacting] = useState(false) // 压缩会话进行中（引擎总结并替换历史，等效 /compact）
   const [ctxTokens, setCtxTokens] = useState(null) // 当前上下文 token 量（最近 assistant 消息 info.tokens 的 input+cache.read，null = 无数据）
+  // 「回退至此」：待轻确认的回退信息（messageID + 回退后填入输入框的用户原文）与 git 可用状态
+  // undoResult：回退完成后的实际影响清单（{ impact:[{path,type}] }，null = 不展示）
+  const [undoDraft, setUndoDraft] = useState(null)
+  const [undoResult, setUndoResult] = useState(null)
+  const [gitState, setGitState] = useState({ available: false, isGit: false })
   // 已保存的权限配置（自动应答兜底用）：onEvent 回调是 [ ] 闭包，必须经 ref 读取最新值
   const permCfgRef = useRef(null)
   const [appInfo, setAppInfo] = useState(null) // 应用版本信息（「关于」面板）
@@ -262,6 +287,8 @@ export default function App() {
   const [wsSwitching, setWsSwitching] = useState(null) // 工作区切换中（= 目标目录，null = 空闲），驱动切换遮罩
 
   const listRef = useRef(null)
+  const listStickRef = useRef(true) // 对话区是否贴底：上滑即 false，滚回底部自动恢复
+  const [showNewHint, setShowNewHint] = useState(false) // 上滑停止跟随期间有新内容时，显示「↓ 新消息」提示
   const currentRef = useRef(currentID)
   currentRef.current = currentID
   const workspaceRef = useRef(workspace) // 供事件处理器取最新工作区（闭包防过期）
@@ -723,10 +750,35 @@ export default function App() {
     return () => clearInterval(timer)
   }, [engine.running, timings])
 
-  // 自动滚动到底部
+  // 自动滚动到底部：仅在贴底时跟随最新内容；用户上滑后停止跟随（保持当前位置可阅读），
+  // 期间有新内容则显示「↓ 新消息」提示；滚回底部（onListScroll 判定）自动恢复跟随
   useEffect(() => {
-    if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight
+    const el = listRef.current
+    if (!el) return
+    if (listStickRef.current) {
+      el.scrollTop = el.scrollHeight
+      setShowNewHint(false)
+    } else {
+      setShowNewHint(true)
+    }
   }, [messages, busy])
+
+  // 对话区滚动：距底 <30px 视为贴底（恢复跟随），否则上滑（停止跟随并隐藏提示）
+  const onListScroll = () => {
+    const el = listRef.current
+    if (!el) return
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30
+    listStickRef.current = nearBottom
+    if (nearBottom) setShowNewHint(false)
+  }
+
+  // 「↓ 新消息」：点击回到底部并恢复跟随
+  const jumpToLatest = () => {
+    const el = listRef.current
+    if (el) el.scrollTop = el.scrollHeight
+    listStickRef.current = true
+    setShowNewHint(false)
+  }
 
   // 操作提示自动消失
   useEffect(() => {
@@ -968,6 +1020,100 @@ export default function App() {
       api.applyCloseAction(v).catch(() => setToast('关闭行为保存失败'))
     }
     setSettingsData((d) => (d ? { ...d, closeAction: v } : d))
+  }
+
+  // 工作区变化时刷新 git 可用状态（决定「回退至此」按钮可用性；git 已在主进程静默初始化，isGit 用于日志/兜底判断）
+  useEffect(() => {
+    if (!workspace) return
+    if (typeof api.gitEnsure !== 'function') return
+    let stale = false
+    api
+      .gitEnsure(workspace, {})
+      .then((g) => {
+        if (stale) return
+        setGitState({ available: !!g?.available, isGit: !!(g && g.isGit) })
+      })
+      .catch(() => {})
+    return () => {
+      stale = true
+    }
+  }, [workspace])
+
+  // 「回退至此」：点击气泡左侧按钮 → 轻确认弹窗。
+  // 事前不再预估影响清单（bash 等无法精确预测，见 undo功能设计.md §6.2），
+  // 实际影响由主进程在 undo 完成后按快照对比收集（§6.3），成功后经 undoResult 展示
+  const openUndoConfirm = (m) => {
+    setUndoDraft({
+      messageID: m.id,
+      // 回退成功后把该消息原样填回输入框（用户可能需要编辑后重发）
+      userText: (m.parts || []).filter((p) => p.type === 'text').map((p) => p.text || '').join('\n')
+    })
+  }
+
+  // 回退后刷新：消息列表 + 上下文 token + 工作区文件树（文件变更反映到侧栏）
+  // 引擎 revert 只回滚文件快照，消息列表要到下一次发送才截断；因此按目标 user 消息 ID 前端截断：
+  // 保留该消息之前的部分，该消息及其后的 AI 回复一并移除（与引擎后续截断结果一致，幂等）
+  const refreshAfterUndo = async (targetMsgID) => {
+    try {
+      const msgs = await api.messageList(currentID)
+      const norm = normalize(msgs)
+      if (targetMsgID) {
+        const idx = norm.findIndex((m) => m.id === targetMsgID)
+        if (idx >= 0) {
+          const trimmed = norm.slice(0, idx)
+          setMessages(trimmed)
+          setCtxTokens(ctxTokenCount(trimmed))
+        } else {
+          setMessages(norm)
+          setCtxTokens(ctxTokenCount(msgs))
+        }
+      } else {
+        setMessages(norm)
+        setCtxTokens(ctxTokenCount(msgs))
+      }
+    } catch (e) {
+      console.error('refresh after undo failed', e)
+    }
+    if (workspace && typeof api.workspaceListDir === 'function') {
+      try {
+        const list = await api.workspaceListDir(workspace)
+        if (list && !list.error) setWsChildren((c) => ({ ...c, [workspace]: list }))
+      } catch {
+        /* 忽略 */
+      }
+    }
+  }
+
+  // 执行回退：调用引擎 revert；失败（含引擎静默失败兜底 no_git_snapshot）给出明确提示。
+  // 成功后把被回退的用户消息原样填入输入框（用户可能需要编辑后重发），并截断消息列表
+  const doUndo = async (messageID, userText) => {
+    try {
+      const r = await api.undoTo(currentID, messageID)
+      if (!r || !r.ok) {
+        if (r?.reason === 'no_git_snapshot') {
+          setToast('回退失败：引擎未产生文件快照，文件无法回滚（工作区 git 不可用）')
+        } else {
+          setToast((r && r.message) || '回退失败')
+        }
+        return
+      }
+      setToast('已回退到此轮对话之前')
+      if (userText) setInput(userText)
+      // 主进程已按快照对比收集实际影响清单（§6.3），非空时展示事后结果面板
+      if (r.impact && r.impact.length) setUndoResult({ impact: r.impact })
+      refreshAfterUndo(messageID)
+    } catch (e) {
+      console.error('undo failed', e)
+      setToast('回退失败：' + (e.message || '未知错误'))
+    }
+  }
+
+  // 确认弹窗确认 → 直接执行回退（git 已在工作区建立时静默初始化，见主进程 ensureWorkdirGit；
+  //   无 git 环境时「回退至此」按钮已置灰禁用，不会走到这里）
+  const onUndoConfirm = () => {
+    const { messageID, userText } = undoDraft
+    setUndoDraft(null)
+    doUndo(messageID, userText)
   }
   // 任务通知开关：即时保存并同步本地状态
   const applyNotifyTask = (v) => {
@@ -1726,21 +1872,34 @@ export default function App() {
         </aside>
 
         <main className="main">
-          <div className="message-list" ref={listRef}>
+          <div className="message-list" ref={listRef} onScroll={onListScroll}>
             {!currentID && !busy && (
               <div className="greeting">
                 <div className="greet-title">{greeting.title}</div>
                 <div className="greet-sub">{greeting.sub}</div>
               </div>
             )}
-            {messages.map((m) => (
-              <MessageView key={m.id} m={m} onCopy={copyText} />
+            {messages.map((m, mi) => (
+              <MessageView
+                key={m.id}
+                m={m}
+                onCopy={copyText}
+                onUndo={openUndoConfirm}
+                canUndo={m.role === 'user' && hasToolChangeAfter(messages, mi)}
+                gitAvailable={gitState.available}
+                busy={busy}
+              />
             ))}
             {busy && (
               <div className="busy-hint">
                 {stopping ? '正在停止…' : 'AI 正在执行中…'}
                 {currentStep?.kind === 'tool' && ` 正在${currentStep.tool}`}
               </div>
+            )}
+            {showNewHint && (
+              <button className="new-hint" onClick={jumpToLatest} title="回到最新内容">
+                ↓ 新消息
+              </button>
             )}
           </div>
 
@@ -2057,6 +2216,50 @@ export default function App() {
                 }}
               >
                 {confirm.confirmLabel || '确认'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {undoDraft && (
+        <div className="perm-mask z-top">
+          <div className="perm-card">
+            <div className="perm-title">回退到此轮对话之前？</div>
+            <div className="perm-desc">将撤销此条及之后全部 AI 变更，此操作不可恢复。</div>
+            <div className="perm-desc">实际影响了哪些文件，将在回退完成后展示。</div>
+            <div className="perm-btns">
+              <button onClick={() => setUndoDraft(null)}>取消</button>
+              <button className="danger" onClick={onUndoConfirm}>
+                确认回退
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {undoResult && (
+        <div className="perm-mask z-top">
+          <div className="perm-card">
+            <div className="perm-title">已回退到此轮对话之前</div>
+            <div className="undo-impact">
+              <div className="undo-impact-head">实际影响（{undoResult.impact.length} 个）</div>
+              <div className="undo-impact-list">
+                {undoResult.impact.map((f, i) => {
+                  const meta = UNDO_IMPACT_META[f.type] || { icon: '📄', note: '' }
+                  return (
+                    <div className="undo-impact-item" key={i}>
+                      <span className="undo-impact-icon">{meta.icon}</span>
+                      <span className="undo-impact-path">{f.path}</span>
+                      <span className="undo-impact-note">{meta.note}</span>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+            <div className="perm-btns">
+              <button className="primary" onClick={() => setUndoResult(null)}>
+                知道了
               </button>
             </div>
           </div>
@@ -3051,9 +3254,16 @@ function ToolCard({ step }) {
 
 // AI 思考过程：可折叠区块，展开/收起带高度过渡动画（grid 0fr→1fr，纯 CSS 无需测量高度）
 // 流式进行中强制展开（与 <details open={streaming}> 行为一致），结束后按用户选择
+// 思考文本内部独立滚动：贴底时跟随最新思考内容，上滑后停止跟随，滚回底部恢复
 function ReasoningBlock({ text, streaming }) {
   const [open, setOpen] = useState(false)
   const isOpen = open || streaming
+  const innerRef = useRef(null)
+  const stickRef = useRef(true)
+  useEffect(() => {
+    const el = innerRef.current
+    if (el && stickRef.current) el.scrollTop = el.scrollHeight
+  }, [text])
   return (
     <div className="reasoning">
       <button className={`reasoning-summary${isOpen ? ' open' : ''}`} onClick={() => setOpen((o) => !o)}>
@@ -3061,13 +3271,23 @@ function ReasoningBlock({ text, streaming }) {
         思考过程
       </button>
       <div className={`reasoning-body${isOpen ? ' open' : ''}`}>
-        <div className="reasoning-inner">{text}</div>
+        <div
+          className="reasoning-inner"
+          ref={innerRef}
+          onScroll={() => {
+            const el = innerRef.current
+            if (!el) return
+            stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 30
+          }}
+        >
+          {text}
+        </div>
       </div>
     </div>
   )
 }
 
-function MessageView({ m, onCopy }) {
+function MessageView({ m, onCopy, onUndo, canUndo, gitAvailable, busy }) {
   const mdText = m.parts.filter((p) => p.type === 'text').map((p) => p.text || '').join('\n')
   if (m.role === 'user') {
     // 压缩会话产生的 compaction 消息：本身无正文，仅标记"此前的历史已被压缩"，显示为提示条而非空气泡
@@ -3078,8 +3298,23 @@ function MessageView({ m, onCopy }) {
         </div>
       )
     }
+    // 「回退至此」按钮：hover 气泡时显示；无变更 / 无 git / 操作进行中时置灰并给 tooltip 说明
+    const undoDisabled = !canUndo || busy || !gitAvailable
+    const undoTitle = !gitAvailable
+      ? '此功能需要本机安装 Git'
+      : !canUndo
+        ? '此条之后没有可撤销的变更'
+        : '回退至此（撤销此条及之后的全部 AI 变更）'
     return (
       <div className="row user">
+        <button
+          className={'undo-btn' + (undoDisabled ? ' disabled' : '')}
+          title={undoTitle}
+          disabled={undoDisabled}
+          onClick={() => !undoDisabled && onUndo && onUndo(m)}
+        >
+          ↶
+        </button>
         <div className="bubble user">
           {m.parts.map((p, i) => (p.type === 'text' ? <div key={i}>{p.text}</div> : null))}
         </div>

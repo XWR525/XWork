@@ -11,9 +11,11 @@ function effectiveConfig() {
 const { app, BrowserWindow, ipcMain, dialog, shell, Menu, Notification, Tray, nativeImage } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
-const { Engine } = require('./engine')
+const { execSync } = require('node:child_process')
+const { Engine, findGit } = require('./engine')
 const { Bridge } = require('./bridge')
 const { Settings, applyToOpencode, MASK } = require('./settings')
+const { restoreMissingFiles, collectUndoImpact } = require('./undo')
 const logger = require('./logger')
 const JSZip = require('jszip')
 
@@ -225,6 +227,8 @@ app.whenReady().then(async () => {
   createTray()
   try {
     applyToOpencode(opencodeConfig, settings) // 保证 provider 段与设置一致
+    // 工作区建立时静默 git init：引擎快照每轮对话前写入，事后 init 无法追溯此前轮次（见 ensureWorkdirGit）
+    ensureWorkdirGit(cfg.workspace, { init: true })
     await engine.start()
     startGlobalWatch()
   } catch (e) {
@@ -413,6 +417,8 @@ ipcMain.handle('workspace:switch', async (_e, dir) => {
   if (!stat.isDirectory()) return { ok: false, error: '所选路径不是文件夹' }
   console.log('[ws] switch start, dir=', dir)
   settings.save({ workspace: dir })
+  // 工作区建立时静默 git init（引擎快照依赖：每轮对话前写入，事后 init 无法追溯此前轮次）
+  ensureWorkdirGit(dir, { init: true })
   engine.setCwd(dir)
   await engine.stop()
   console.log('[ws] stop done, forcing restart')
@@ -524,6 +530,119 @@ ipcMain.handle('session:create', (_e, { title, permission }) =>
 ipcMain.handle('session:delete', (_e, sessionID) => bridge.deleteSession(sessionID))
 
 ipcMain.handle('session:rename', (_e, sessionID, title) => bridge.renameSession(sessionID, title))
+
+// 目标轮次前快照 T_before：消息 part 的 step-start/step-finish 携带引擎 track() 的 write-tree 结果（实测确认），
+// 即每轮「操作完成后」的快照。回退到目标 user 消息之前 → 工作区应回到「目标轮次开始前」的状态：
+//   取目标消息之前最后一条带 snapshot 的 part；
+//   若目标消息之前无任何快照（目标消息是会话首条），取目标轮首个 step-start 的快照（同为轮次开始前状态）
+async function snapshotBeforeMessage(bridge, sessionID, messageID) {
+  try {
+    const msgs = await bridge.getMessages(sessionID)
+    let lastBefore = null
+    for (const m of msgs || []) {
+      if (m.info && m.info.id === messageID) break
+      for (const p of m.parts || []) {
+        if (typeof p.snapshot === 'string' && p.snapshot) lastBefore = p.snapshot
+      }
+    }
+    if (lastBefore) return lastBefore
+    let sawTarget = false
+    for (const m of msgs || []) {
+      if (m.info && m.info.id === messageID) {
+        sawTarget = true
+        continue
+      }
+      if (!sawTarget) continue
+      for (const p of m.parts || []) {
+        if (typeof p.snapshot === 'string' && p.snapshot) return p.snapshot
+      }
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+// 撤销到指定 user 消息之前（「回退至此」）：回退该消息及之后的全部文件变更与会话状态
+// bridge.revertMessage 已兜底「引擎返回 200 但无快照」的静默失败（非 git 工作区等），不会误报成功
+// 引擎 revert 存在缺陷：被改名/删除的旧文件不恢复（旧名不在任何 patch 的 files 列表，见 undo功能设计.md §7.4），
+// 兜底参照采用「目标轮次前快照 T_before」而非 revert 返回的「操作后快照」：
+// 回退后工作区应等于 T_before 状态，T_before 有、工作区缺的文件即漏恢复的旧文件，按路径恢复
+ipcMain.handle('session:undo-to', async (_e, sessionID, messageID) => {
+  if (!sessionID || typeof sessionID !== 'string') return { ok: false, reason: 'bad_args' }
+  if (!messageID || typeof messageID !== 'string') return { ok: false, reason: 'bad_args' }
+  try {
+    const tBefore = await snapshotBeforeMessage(bridge, sessionID, messageID)
+    console.log('[session:undo-to] tBefore=', tBefore || '(none)')
+    const r = await bridge.revertMessage(sessionID, messageID)
+    console.log('[session:undo-to] ok=', r.ok, r.reason || '')
+    if (r.ok && r.revert && r.revert.snapshot) {
+      const ws = engine.status().workspace || settings.load().workspace
+      const git = findGit()
+      const fb = tBefore
+        ? restoreMissingFiles({
+            git,
+            snapshotDir: path.join(xdgHome, 'data', 'opencode', 'snapshot'),
+            workspace: ws,
+            snapshot: tBefore
+          })
+        : { ok: true, restored: [], skipped: [] }
+      console.log(
+        '[session:undo-to] snapshot-compensate:',
+        fb.ok ? `restored=${fb.restored.length} skipped=${fb.skipped.length}` : `skip (${fb.reason})`
+      )
+      // 兜底恢复完成后（工作区为最终状态）再收集实际影响
+      const imp = collectUndoImpact({
+        git,
+        snapshotDir: path.join(xdgHome, 'data', 'opencode', 'snapshot'),
+        workspace: ws,
+        snapshot: r.revert.snapshot
+      })
+      console.log(
+        '[session:undo-to] impact:',
+        imp.ok ? imp.impact.map((i) => `${i.type}:${i.path}`).join(' | ') || '(none)' : `skip (${imp.reason})`
+      )
+      return { ...r, restored: fb.ok ? fb.restored : [], impact: imp.ok ? imp.impact : [] }
+    }
+    return r
+  } catch (e) {
+    console.error('[session:undo-to] failed:', e.message)
+    return { ok: false, reason: 'error', message: e.message }
+  }
+})
+
+// git 可用性 + 工作区 git 状态检测 + 按需 git init
+// - 内置 MinGit 优先，其次系统 git（findGit，与引擎快照实际使用的 git 一致）
+// - 工作区 git 检测：沿目录向上查找 .git（与引擎探测逻辑一致）
+// - opts.init=true 且工作区非 git 时执行 git init（静默：工作区建立/切换时调用，保证引擎每轮对话前能写快照）
+// 注意：引擎的快照是「每轮对话前」写入的，若等用户要回退时才 init，此前轮次没有快照、无法回退，
+// 因此必须在工作区建立时就保证 .git 存在（启动恢复 + 切换工作区两处调用）
+function ensureWorkdirGit(dir, opts = {}) {
+  const git = findGit()
+  if (!git) return { ok: false, reason: 'no_git', available: false, isGit: false }
+  let cur = dir
+  let isGit = false
+  while (cur && fs.existsSync(cur)) {
+    if (fs.existsSync(path.join(cur, '.git'))) { isGit = true; break }
+    const parent = path.dirname(cur)
+    if (parent === cur) break
+    cur = parent
+  }
+  if (isGit) return { ok: true, available: true, isGit: true }
+  if (opts.init) {
+    try {
+      execSync(`"${git}" init`, { cwd: dir, stdio: 'ignore', windowsHide: true })
+      console.log('[git:ensure] git init done at', dir)
+      return { ok: true, available: true, isGit: true, inited: true }
+    } catch (e) {
+      console.error('[git:ensure] init failed:', e.message)
+      return { ok: false, reason: 'init_failed', available: true, isGit: false, message: e.message }
+    }
+  }
+  return { ok: true, available: true, isGit: false }
+}
+
+ipcMain.handle('git:ensure', (_e, dir, opts = {}) => ensureWorkdirGit(dir, opts))
 
 // 模型列表：引擎未就绪（如刚启动、健康检查前）时返回空列表，渲染层稍后经 server.connected 事件重试
 ipcMain.handle('provider:list', async () => {

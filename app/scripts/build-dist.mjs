@@ -57,6 +57,39 @@ const dstExe = path.join(dstDir, 'opencode.exe')
 fs.copyFileSync(srcExe, dstExe)
 console.log('==> opencode.exe 已复制: ' + srcExe + ' → ' + dstExe + ' (' + Math.round(fs.statSync(dstExe).size / 1024 / 1024) + ' MB)')
 
+// 3.5 内置 MinGit（resources/git）：引擎的快照/撤销依赖 git 命令（实测 PATH 无 git 时 revert 静默失败），
+// 随包内置后 undo 功能开箱即用、不依赖用户机器安装 git。固定版本避免漂移。
+const MINGIT_VERSION = '2.55.0'
+const gitDir = path.join(appDir, 'resources', 'git')
+const gitExe = path.join(gitDir, 'cmd', 'git.exe')
+if (fs.existsSync(gitExe)) {
+  console.log('==> 内置 MinGit 已存在，跳过下载:', gitExe)
+} else {
+  const zipUrl = `https://github.com/git-for-windows/git/releases/download/v${MINGIT_VERSION}.windows.1/MinGit-${MINGIT_VERSION}-64-bit.zip`
+  const tmpZip = path.join(appDir, 'build', `MinGit-${MINGIT_VERSION}.zip`)
+  console.log(`==> 下载 MinGit ${MINGIT_VERSION} → resources/git（引擎撤销功能依赖）`)
+  try {
+    const res = await fetch(zipUrl, { redirect: 'follow' })
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    const buf = Buffer.from(await res.arrayBuffer())
+    fs.mkdirSync(path.dirname(tmpZip), { recursive: true })
+    fs.writeFileSync(tmpZip, buf)
+    console.log('==> MinGit zip 已下载: ' + Math.round(buf.length / 1024 / 1024) + ' MB')
+    // Windows 自带 bsdtar 可解压 zip，比纯 JS 解压快得多；先清空目录避免残留不完整内容
+    fs.rmSync(gitDir, { recursive: true, force: true })
+    fs.mkdirSync(gitDir, { recursive: true })
+    const r = spawnSync('tar', ['-xf', tmpZip, '-C', gitDir], { stdio: 'inherit' })
+    fs.unlinkSync(tmpZip)
+    if (r.status !== 0 || !fs.existsSync(gitExe)) throw new Error('解压后未找到 cmd/git.exe')
+    console.log('==> MinGit 已解压到 resources/git (' + Math.round(fs.statSync(gitExe).size / 1024 / 1024) + ' MB 解压目录)')
+  } catch (e) {
+    console.error('!! MinGit 下载/解压失败: ' + e.message)
+    console.error('   安装包将不包含内置 git，undo 功能需用户机器安装 Git（无 git 时该功能禁用）。')
+    console.error('   网络恢复后请删除 app/resources/git 目录重新打包。')
+    process.exit(1)
+  }
+}
+
 // 4. electron-builder 产出 NSIS 安装包（产物在 release/）
 // 默认 --publish never：本地构建不上传 GitHub Release（避免 CI 检测触发隐式发布而要求 GH_TOKEN）；
 // latest.yml 更新元数据仍会生成。发布到 GitHub 时设置环境变量 XWORK_PUBLISH=always（并配置 GH_TOKEN）

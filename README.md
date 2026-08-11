@@ -33,11 +33,17 @@
 ### 会话管理
 - 新建 / 重命名（双击标题）/ 删除 / 回看
 - 置顶与拖拽排序（本地持久化）
+- **回退（undo）**：user 气泡左侧「回退至此」→ 轻确认 → 撤销该轮及之后全部 AI 变更（引擎 revert + 快照补偿恢复，改名 / 移动的旧文件自动找回），回退完成后展示实际影响清单（删除 / 还原 / 找回）并刷新消息列表与文件树（详见 [undo功能设计.md](undo功能设计.md)）
+- **压缩会话**：输入区「压缩」按钮，将历史对话压缩为摘要以换取上下文空间（引擎 summarize，需指定总结模型）
+- **上下文 Token 统计**：输入区实时显示当前会话上下文长度（最近一次成功回复的 input + cache.read）
 
 ### 界面与系统
 - 暗色 / 亮色主题
 - 设置面板（模型设置 / 界面设置），支持「保存并重启引擎」
 - 自绘无边框标题栏（最小化 / 最大化 / 关闭）
+- **任务通知**：AI 完成回复或发起提问时，窗口不在前台则弹 Windows 系统通知（点击恢复窗口）
+- **关闭时最小化到托盘**：托盘图标 + 右键菜单（显示主窗口 / 退出），首次最小化有系统通知
+- **技能市场（Skill Hub）**：浏览 / 安装 / 卸载技能（`.agents/skills`），安装后引擎自动加载
 - 文件日志：主进程 + 渲染进程日志落盘，1MB 轮转保留 5 份
 - 自动更新（打包版，基于 GitHub Releases 的 electron-updater，支持差分更新）
 
@@ -48,7 +54,7 @@
 │  渲染进程 (React, App.jsx)                                               │
 │    │ window.xwork.*（preload contextBridge）                             │
 │    │ ←── engine:event（IPC，全局事件流转发）                              │
-│ 主进程 (index / engine / bridge / settings / logger)                     │
+│ 主进程 (index / engine / bridge / settings / undo / config / logger)        │
 │    │ HTTP REST + 全局 SSE (GET /global/event)                            │
 └────┼─────────────────────────────────────────────────────────────────────┘
      ▼
@@ -117,7 +123,7 @@ npm run dev
 
 ```
 app/                        Electron 应用（源码 + 构建配置）
-  src/main/                 主进程：index（IPC）/ engine（进程管理）/ bridge（引擎 API 桥）/ settings（设置与 Key）/ logger
+  src/main/                 主进程：index（IPC）/ engine（进程管理）/ bridge（引擎 API 桥）/ settings（设置与 Key）/ undo（回退兜底恢复）/ config（应用配置）/ logger
   src/preload/              contextBridge 桥接层
   src/renderer/             React 渲染层（App.jsx / styles.css / main.jsx）
   scripts/                  dev.mjs（开发启动）/ build-dist.mjs（一键打包）/ gen-icon.mjs（图标生成）
@@ -125,6 +131,10 @@ app/                        Electron 应用（源码 + 构建配置）
   release/                  打包产物（NSIS 安装器 / win-unpacked）
 PACKAGING.md                打包与发布指南
 PRD.md                      产品需求文档（含各阶段实现记录）
+undo功能设计.md             回退（undo）功能设计（已实现）
+回退功能测试报告.md          回退功能端到端测试报告（真实 AI，13/13 通过）
+多模态图片支持功能设计.md    多模态图片支持方案讨论稿（待评审）
+定时任务功能设计.md          定时任务方案讨论稿（待评审）
 start-xwork.bat             开发一键启动脚本
 ```
 
@@ -135,15 +145,6 @@ start-xwork.bat             开发一键启动脚本
 - 产物：`app/release/XWork-Installer-<版本>.exe`（NSIS 向导安装器，内含 Electron 运行时与 opencode 引擎，目标机器无需预装 Node.js / opencode）。
 - 本地打包：`cd app && npm run build:dist`（默认仅产本地，不上传）。
 - 发布更新：配置 `GH_TOKEN` + `XWORK_PUBLISH=always` 后运行同一命令，产物自动上传 GitHub Releases；应用内「检查更新」据此检测并下载新版本。
-
-## 常见问题
-
-| 现象 | 处理 |
-| --- | --- |
-| 启动报 opencode executable not found | 设置环境变量 `XWORK_OPENCODE_PATH` 指向 `opencode.exe`，或 `npm install -g opencode-ai` |
-| 端口 4096 被占用 | 若占用者是健康 opencode 服务则自动复用；否则结束占用进程后重启应用 |
-| 切换工作区 / 保存模型配置后等待较久 | 引擎需要重启进程（新 cwd / 新环境变量），属正常现象 |
-| 纯 Node 环境下 Key 显示 `plain:` 前缀 | safeStorage 仅在 Electron 运行时可用，测试环境自动降级为明文 |
 
 ## 许可
 

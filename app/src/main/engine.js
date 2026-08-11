@@ -68,11 +68,38 @@ function findOpencodeExe() {
 
 // 重定向 XDG 目录到应用数据目录（规避安全软件对用户目录写入的拦截）
 function xdgEnv(xdgHome) {
-  return {
+  const env = {
     ...process.env,
     XDG_CONFIG_HOME: path.join(xdgHome, 'config'),
     XDG_STATE_HOME: path.join(xdgHome, 'state'),
     XDG_DATA_HOME: path.join(xdgHome, 'data')
+  }
+  // 内置 git（MinGit，随包分发在 resources/git）：存在则注入 PATH 最前。
+  // 引擎的快照/撤销依赖 git 命令（实测：PATH 无 git 时 revert 静默失败），
+  // 内置后回退功能开箱即用，不依赖用户机器安装 git
+  const builtin = builtinGitDir()
+  if (builtin) {
+    env.PATH = [path.join(builtin, 'cmd'), path.join(builtin, 'mingw64', 'bin'), ...(env.PATH || '').split(';')].join(';')
+  }
+  return env
+}
+
+// 内置 git 根目录（resources/git，需含 cmd/git.exe）；开发环境未打包时不存在则返回 null
+function builtinGitDir() {
+  if (!process.resourcesPath) return null
+  const dir = path.join(process.resourcesPath, 'git')
+  return fs.existsSync(path.join(dir, 'cmd', 'git.exe')) ? dir : null
+}
+
+// 当前可用的 git 可执行文件：优先内置 MinGit，其次系统 git（PATH）；均不可用返回 null
+function findGit() {
+  const builtin = builtinGitDir()
+  if (builtin) return path.join(builtin, 'cmd', 'git.exe')
+  try {
+    const out = execSync('git --version', { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
+    return out.startsWith('git version') ? 'git' : null
+  } catch {
+    return null
   }
 }
 
@@ -220,4 +247,4 @@ class Engine {
   }
 }
 
-module.exports = { Engine, findOpencodeExe, healthCheck, DEFAULT_PORT }
+module.exports = { Engine, findOpencodeExe, healthCheck, DEFAULT_PORT, findGit }

@@ -15,7 +15,8 @@ export default defineConfig({
           bridge: resolve(dir, 'src/main/bridge.js'),
           settings: resolve(dir, 'src/main/settings.js'),
           logger: resolve(dir, 'src/main/logger.js'),
-          config: resolve(dir, 'src/main/config.js')
+          config: resolve(dir, 'src/main/config.js'),
+          undo: resolve(dir, 'src/main/undo.js')
         }
       }
     }
