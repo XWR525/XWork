@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { marked } from 'marked'
 marked.setOptions({ gfm: true, breaks: true })
 
@@ -278,6 +278,10 @@ export default function App() {
   const [panelOpen, setPanelOpen] = useState(false) // 任务执行面板：默认折叠，执行中由收起窄条上的圆点闪烁提示
   const [sidebarW, setSidebarW] = useState(240) // 左边栏宽度（拖动边缘调整）
   const [taskW, setTaskW] = useState(300) // 任务面板展开宽度（拖动边缘调整）
+  // 拖拽实时宽度（null = 未拖拽）+ 当前拖拽方向（'left' | 'task'）：拖拽期间只更新被拖一侧的宽度
+  // （覆盖在聊天区上），另一侧保持提交值，互不影响；松手时一次性提交到 sidebarW/taskW（瞬时让位）
+  const [dragW, setDragW] = useState(null)
+  const [dragType, setDragType] = useState(null)
   const [toolVisible, setToolVisible] = useState(TOOL_PAGE) // 任务面板已展示的工具步骤数（分页：从最新向前展示，按钮加载更早）
   const [composerH, setComposerH] = useState(null) // 输入区高度（拖动上缘调整，null = 按内容自适应）
   // 渲染层配置（来自 app/app.config.json，经 config:get IPC 获取）：文件树隐藏列表 + 各时长
@@ -312,6 +316,9 @@ export default function App() {
     setCurrentID(sid)
     setBusy(false)
     setStopping(false)
+    // 切换会话：重置对话区贴底状态并隐藏「↓ 新消息」气泡（避免上个会话的上滑残留）
+    listStickRef.current = true
+    setShowNewHint(false)
     // 恢复该会话绑定的模型（opencode 将模型持久化在会话 model 字段）
     const s = sessions.find((x) => x.id === sid)
     if (s?.model?.providerID) setModelSel({ providerID: s.model.providerID, modelID: s.model.id })
@@ -409,6 +416,9 @@ export default function App() {
       setMessages([])
       setBusy(false)
       setStopping(false)
+      // 切换工作区同样重置对话区贴底状态与「↓ 新消息」气泡
+      listStickRef.current = true
+      setShowNewHint(false)
       setAddedFiles([])
       setExpandedDirs({})
       setCtxMenu(null)
@@ -751,7 +761,7 @@ export default function App() {
   }, [engine.running, timings])
 
   // 自动滚动到底部：仅在贴底时跟随最新内容；用户上滑后停止跟随（保持当前位置可阅读），
-  // 期间有新内容则显示「↓ 新消息」提示；滚回底部（onListScroll 判定）自动恢复跟随
+  // 上滑中且 AI 出现新消息（messages/busy 变化）时显示「↓ 新消息」提示；滚回底部自动隐藏并恢复跟随
   useEffect(() => {
     const el = listRef.current
     if (!el) return
@@ -763,7 +773,8 @@ export default function App() {
     }
   }, [messages, busy])
 
-  // 对话区滚动：距底 <30px 视为贴底（恢复跟随），否则上滑（停止跟随并隐藏提示）
+  // 对话区滚动：距底 <30px 视为贴底（恢复跟随），否则上滑（停止跟随）；
+  // 「↓ 新消息」提示仅在「上滑中 + 有新消息/busy 变化」（下方 effect）时出现
   const onListScroll = () => {
     const el = listRef.current
     if (!el) return
@@ -980,15 +991,15 @@ export default function App() {
     }
   }
 
-  // 复制消息文本到剪贴板
-  const copyText = async (md) => {
+  // 复制文本（useCallback 稳定引用：MessageView 已 memo，避免每次渲染触发子组件重渲染）
+  const copyText = useCallback(async (md) => {
     try {
       await navigator.clipboard.writeText(md)
       setToast('已复制到剪贴板')
     } catch (e) {
       setToast('复制失败: ' + e.message)
     }
-  }
+  }, [])
 
   // 启动时加载已保存的界面主题（旧 preload 无 getTheme 时保持默认暗色）
   useEffect(() => {
@@ -1039,16 +1050,15 @@ export default function App() {
     }
   }, [workspace])
 
-  // 「回退至此」：点击气泡左侧按钮 → 轻确认弹窗。
-  // 事前不再预估影响清单（bash 等无法精确预测，见 undo功能设计.md §6.2），
-  // 实际影响由主进程在 undo 完成后按快照对比收集（§6.3），成功后经 undoResult 展示
-  const openUndoConfirm = (m) => {
+  // 回退确认（useCallback 稳定引用：MessageView 已 memo）。事前不再预估影响清单
+  // （bash 等无法精确预测，见 undo功能设计.md §6.2），实际影响由主进程 undo 完成后按快照对比收集（§6.3）
+  const openUndoConfirm = useCallback((m) => {
     setUndoDraft({
       messageID: m.id,
       // 回退成功后把该消息原样填回输入框（用户可能需要编辑后重发）
       userText: (m.parts || []).filter((p) => p.type === 'text').map((p) => p.text || '').join('\n')
     })
-  }
+  }, [])
 
   // 回退后刷新：消息列表 + 上下文 token + 工作区文件树（文件变更反映到侧栏）
   // 引擎 revert 只回滚文件快照，消息列表要到下一次发送才截断；因此按目标 user 消息 ID 前端截断：
@@ -1289,28 +1299,34 @@ export default function App() {
     }
   }
 
-  // 拖拽调整侧栏宽度：type = 'left'（左边栏右缘）/ 'task'（任务面板左缘）
-  // mousedown 记录起点，window mousemove 期间用函数式 setState 更新，mouseup 清理监听
+  // 拖拽调整侧栏/任务面板宽度：type = 'left'（左边栏右缘）/ 'task'（任务面板左缘）
+  // 覆盖式布局下，拖拽期间只更新 dragW（面板实时变宽、盖在聊天区上），聊天区保持原宽不重排；
+  // mouseup 一次性提交到 sidebarW/taskW → 聊天区瞬时让位（一次布局，无逐帧动画）
   const startResize = (type, e) => {
     e.preventDefault()
     const startX = e.clientX
-    const startW = type === 'left' ? sidebarW : taskW
-    const setter = type === 'left' ? setSidebarW : setTaskW
+    const baseW = type === 'left' ? sidebarW : taskW
     const min = type === 'left' ? 160 : 200
     const max = type === 'left' ? 480 : 600
+    let latestW = null // 闭包内记录最新拖拽宽度，onUp 一次性提交（避免在 setState updater 里做副作用）
+    setDragType(type)
     const onMove = (ev) => {
       // 左边栏向右拉变宽；任务面板向左拉变宽
       const delta = type === 'left' ? ev.clientX - startX : startX - ev.clientX
-      setter(Math.min(max, Math.max(min, startW + delta)))
+      latestW = Math.min(max, Math.max(min, baseW + delta))
+      setDragW(latestW)
     }
     const onUp = () => {
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
-      document.body.classList.remove('resizing')
+      document.body.classList.remove('resizing', type === 'left' ? 'resizing-left' : 'resizing-task')
+      if (latestW !== null) (type === 'left' ? setSidebarW : setTaskW)(latestW)
+      setDragW(null)
+      setDragType(null)
     }
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
-    document.body.classList.add('resizing')
+    document.body.classList.add('resizing', type === 'left' ? 'resizing-left' : 'resizing-task')
   }
 
   // 拖拽调整输入区高度：向上拉变高（消息区自动腾出空间），最小 100px（手柄到窗口底边的距离），最大不超过窗口一半
@@ -1366,6 +1382,9 @@ export default function App() {
     setMessages([])
     setBusy(false)
     setStopping(false)
+    // 新建会话：重置对话区贴底状态并隐藏「↓ 新消息」气泡
+    listStickRef.current = true
+    setShowNewHint(false)
     setGreeting(pickGreeting())
     setAgent('build') // 新对话默认 build 模式
     // 默认最常用模型（须仍存在于模型组中有效），无记录或已失效则置空让用户选择
@@ -1511,16 +1530,37 @@ export default function App() {
     setDropPos(null)
   }
 
-  // 任务执行面板：按时间顺序提取所有工具调用
-  const toolSteps = []
-  for (const m of messages) {
-    if (m.role !== 'assistant') continue
-    for (const p of m.parts) {
-      if (p.type === 'tool') {
-        toolSteps.push({ key: p.id || p.callID || Math.random().toString(36).slice(2), tool: p.tool, state: p.state, aborted: m.aborted })
+  // 任务执行面板：按时间顺序提取所有工具调用。
+  // useMemo([messages])：messages 未变时数组引用稳定；元素持有 part 引用（delta 更新只替换变化的
+  // part，未变 part 引用稳定）→ 配合 ToolCard memo，无关消息更新 / 面板展开不重渲染工具卡
+  const toolSteps = useMemo(() => {
+    const out = []
+    for (const m of messages) {
+      if (m.role !== 'assistant') continue
+      for (const p of m.parts) {
+        if (p.type === 'tool') {
+          out.push({ key: p.id || p.callID || Math.random().toString(36).slice(2), part: p })
+        }
       }
     }
-  }
+    return out
+  }, [messages])
+
+  // 最新待办列表：倒序遍历消息，取最后一次 todowrite 的 input.todos（每次调用为全量列表，
+  // 最新 part 即当前完整状态）；AI 更新待办产生新 part → messages 变化 → 自动重算实时刷新
+  const latestTodos = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i]
+      if (m.role !== 'assistant') continue
+      for (let j = m.parts.length - 1; j >= 0; j--) {
+        const p = m.parts[j]
+        if (p.type === 'tool' && p.tool === 'todowrite' && Array.isArray(p.state?.input?.todos)) {
+          return p.state.input.todos
+        }
+      }
+    }
+    return null
+  }, [messages])
 
   // 渲染工作区文件树（懒加载：仅渲染已展开路径；隐藏大目录/无关文件）
   // 文件夹样式：类型图标 + 名称；文件点击添加/移除到对话；右键呼出菜单
@@ -1573,8 +1613,8 @@ export default function App() {
     })
   }
 
-  // 当前正在进行的步骤（用于面板顶部状态）
-  const currentStep = (() => {
+  // 当前正在进行的步骤（用于面板顶部状态）；useMemo 避免每次渲染都倒序遍历全部消息
+  const currentStep = useMemo(() => {
     if (!busy) return null
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i]
@@ -1588,7 +1628,7 @@ export default function App() {
       }
     }
     return { kind: 'working' }
-  })()
+  }, [messages, busy])
 
   // 可用模型列表（聊天框下拉）：全部来自自定义模型组
   const availableModels = (() => {
@@ -1651,7 +1691,7 @@ export default function App() {
       </header>
 
       <div className="body">
-        <aside className="sidebar" style={{ width: sidebarW }}>
+        <aside className="sidebar" style={{ width: dragType === 'left' ? dragW : sidebarW }}>
           <div
             className="resize-handle"
             title="拖动调整宽度"
@@ -1871,31 +1911,36 @@ export default function App() {
           </div>
         </aside>
 
-        <main className="main">
-          <div className="message-list" ref={listRef} onScroll={onListScroll}>
-            {!currentID && !busy && (
-              <div className="greeting">
-                <div className="greet-title">{greeting.title}</div>
-                <div className="greet-sub">{greeting.sub}</div>
-              </div>
-            )}
-            {messages.map((m, mi) => (
-              <MessageView
-                key={m.id}
-                m={m}
-                onCopy={copyText}
-                onUndo={openUndoConfirm}
-                canUndo={m.role === 'user' && hasToolChangeAfter(messages, mi)}
-                gitAvailable={gitState.available}
-                busy={busy}
-              />
-            ))}
-            {busy && (
-              <div className="busy-hint">
-                {stopping ? '正在停止…' : 'AI 正在执行中…'}
-                {currentStep?.kind === 'tool' && ` 正在${currentStep.tool}`}
-              </div>
-            )}
+        {/* padding-left 为左边栏预留空间（提交值 sidebarW，拖拽中不更新 → 拖拽期间聊天区不重排）；
+            padding-right 为任务面板预留空间：折叠时留窄条宽(40px)，展开时留面板宽(taskW)；
+            两者都瞬时一次布局（不做动画），配合面板/侧栏的覆盖式位移避免逐帧重排 */}
+        <main className="main" style={{ paddingRight: panelOpen ? taskW : 40, paddingLeft: sidebarW }}>
+          <div className="list-area">
+            <div className="message-list" ref={listRef} onScroll={onListScroll}>
+              {!currentID && !busy && (
+                <div className="greeting">
+                  <div className="greet-title">{greeting.title}</div>
+                  <div className="greet-sub">{greeting.sub}</div>
+                </div>
+              )}
+              {messages.map((m, mi) => (
+                <MessageView
+                  key={m.id}
+                  m={m}
+                  onCopy={copyText}
+                  onUndo={openUndoConfirm}
+                  canUndo={m.role === 'user' && hasToolChangeAfter(messages, mi)}
+                  gitAvailable={gitState.available}
+                  busy={busy}
+                />
+              ))}
+              {busy && (
+                <div className="busy-hint">
+                  {stopping ? '正在停止…' : 'AI 正在执行中…'}
+                  {currentStep?.kind === 'tool' && ` 正在${currentStep.tool}`}
+                </div>
+              )}
+            </div>
             {showNewHint && (
               <button className="new-hint" onClick={jumpToLatest} title="回到最新内容">
                 ↓ 新消息
@@ -1991,15 +2036,9 @@ export default function App() {
           )}
         </main>
 
-        {/* 任务面板：常驻容器，展开/收起用宽度过渡动画（窄条从右侧滑入滑出） */}
-        <aside
-          className={`task-side ${panelOpen ? '' : 'closed'}`}
-          style={
-            panelOpen
-              ? { width: taskW, gridTemplateColumns: `${taskW}px 0px` }
-              : undefined
-          }
-        >
+        {/* 任务面板：覆盖式抽屉（absolute + transform 位移，GPU 合成不触发整行重排）。
+            展开/收起只平移自身；主区空间由 .main 的 padding-right 瞬时预留（一次布局，不做动画） */}
+        <aside className={`task-side ${panelOpen ? 'open' : ''}`} style={{ width: dragType === 'task' ? dragW : taskW }}>
           <div
             className="resize-handle"
             title="拖动调整宽度"
@@ -2042,7 +2081,7 @@ export default function App() {
                   {/* 分页：倒序展示（最新在上、更早在下），只渲染最近 toolVisible 条；
                       隐藏的是最早的记录，底部按钮向下逐批加载更早的 */}
                   {toolSteps.slice(-toolVisible).reverse().map((s) => (
-                    <ToolCard key={s.key} step={s} />
+                    <ToolCard key={s.key} part={s.part} />
                   ))}
                   {toolSteps.length > toolVisible && (
                     <button className="load-more" onClick={() => setToolVisible((v) => v + TOOL_PAGE)}>
@@ -2052,12 +2091,37 @@ export default function App() {
                 </>
               )}
             </div>
-          </div>
-          <div className="task-strip" title="任务执行过程" onClick={() => setPanelOpen(true)}>
-            <span className={`ts-dot ${busy ? 'busy' : ''}`} />
-            <span className="ts-text">执行过程</span>
+            {/* 待办列表区（面板下 1/4）：展示最新一份 todowrite 待办，随 AI 更新实时刷新；无待办时隐藏 */}
+            {latestTodos && latestTodos.length > 0 && (
+              <div className="todo-panel">
+                <div className="todo-head">
+                  <span className="todo-head-title">待办列表</span>
+                  <span className="todo-count">
+                    {latestTodos.filter((x) => x.status === 'completed').length}/{latestTodos.length}
+                  </span>
+                </div>
+                <div className="todo-list">
+                  {latestTodos.map((x) => (
+                    <div
+                      key={x.id || x.content || x.title}
+                      className={`todo-item${x.status === 'completed' ? ' done' : x.status === 'in_progress' ? ' active' : ''}`}
+                    >
+                      <span className="todo-icon">
+                        {x.status === 'completed' ? '✓' : x.status === 'in_progress' ? '▶' : '○'}
+                      </span>
+                      <span className="todo-text">{x.content ?? x.title}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         </aside>
+        {/* 折叠后的窄条：常驻绝对定位在右侧（z-index 低于面板），展开时被面板覆盖 */}
+        <div className="task-strip" title="任务执行过程" onClick={() => setPanelOpen(true)}>
+          <span className={`ts-dot ${busy ? 'busy' : ''}`} />
+          <span className="ts-text">执行过程</span>
+        </div>
       </div>
 
       {/* 文件右键菜单：打开 / 打开所在文件夹 / 复制路径 */}
@@ -3203,13 +3267,14 @@ function ModelPicker({ models, value, onPick }) {
 }
 
 // 工具调用卡片（任务执行面板）
-function ToolCard({ step }) {
+// memo：part 为消息 part 引用（delta 只替换变化的 part），未变化的工具卡不重渲染
+const ToolCard = memo(function ToolCard({ part }) {
   const [open, setOpen] = useState(false)
-  const st = step.state?.status || 'pending'
-  const input = step.state?.input
-  const output = step.state?.output ?? step.state?.metadata?.output ?? ''
+  const st = part.state?.status || 'pending'
+  const input = part.state?.input
+  const output = part.state?.output ?? part.state?.metadata?.output ?? ''
   // 引擎为每个工具调用记录 state.time = { start, end }（epoch 毫秒）；进行中只有 start
-  const t = step.state?.time || {}
+  const t = part.state?.time || {}
   const clock = fmtClock(t.start)
   const dur = fmtDur(t.start, t.end)
   const fmt = (v) => {
@@ -3220,7 +3285,7 @@ function ToolCard({ step }) {
     <div className={`tool-card ${st}`}>
       <div className="tool-head" onClick={() => setOpen(!open)}>
         <span className={`tool-dot ${st}`} />
-        <span className="tool-name">{step.tool}</span>
+        <span className="tool-name">{part.tool}</span>
         {clock && (
           <span className="tool-time" title={`开始 ${clock}${dur ? ' · 耗时 ' + dur : ''}`}>
             {clock}
@@ -3250,7 +3315,7 @@ function ToolCard({ step }) {
       )}
     </div>
   )
-}
+})
 
 // AI 思考过程：可折叠区块，展开/收起带高度过渡动画（grid 0fr→1fr，纯 CSS 无需测量高度）
 // 流式进行中强制展开（与 <details open={streaming}> 行为一致），结束后按用户选择
@@ -3287,7 +3352,9 @@ function ReasoningBlock({ text, streaming }) {
   )
 }
 
-function MessageView({ m, onCopy, onUndo, canUndo, gitAvailable, busy }) {
+// memo：delta 流式只替换变化的 message 对象（未变消息引用稳定），
+// 配合 useCallback 的 onCopy/onUndo 与原始值 canUndo/busy，无关消息不再重渲染（含 marked 解析）
+const MessageView = memo(function MessageView({ m, onCopy, onUndo, canUndo, gitAvailable, busy }) {
   const mdText = m.parts.filter((p) => p.type === 'text').map((p) => p.text || '').join('\n')
   if (m.role === 'user') {
     // 压缩会话产生的 compaction 消息：本身无正文，仅标记"此前的历史已被压缩"，显示为提示条而非空气泡
@@ -3354,7 +3421,7 @@ function MessageView({ m, onCopy, onUndo, canUndo, gitAvailable, busy }) {
       )}
     </div>
   )
-}
+})
 
 // 文本块：曾流式输出的消息走打字机逐字揭示，历史消息直接渲染 Markdown
 function TextBlock({ text, streamed }) {

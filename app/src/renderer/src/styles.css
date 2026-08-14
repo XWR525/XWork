@@ -217,13 +217,11 @@ body {
   display: flex;
   flex: 1;
   min-height: 0;
+  position: relative; /* 任务面板 / 折叠窄条绝对定位的定位基准 */
+  overflow: hidden; /* 面板平移出视口时不产生横向溢出 */
 }
 
 /* ---------- 侧栏边缘拖拽调整大小 ---------- */
-.sidebar,
-.task-side {
-  position: relative;
-}
 .resize-handle {
   position: absolute;
   top: 0;
@@ -233,15 +231,12 @@ body {
   z-index: 30;
   transition: background 0.12s;
 }
-/* 左边栏手柄居中对齐于右缘分隔线；任务面板手柄在其左缘（收起态隐藏） */
+/* 左边栏手柄居中对齐于右缘分隔线；任务面板手柄在其左缘（收起时面板整体移出视口，手柄随之隐藏） */
 .sidebar > .resize-handle {
   right: -3px;
 }
 .task-side > .resize-handle {
   left: 0;
-}
-.task-side.closed > .resize-handle {
-  display: none;
 }
 .resize-handle:hover {
   background: var(--accent);
@@ -261,13 +256,25 @@ body.resizing-v {
   cursor: row-resize;
 }
 
+/* 左边栏：覆盖式（与任务面板对称）。absolute 贴左，聊天区空间由 .main padding-left 预留
+   （只看提交值，拖拽中不更新 → 拖拽期间聊天区不重排，松手后瞬时让位） */
 .sidebar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
   width: 240px;
   background: var(--panel);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  flex-shrink: 0;
+  z-index: 1; /* 覆盖在聊天区上（拖拽时盖住聊天区左缘，正文半透明提示见 body.resizing-left） */
+}
+/* 拖拽中半透明缓解：能隐约看到被覆盖的聊天区正文，松手后恢复不透明 */
+body.resizing-left .sidebar,
+body.resizing-task .task-side {
+  opacity: 0.9;
+  transition: opacity 0.15s;
 }
 
 .new-btn {
@@ -974,18 +981,25 @@ body.resizing-v {
   animation: fade-up 0.22s ease;
 }
 
+/* 对话区包裹层：position: relative 作为「↓ 新消息」悬浮按钮的定位基准（不滚动 → 按钮固定在右下角） */
+.list-area {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
 .message-list {
   flex: 1;
   overflow-y: auto;
   padding: 20px 24px;
-  position: relative;
 }
 
-/* 「↓ 新消息」悬浮提示：上滑停止跟随期间有新内容时出现，点击回到底部并恢复跟随 */
+/* 「↓ 新消息」悬浮提示：固定在对话区（list-area）右下角，不随消息列表滚动；
+   用户上滑后 AI 出现新气泡时出现，点击回到底部并恢复跟随 */
 .new-hint {
   position: absolute;
-  left: 50%;
-  transform: translateX(-50%);
+  right: 16px;
   bottom: 14px;
   padding: 6px 14px;
   font-size: 12px;
@@ -1466,52 +1480,52 @@ body.resizing-v {
 }
 
 /* ---------- 任务执行面板 ---------- */
-/* 常驻容器：展开(300px)↔收起(40px 窄条) 用宽度 + grid 列宽过渡，窄条从右侧滑入滑出 */
+/* 覆盖式抽屉：绝对定位贴右，折叠/展开只做 transform 平移（GPU 合成，不触发整行布局/文本重排）。
+   主区空间由 .main 的 padding-right 预留（瞬时一次布局，不做动画） */
 .task-side {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
   width: 300px;
-  overflow: hidden;
-  display: grid;
-  grid-template-columns: 300px 0px;
-  /* 行高受容器高度约束（flex 拉伸确定高），内容区（.task-body）才能正常滚动 */
-  grid-template-rows: minmax(0, 100%);
-  transition: width 0.25s ease, grid-template-columns 0.25s ease;
-  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
   background: var(--panel);
   border-left: 1px solid var(--border);
+  /* 折叠态整体平移到右侧视口外（translateX(100%) = 自身宽度，即 inline width），展开回到原位 */
+  transform: translateX(100%);
+  transition: transform 0.25s ease;
+  z-index: 2;
 }
 
-.task-side.closed {
-  width: 40px;
-  grid-template-columns: 0px 40px;
+.task-side.open {
+  transform: translateX(0);
 }
 
 .task-panel {
-  /* 宽度由 grid 轨道控制；收起时轨道 0px，内容盒为 0，文字会逐字换行，
-     滑动结束后整体隐藏面板内容，避免竖排文字从窄条后透出 */
-  min-width: 0;
   display: flex;
   flex-direction: column;
-  visibility: visible;
-  transition: visibility 0s;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
 }
 
-/* 可滚动内容区：标题行在它上方（滚动区之外），滚动只发生在这里 */
+/* 可滚动内容区（上 3/4）：标题行在它上方（滚动区之外），滚动只发生在这里；
+   下 1/4 为待办列表区（.todo-panel，仅存在待办时出现） */
 .task-body {
-  flex: 1;
+  flex: 3;
   min-height: 0;
   overflow-y: auto;
   padding: 0 12px 12px;
 }
 
-.task-side.closed .task-panel {
-  visibility: hidden;
-  transition: visibility 0s 0.25s;
-}
-
-/* 折叠后的窄条（常驻，收起时可见） */
+/* 折叠后的窄条：常驻绝对定位在右侧（z-index 低于面板，展开时被面板覆盖） */
 .task-strip {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
   width: 40px;
-  min-width: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1519,8 +1533,8 @@ body.resizing-v {
   padding: 16px 0;
   cursor: pointer;
   transition: background 0.15s;
-  /* 不透明背景：即使收起过程中面板内容残留，也被窄条遮住 */
   background: var(--panel);
+  z-index: 1;
 }
 
 .task-strip:hover {
@@ -1593,6 +1607,62 @@ body.resizing-v {
   color: var(--text-dim);
   margin-bottom: 0;
   flex-shrink: 0;
+}
+
+/* 待办列表区（任务面板下 1/4）：与上方工具步骤 flex:3 分栏，列表独立滚动，随 AI 更新实时刷新 */
+.todo-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  padding: 10px 12px 12px;
+  overflow: hidden;
+}
+.todo-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+  margin-bottom: 8px;
+}
+.todo-head-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.todo-count {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.todo-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.todo-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+.todo-icon {
+  flex-shrink: 0;
+  width: 16px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.todo-item.active .todo-icon {
+  color: var(--accent);
+}
+.todo-item.done {
+  color: var(--text-dim);
 }
 
 .current-step {
