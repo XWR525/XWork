@@ -16,6 +16,8 @@ const { Engine, findGit } = require('./engine')
 const { Bridge } = require('./bridge')
 const { Settings, applyToOpencode, MASK } = require('./settings')
 const { restoreMissingFiles, collectUndoImpact } = require('./undo')
+const { TaskStore, Scheduler, isValidCron, nextRunAfter, normalizeTask, describeCron } = require('./tasks')
+const { TaskRunner } = require('./task-runner')
 const logger = require('./logger')
 const JSZip = require('jszip')
 
@@ -101,6 +103,28 @@ const xdgHome =
 // 设置存储与 opencode 配置文件
 const settings = new Settings(path.join(xdgHome, 'xwork-settings.json'))
 const opencodeConfig = path.join(xdgHome, 'config', 'opencode', 'opencode.json')
+
+// 定时任务：任务存储 / 执行器 / 调度器
+// 调度器启动/停止随应用生命周期（仅应用运行时任务执行）；任务引擎惰性拉起，空闲 5 分钟回收
+const taskStore = new TaskStore(path.join(xdgHome, 'xwork-tasks.json'))
+const taskRunner = new TaskRunner({
+  store: taskStore,
+  notify,
+  settings,
+  effectiveConfig,
+  ensureGit: (dir, opts) => ensureWorkdirGit(dir, opts),
+  mainXdgHome: xdgHome
+})
+const taskScheduler = new Scheduler(taskStore, {
+  // 命中回调：任务执行（定时与立即执行共用 taskRunner）；finally 释放调度器运行锁（防重入）
+  onFire: async (task) => {
+    try {
+      return await taskRunner.runTask(task)
+    } finally {
+      taskScheduler.markDone(task.id)
+    }
+  }
+})
 
 // 工作区注册表：应用自维护所有发生过会话/切换的工作区
 // （opencode 的 /session 按当前项目过滤且作用域漂移，不可作为跨工作区数据源，注册表保证稳定）
@@ -238,6 +262,9 @@ app.whenReady().then(async () => {
       properties: { message: e.message }
     })
   }
+  // 定时任务：启动调度器（整分 tick）+ 触发应用启动时任务（任务引擎独立于主引擎，主引擎失败不影响调度）
+  taskScheduler.start()
+  taskScheduler.fireNow()
 })
 
 ipcMain.handle('engine:start', async () => {
@@ -403,6 +430,14 @@ ipcMain.handle('workspace:pick', async () => {
     properties: ['openDirectory']
   })
   return canceled || !filePaths.length ? null : filePaths[0]
+})
+
+// 登记工作区到注册表（任务工作区「选择新的工作区」使用）：幂等，仅登记不计数
+ipcMain.handle('workspace:register', async (_e, dir) => {
+  if (!dir || typeof dir !== 'string') return { ok: false, error: '无效的目录路径' }
+  if (!fs.existsSync(dir)) return { ok: false, error: '目录不存在' }
+  wsRecord(dir)
+  return { ok: true }
 })
 
 // 切换工作区：持久化路径 → 重启引擎（新 cwd）→ 返回新状态
@@ -932,4 +967,76 @@ app.on('before-quit', () => {
   isQuitting = true
   sseActive = false
   engine?.stop()
+  taskScheduler.stop()
+  taskRunner.dispose()
+})
+
+// ---------- 定时任务 IPC ----------
+// 校验并归一化任务定义：名称/工作区/执行内容/模型/频率合法性校验，计算下次执行时间
+function validateTask(raw) {
+  const norm = normalizeTask(raw)
+  if (!norm.name) throw new Error('请填写任务名称')
+  if (!norm.workspace) throw new Error('请选择任务工作区')
+  if (!norm.prompt) throw new Error('请填写执行内容（prompt）')
+  if (!norm.model || !norm.model.modelID) throw new Error('请选择模型')
+  if (!isValidCron(norm.schedule)) throw new Error('执行频率表达式不合法')
+  return norm
+}
+
+// 任务列表（附带展示字段：cron 人话描述、运行中标记、历史条数）
+// 注意：剥离 history 全量数组（列表 5 秒轮询不传全量历史，展开时按需 tasks:history 拉取）
+ipcMain.handle('tasks:list', () =>
+  taskStore.list().map((t) => {
+    const { history, ...rest } = t
+    return {
+      ...rest,
+      _historyCount: Array.isArray(history) ? history.length : 0,
+      _nextText: t.schedule === '@startup' ? '应用启动时' : describeCron(t.schedule),
+      // 运行中 = 调度器运行锁（定时触发）或执行器当前任务（立即执行），两者任一命中即锁卡片
+      _running: taskScheduler.isRunning(t.id) || taskRunner.isCurrent(t.id)
+    }
+  })
+)
+
+// 任务执行历史（倒序：最新在前；任务不存在返回空数组）
+ipcMain.handle('tasks:history', (_e, id) => {
+  const t = taskStore.get(id)
+  return t ? [...(t.history || [])].reverse() : []
+})
+
+// 创建任务
+ipcMain.handle('tasks:create', async (_e, raw) => {
+  const task = validateTask(raw)
+  task.nextRunAt = task.schedule === '@startup' ? -1 : nextRunAfter(task.schedule)
+  taskStore.upsert(task)
+  return task
+})
+
+// 更新任务（运行中禁止修改）
+ipcMain.handle('tasks:update', async (_e, id, patch) => {
+  const cur = taskStore.get(id)
+  if (!cur) throw new Error('任务不存在')
+  if (taskRunner.current && taskRunner.current.task.id === id) throw new Error('任务正在进行，无法修改')
+  const merged = validateTask({ ...cur, ...patch })
+  merged.createdAt = cur.createdAt
+  merged.nextRunAt = merged.schedule === '@startup' ? -1 : nextRunAfter(merged.schedule)
+  taskStore.upsert(merged)
+  return merged
+})
+
+// 删除任务（运行中禁止删除；同步清理固定会话）
+ipcMain.handle('tasks:remove', async (_e, id) => {
+  const cur = taskStore.get(id)
+  if (!cur) throw new Error('任务不存在')
+  if (taskRunner.current && taskRunner.current.task.id === id) throw new Error('任务正在进行，无法删除')
+  taskStore.remove(id)
+  await taskRunner.deleteTaskSession(cur)
+  return { ok: true }
+})
+
+// 立即执行：绕过调度器等待，强制入队（任务引擎串行，忙碌时返回 busy）
+ipcMain.handle('tasks:run-now', async (_e, id) => {
+  const cur = taskStore.get(id)
+  if (!cur) throw new Error('任务不存在')
+  return taskRunner.runNow(cur)
 })

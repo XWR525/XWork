@@ -16,7 +16,9 @@ export default defineConfig({
           settings: resolve(dir, 'src/main/settings.js'),
           logger: resolve(dir, 'src/main/logger.js'),
           config: resolve(dir, 'src/main/config.js'),
-          undo: resolve(dir, 'src/main/undo.js')
+          undo: resolve(dir, 'src/main/undo.js'),
+          tasks: resolve(dir, 'src/main/tasks.js'),
+          'task-runner': resolve(dir, 'src/main/task-runner.js')
         }
       }
     }

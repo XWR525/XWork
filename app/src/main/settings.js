@@ -208,7 +208,8 @@ class Settings {
 }
 
 // 将设置应用到 opencode.json（保留既有字段，按模型组写入/移除自定义 provider）
-function applyToOpencode(configFile, settings) {
+// opts.allPermissions=true：任务引擎配置（无人值守，全部操作类型 allow，不弹确认框；question 由事件流自动应答）
+function applyToOpencode(configFile, settings, opts = {}) {
   const s = settings.load()
   let cfg = { $schema: 'https://opencode.ai/config.json' }
   try {
@@ -244,12 +245,22 @@ function applyToOpencode(configFile, settings) {
       }
     }
   }
-  // 权限规则写入全局 permission：设置页 11 项 + 内部固定项 + doom_loop
-  // 新会话不再携带权限快照，引擎统一按此处全局规则判断；修改设置并重启引擎后即时生效
+  // 权限规则：任务引擎全 allow；普通引擎按设置档（11 项 + 内部固定项 + doom_loop）
   const permission = {}
-  for (const k of PERMISSION_KEYS) permission[k] = s.permission?.[k] || 'ask'
-  for (const k of INTERNAL_ALLOW_PERMS) permission[k] = 'allow'
-  permission.doom_loop = 'ask'
+  if (opts.allPermissions) {
+    // 覆盖 opencode 已知操作类型，全部放行（无人值守不弹确认框）
+    const ALL_KEYS = new Set([
+      ...PERMISSION_KEYS,
+      ...INTERNAL_ALLOW_PERMS,
+      'doom_loop', 'write', 'tool', 'agent', 'exact', 'ask',
+      'image', 'timeout', 'output', 'scope', 'permission', 'mcp', 'schema', 'env', 'notification', 'admin'
+    ])
+    for (const k of ALL_KEYS) permission[k] = 'allow'
+  } else {
+    for (const k of PERMISSION_KEYS) permission[k] = s.permission?.[k] || 'ask'
+    for (const k of INTERNAL_ALLOW_PERMS) permission[k] = 'allow'
+    permission.doom_loop = 'ask'
+  }
   cfg.permission = permission
   fs.mkdirSync(path.dirname(configFile), { recursive: true })
   fs.writeFileSync(configFile, JSON.stringify(cfg, null, 2))

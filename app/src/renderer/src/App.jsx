@@ -1,4 +1,5 @@
-import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { marked } from 'marked'
 marked.setOptions({ gfm: true, breaks: true })
 
@@ -138,6 +139,106 @@ function normalize(list) {
   }))
 }
 
+// ---- 流式增量纯函数（事件处理与会话级流式缓存共用，不依赖组件状态） ----
+
+// 文本增量追加（message.part.delta）：优先按 partID 归属 reasoning，其次 text
+function applyDelta(ms, p) {
+  const mid = p.messageID
+  const i = ms.findIndex((m) => m.id === mid)
+  if (i < 0) {
+    // 新消息按时间顺序追加到末尾（AI 回复应直接出现在对话列表底部）
+    return [...ms, { id: mid, role: 'assistant', streaming: true, streamed: true, parts: [{ type: 'text', text: p.delta || '' }] }]
+  }
+  const clone = ms.slice()
+  const m = clone[i]
+  // 已最终落定的消息不再追加 delta（避免 settle 后残留 delta 造成文本重复/不一致）
+  if (m.settled) return ms
+  const parts = m.parts.slice()
+  const ri = parts.findIndex((x) => x.id === p.partID && x.type === 'reasoning')
+  if (ri >= 0) {
+    parts[ri] = { ...parts[ri], text: (parts[ri].text || '') + (p.delta || '') }
+  } else {
+    const ti = parts.findIndex((x) => x.type === 'text')
+    if (ti >= 0) parts[ti] = { ...parts[ti], text: (parts[ti].text || '') + (p.delta || '') }
+    else parts.unshift({ type: 'text', text: p.delta || '' })
+  }
+  // 无条件进入流式：无论消息当前是否标记流式，delta 都必须累积显示
+  clone[i] = { ...m, parts, streaming: true, streamed: true }
+  return clone
+}
+
+// 消息部分完整更新（message.part.updated）：text/reasoning 完整替换、tool 状态更新
+function applyPartUpdated(ms, part, mid) {
+  if (part.type === 'text') {
+    const i = ms.findIndex((m) => m.id === mid)
+    if (i < 0) return ms
+    const clone = ms.slice()
+    const m = clone[i]
+    const parts = m.parts.slice()
+    const ti = parts.findIndex((x) => x.type === 'text')
+    if (ti >= 0) parts[ti] = { ...parts[ti], text: part.text }
+    else parts.unshift({ type: 'text', text: part.text })
+    clone[i] = { ...m, parts, streaming: true, streamed: true }
+    return clone
+  }
+  if (part.type === 'reasoning') {
+    const i = ms.findIndex((m) => m.id === mid)
+    if (i < 0) {
+      return [...ms, { id: mid, role: 'assistant', streaming: true, streamed: true, parts: [{ id: part.id, type: 'reasoning', text: part.text || '' }] }]
+    }
+    const clone = ms.slice()
+    const m = clone[i]
+    const parts = m.parts.slice()
+    const ri = parts.findIndex((x) => x.type === 'reasoning')
+    if (ri >= 0) parts[ri] = { ...parts[ri], id: part.id, text: part.text }
+    else parts.unshift({ id: part.id, type: 'reasoning', text: part.text || '' })
+    clone[i] = { ...m, parts, streaming: true, streamed: true }
+    return clone
+  }
+  if (part.type === 'tool') {
+    const i = ms.findIndex((m) => m.id === mid)
+    if (i < 0) {
+      // 消息尚未出现（无文本增量）→ 创建占位追加到末尾，保证实时状态可渲染
+      return [...ms, { id: mid, role: 'assistant', streamed: true, parts: [{ id: part.id, callID: part.callID, type: 'tool', tool: part.tool, state: part.state }] }]
+    }
+    const clone = ms.slice()
+    const m = clone[i]
+    const parts = m.parts.slice()
+    const ti = parts.findIndex((x) => x.type === 'tool' && (x.id === part.id || x.callID === part.callID))
+    if (ti >= 0) parts[ti] = { ...parts[ti], tool: part.tool, state: part.state }
+    else parts.push({ id: part.id, callID: part.callID, type: 'tool', tool: part.tool, state: part.state })
+    clone[i] = { ...m, parts, streamed: true }
+    return clone
+  }
+  return ms
+}
+
+// 同步 POST 最终结果落定（settle）：替换为已落定的消息
+function settleApply(ms, result) {
+  const aborted = !!(result.info?.error && /abort/i.test(result.info.error.name || ''))
+  const final = {
+    id: result.info.id,
+    role: 'assistant',
+    aborted,
+    error: extractError(result.info),
+    streamed: true,
+    settled: true,
+    parts: (result.parts || []).map((p) => ({
+      id: p.id,
+      callID: p.callID,
+      type: p.type,
+      text: p.text || '',
+      tool: p.tool,
+      state: p.state
+    }))
+  }
+  const idx = ms.findIndex((m) => m.id === result.info.id)
+  const clone = ms.slice()
+  if (idx >= 0) clone[idx] = final
+  else clone.push(final)
+  return clone
+}
+
 // 当前上下文 token 量：最近一条带有效统计的 assistant 消息的 info.tokens（引擎实际返回位置），
 // input + cache.read 即实际发送给模型的上下文量；回复失败/未完成时引擎写入全 0 统计，
 // 此时向上跳过、沿用上一条成功回复的统计；无任何有效统计（新会话/从未成功）返回 null
@@ -247,6 +348,7 @@ export default function App() {
   const [editingTitle, setEditingTitle] = useState('')
   const [settingsOpen, setSettingsOpen] = useState(false) // 设置面板
   const [skillHubOpen, setSkillHubOpen] = useState(false) // SKILL HUB 弹窗
+  const [page, setPage] = useState('chat') // 主视图：chat（对话）| tasks（定时任务管理页）
   const [skills, setSkills] = useState([]) // 技能列表（来自本地技能服务，按 sort_order 升序）
   const [skillLoading, setSkillLoading] = useState(false)
   const [skillError, setSkillError] = useState('')
@@ -295,6 +397,10 @@ export default function App() {
   const [showNewHint, setShowNewHint] = useState(false) // 上滑停止跟随期间有新内容时，显示「↓ 新消息」提示
   const currentRef = useRef(currentID)
   currentRef.current = currentID
+  const busySessionRef = useRef(null) // 引擎当前正在运行任务的会话 id（session.status 实时维护）：切回该会话时恢复 UI busy
+  // 会话级流式消息缓存 { [sessionID]: 渲染结构消息数组 }：事件流增量始终写入缓存（不因切走丢弃），
+  // 切回任务仍在跑的会话时用缓存恢复，避免引擎「流式中 GET 快照文本为空」导致正文截断
+  const streamCacheRef = useRef({})
   const workspaceRef = useRef(workspace) // 供事件处理器取最新工作区（闭包防过期）
   workspaceRef.current = workspace
   const expandedRef = useRef(expandedDirs) // 供事件处理器取最新展开目录
@@ -316,6 +422,8 @@ export default function App() {
     setCurrentID(sid)
     setBusy(false)
     setStopping(false)
+    // 引擎中该会话的任务仍在后台运行（如中途切走后任务未中止）→ 恢复执行中状态
+    if (busySessionRef.current === sid) setBusy(true)
     // 切换会话：重置对话区贴底状态并隐藏「↓ 新消息」气泡（避免上个会话的上滑残留）
     listStickRef.current = true
     setShowNewHint(false)
@@ -324,7 +432,23 @@ export default function App() {
     if (s?.model?.providerID) setModelSel({ providerID: s.model.providerID, modelID: s.model.id })
     try {
       const msgs = await api.messageList(sid)
-      setMessages(normalize(msgs))
+      const norm = normalize(msgs)
+      if (busySessionRef.current === sid && streamCacheRef.current[sid]) {
+        // 该会话任务仍在后台运行：用流式缓存恢复（含切走期间的增量），
+        // 避免引擎「流式中 GET 快照文本为空」导致正文截断；token 统计仍取 GET（info 字段不受流式影响）
+        // 恢复时刻已累积的文本视为已揭示（revealTo）：直接显示全文，后续增量从该位置继续打字机
+        const restored = streamCacheRef.current[sid].map((m) => {
+          if (!m.streaming && !m.streamed) return m
+          const md = (m.parts || []).filter((p) => p.type === 'text').map((p) => p.text || '').join('')
+          return md ? { ...m, revealTo: md.length } : m
+        })
+        streamCacheRef.current[sid] = restored // 同步缓存引用，保证后续增量基于同一份数组
+        setMessages(restored)
+      } else {
+        // 任务已结束（或缓存缺失）：以 GET 全量快照为准，并同步缓存基线
+        setMessages(norm)
+        streamCacheRef.current[sid] = norm
+      }
       setCtxTokens(ctxTokenCount(msgs)) // 刷新上下文 token 统计
       // 恢复该会话绑定的模式：优先会话字段，其次最后一条用户消息（opencode 在消息上记录 agent）
       let ag = s?.agent
@@ -414,8 +538,11 @@ export default function App() {
       setWorkspace(ws)
       setCurrentID(null)
       setMessages([])
+      setCtxTokens(null) // 切换工作区后无当前会话，清空 token 统计
       setBusy(false)
       setStopping(false)
+      busySessionRef.current = null // 引擎随工作区重启，任务必然中断，撤销后台恢复标记
+      streamCacheRef.current = {} // 引擎随工作区重启：所有会话流式缓存失效
       // 切换工作区同样重置对话区贴底状态与「↓ 新消息」气泡
       listStickRef.current = true
       setShowNewHint(false)
@@ -526,111 +653,67 @@ export default function App() {
           break
         case 'message.part.delta': {
           // 流式文本增量（{messageID, partID, field, delta}）
-          if (p.sessionID !== cur || p.field !== 'text') return
+          if (p.field !== 'text') return
           const mid = p.messageID
           if (!mid) return
-          setMessages((ms) => {
-            const i = ms.findIndex((m) => m.id === mid)
-            if (i < 0) {
-              // 新消息按时间顺序追加到末尾（AI 回复应直接出现在对话列表底部）
-              return [...ms, { id: mid, role: 'assistant', streaming: true, streamed: true, parts: [{ type: 'text', text: p.delta || '' }] }]
-            }
-            const clone = ms.slice()
-            const m = clone[i]
-            // 已最终落定的消息不再追加 delta（避免 settle 后残留 delta 造成文本重复/不一致）
-            if (m.settled) return ms
-            const parts = m.parts.slice()
-            // 增量优先按 partID 归属 reasoning part（思考文本也走 delta 流式），
-            // 使思考内容从首个字符起就在引用块内渲染，而不是先落入正文、结束后才归位
-            const ri = parts.findIndex((x) => x.id === p.partID && x.type === 'reasoning')
-            if (ri >= 0) {
-              parts[ri] = { ...parts[ri], text: (parts[ri].text || '') + (p.delta || '') }
-            } else {
-              const ti = parts.findIndex((x) => x.type === 'text')
-              if (ti >= 0) parts[ti] = { ...parts[ti], text: (parts[ti].text || '') + (p.delta || '') }
-              else parts.unshift({ type: 'text', text: p.delta || '' })
-            }
-            // 无条件进入流式：无论消息当前是否标记流式，delta 都必须累积显示
-            clone[i] = { ...m, parts, streaming: true, streamed: true }
-            return clone
-          })
+          // 增量先写入会话级缓存（切走期间不丢弃），当前会话再同步渲染
+          const sid = p.sessionID
+          const cached = streamCacheRef.current[sid]
+          if (cached) {
+            streamCacheRef.current[sid] = applyDelta(cached, p)
+            if (sid === cur) setMessages(streamCacheRef.current[sid])
+          } else if (sid === cur) {
+            setMessages((ms) => applyDelta(ms, p))
+          }
           break
         }
         case 'message.part.updated': {
-          if (p.sessionID !== cur) return
           const part = p.part
           // 注意：messageID 在 part 内部（如 part.messageID），顶层可能没有
           const mid = part?.messageID || p.messageID
           if (!mid || !part) break
-          if (part.type === 'text') {
-            // 更新文本内容并保持流式模式（引擎在 delta 流式中途也会推 updated，
-            // 若此时退出流式，后续 delta 会被丢弃导致文本「整段跳出」）
-            setMessages((ms) => {
-              const i = ms.findIndex((m) => m.id === mid)
-              if (i < 0) return ms
-              const clone = ms.slice()
-              const m = clone[i]
-              const parts = m.parts.slice()
-              const ti = parts.findIndex((x) => x.type === 'text')
-              if (ti >= 0) parts[ti] = { ...parts[ti], text: part.text }
-              else parts.unshift({ type: 'text', text: part.text })
-              clone[i] = { ...m, parts, streaming: true, streamed: true }
-              return clone
-            })
-          } else if (part.type === 'reasoning') {
-            // 思考过程更新（完整替换当前文本；reasoning 增量经 delta 事件按 partID 路由到此处，
-            // 因此必须保留 part.id，使引用块从流式起点就开始累积显示）
-            setMessages((ms) => {
-              const i = ms.findIndex((m) => m.id === mid)
-              if (i < 0) {
-                return [...ms, { id: mid, role: 'assistant', streaming: true, streamed: true, parts: [{ id: part.id, type: 'reasoning', text: part.text || '' }] }]
-              }
-              const clone = ms.slice()
-              const m = clone[i]
-              const parts = m.parts.slice()
-              const ri = parts.findIndex((x) => x.type === 'reasoning')
-              if (ri >= 0) parts[ri] = { ...parts[ri], id: part.id, text: part.text }
-              else parts.unshift({ id: part.id, type: 'reasoning', text: part.text || '' })
-              clone[i] = { ...m, parts, streaming: true, streamed: true }
-              return clone
-            })
-          } else if (part.type === 'tool') {
-            // 工具调用状态实时更新（pending → running → completed/error）
-            setMessages((ms) => {
-              const i = ms.findIndex((m) => m.id === mid)
-              if (i < 0) {
-                // 消息尚未出现（无文本增量）→ 创建占位追加到末尾，保证实时状态可渲染
-                return [...ms, { id: mid, role: 'assistant', streamed: true, parts: [{ id: part.id, callID: part.callID, type: 'tool', tool: part.tool, state: part.state }] }]
-              }
-              const clone = ms.slice()
-              const m = clone[i]
-              const parts = m.parts.slice()
-              const ti = parts.findIndex((x) => x.type === 'tool' && (x.id === part.id || x.callID === part.callID))
-              if (ti >= 0) parts[ti] = { ...parts[ti], tool: part.tool, state: part.state }
-              else parts.push({ id: part.id, callID: part.callID, type: 'tool', tool: part.tool, state: part.state })
-              clone[i] = { ...m, parts, streamed: true }
-              return clone
-            })
-            // 写入/编辑类工具执行完成 → 实时刷新左侧文件树（新文件立即可见）
-            if (part.state?.status === 'completed') refreshWsTree()
+          // 更新先写入会话级缓存（切走期间不丢弃），当前会话再同步渲染
+          const sid = p.sessionID
+          const isCur = sid === cur
+          const cached = streamCacheRef.current[sid]
+          if (cached) {
+            streamCacheRef.current[sid] = applyPartUpdated(cached, part, mid)
+            if (isCur) setMessages(streamCacheRef.current[sid])
+          } else if (isCur) {
+            setMessages((ms) => applyPartUpdated(ms, part, mid))
           }
+          // 写入/编辑类工具执行完成 → 实时刷新左侧文件树（新文件立即可见；仅当前会话）
+          if (isCur && part.state?.status === 'completed') refreshWsTree()
           break
         }
         case 'message.updated': {
           // 消息完成（含 finish）→ 仅最终完成（stop/error）时拉取权威数据；
           // tool-calls 是中间步骤，由事件流增量更新，避免频繁重置消息列表
-          if (p.sessionID !== cur) break
           const info = p.info
           if (info && info.finish) {
             const f = JSON.stringify(info.finish)
             if (!/tool-calls/.test(f)) {
-              loadSession(cur)
+              // 最终完成：流式缓存失效（不因是否当前会话过滤），后续以 GET 全量快照为准
+              delete streamCacheRef.current[p.sessionID]
+              busySessionRef.current = null // 最终消息已完成（stop/error），撤销后台恢复标记，避免 loadSession 误恢复 busy
+              if (p.sessionID === cur) loadSession(cur)
             }
           }
           break
         }
+        case 'session.status': {
+          // 引擎任务运行状态：全局维护（不随当前会话 cur 过滤），
+          // busy 会话 id 记入 ref，用户切回该会话时由 loadSession 恢复 UI busy
+          const running = p.sessionID && p.status?.type === 'busy'
+          if (running) busySessionRef.current = p.sessionID
+          else if (busySessionRef.current === p.sessionID) busySessionRef.current = null
+          break
+        }
         case 'session.idle': {
           // 任务真正结束（多 turn 任务以 idle 为准；POST 只返回首个 step）
+          // 清理不因是否当前会话过滤：切走期间任务结束也要使缓存/busy 恢复标记失效
+          delete streamCacheRef.current[p.sessionID]
+          if (busySessionRef.current === p.sessionID) busySessionRef.current = null
           if (p.sessionID !== cur) break
           setBusy(false)
           setStopping(false)
@@ -641,6 +724,9 @@ export default function App() {
         case 'session.error': {
           // 任务失败（如 API Key 无效）：把错误标记到当前会话最后一条 assistant 消息，
           // 避免失败回复渲染成「空气泡」；最终错误以 session.idle 后的权威重载为准
+          // 清理不因是否当前会话过滤：切走期间任务失败也要使缓存/busy 恢复标记失效
+          delete streamCacheRef.current[p.sessionID]
+          if (busySessionRef.current === p.sessionID) busySessionRef.current = null
           if (p.sessionID !== cur) break
           setCompacting(false) // 压缩失败也复位，避免按钮卡在「压缩中…」
           const em = extractError({ error: p.error })
@@ -688,6 +774,8 @@ export default function App() {
           // 引擎进程退出事件。可能是瞬态（如冷启动端口瞬占），延迟复查：
           // 复查仍健康则忽略并恢复状态；否则提示用户
           // 引擎进程退出后任何进行中的任务必然中断，立即复位 busy，避免 UI 卡在「执行中」
+          busySessionRef.current = null // 引擎退出，任务中断，撤销后台恢复标记
+          streamCacheRef.current = {} // 引擎退出：所有会话流式缓存失效
           setBusy(false)
           setStopping(false)
           setEngine((e) => ({ ...e, running: false }))
@@ -798,33 +886,16 @@ export default function App() {
     return () => clearTimeout(t)
   }, [toast, timings])
 
-  // 将同步 POST 的最终结果落定到消息列表
-  const settle = (result) => {
-    const aborted = !!(result.info?.error && /abort/i.test(result.info.error.name || ''))
-    setMessages((ms) => {
-      // 刚发送产生的消息必然走打字机；settled 标记用于拦截后续 delta 追加
-      const final = {
-        id: result.info.id,
-        role: 'assistant',
-        aborted,
-        error: extractError(result.info),
-        streamed: true,
-        settled: true,
-        parts: (result.parts || []).map((p) => ({
-          id: p.id,
-          callID: p.callID,
-          type: p.type,
-          text: p.text || '',
-          tool: p.tool,
-          state: p.state
-        }))
-      }
-      const idx = ms.findIndex((m) => m.id === result.info.id)
-      const clone = ms.slice()
-      if (idx >= 0) clone[idx] = final
-      else clone.push(final)
-      return clone
-    })
+  // 将同步 POST 的最终结果落定到消息列表（settleApply 纯函数）。
+  // 先更新会话级缓存；仅在仍是当前会话时 setMessages，避免 POST 返回时已切走却误写入当前列表
+  const settle = (result, sid) => {
+    const cached = streamCacheRef.current[sid]
+    if (cached) {
+      streamCacheRef.current[sid] = settleApply(cached, result)
+      if (sid === currentRef.current) setMessages(streamCacheRef.current[sid])
+    } else if (sid === currentRef.current) {
+      setMessages((ms) => settleApply(ms, result))
+    }
   }
 
   // 同步 POST 只等到「一个 step」完成（多 turn 工具任务会先返回快照）。
@@ -836,8 +907,11 @@ export default function App() {
         const msgs = await api.messageList(sid)
         const assistants = (msgs || []).filter((m) => m.info?.role === 'assistant')
         const last = assistants[assistants.length - 1]
-        const f = JSON.stringify(last?.info?.finish || '')
-        if (last?.info?.id === expectedId && !/tool-calls/.test(f)) {
+        const finish = last?.info?.finish
+        // 只有「finish 标记存在且不是 tool-calls」才算完成；
+        // finish 缺失 = 消息仍在流式输出中，绝不判完成（交由 session.idle 权威复位），
+        // 否则超长任务中 POST 早于任务结束返回时，会把「还在输出」误判为「已完成」导致 busy 提前消失
+        if (last?.info?.id === expectedId && finish && !/tool-calls/.test(JSON.stringify(finish))) {
           setBusy(false)
           setStopping(false)
         }
@@ -877,11 +951,15 @@ export default function App() {
         setCurrentID(sid)
         refreshSessions()
       }
-      setMessages((ms) => [...ms, { id: 'local-' + Date.now(), role: 'user', parts: [{ type: 'text', text: finalText }] }])
+      setMessages((ms) => {
+        const next = [...ms, { id: 'local-' + Date.now(), role: 'user', parts: [{ type: 'text', text: finalText }] }]
+        streamCacheRef.current[sid] = next // 流式缓存基线（含本次用户消息），后续增量在此累积
+        return next
+      })
       setBusy(true)
       // 同步等待首个 step 完成；期间实时过程（流式文本/工具/权限/后续 turn）由全局事件流推送
       const result = await api.messageSend(sid, finalText, modelSel, agent)
-      settle(result)
+      settle(result, sid)
       checkDone(sid, result.info.id)
     } catch (e) {
       // POST 失败 ≠ 任务失败：可能只是「等待快照」的通道断开/超时，引擎已受理消息、任务仍在推进。
@@ -904,6 +982,7 @@ export default function App() {
       } else {
         console.error('send failed', e)
         setEngineError('发送失败: ' + e.message)
+        delete streamCacheRef.current[sid] // 引擎未受理：流式缓存基线作废
         setBusy(false)
         setStopping(false)
       }
@@ -1380,6 +1459,7 @@ export default function App() {
   const newChat = async () => {
     setCurrentID(null)
     setMessages([])
+    setCtxTokens(null) // 新会话无上下文，清空上一会话残留的 token 统计
     setBusy(false)
     setStopping(false)
     // 新建会话：重置对话区贴底状态并隐藏「↓ 新消息」气泡
@@ -1669,11 +1749,14 @@ export default function App() {
           </div>
         )}
         <div className="tb-spacer" />
+        <button className="settings-btn" onClick={() => setPage(page === 'tasks' ? 'chat' : 'tasks')} title={page === 'tasks' ? '回到主页' : '定时任务（开发中）'}>
+          {page === 'tasks' ? '🔙 回到主页' : '⏰ 定时任务'}
+        </button>
         <button className="settings-btn" onClick={openSkillHub} title="技能中心（开发中）">
           🧩 Skill Hub
         </button>
         <button className="settings-btn" onClick={openSettings} title="模型与设置">
-          ⚙ 设置
+          ⚙️ 设置
         </button>
         <div className="win-controls">
           <button className="wc-btn" title="最小化" onClick={() => api.windowMinimize()}>
@@ -1691,6 +1774,8 @@ export default function App() {
       </header>
 
       <div className="body">
+        {page === 'chat' ? (
+        <>
         <aside className="sidebar" style={{ width: dragType === 'left' ? dragW : sidebarW }}>
           <div
             className="resize-handle"
@@ -2122,6 +2207,10 @@ export default function App() {
           <span className={`ts-dot ${busy ? 'busy' : ''}`} />
           <span className="ts-text">执行过程</span>
         </div>
+        </>
+        ) : (
+        <TasksPage notify={setToast} settingsData={settingsData} workspace={workspace} />
+        )}
       </div>
 
       {/* 文件右键菜单：打开 / 打开所在文件夹 / 复制路径 */}
@@ -2403,6 +2492,591 @@ export default function App() {
           onSaveConfig={saveAppConfig}
         />
       )}
+    </div>
+  )
+}
+
+// 创建向导表单默认值
+const EMPTY_TASK_DRAFT = {
+  name: '',
+  workspace: '',
+  prompt: '',
+  model: null,
+  agent: 'build', // 定时任务固定 build 模式
+  cron: '0 9 * * *',
+  timeout: 30,
+  retries: 2,
+  confirmed: false
+}
+
+// 定时任务管理页：任务列表卡片 + 创建/编辑向导 + cron 构造器
+const TASK_STATUS_TEXT = { completed: '已完成', failed: '执行失败', timeout: '执行超时' }
+// 执行耗时格式化：毫秒 → '45s' / '2m 30s'
+function fmtTaskDur(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return ''
+  const s = Math.round(ms / 1000)
+  if (s < 60) return s + 's'
+  return Math.floor(s / 60) + 'm ' + (s % 60) + 's'
+}
+function TasksPage({ notify, settingsData, workspace }) {
+  const [createOpen, setCreateOpen] = useState(false) // 创建/编辑向导弹窗
+  const [cronOpen, setCronOpen] = useState(false) // cron 构造器弹窗
+  const [draft, setDraft] = useState({ ...EMPTY_TASK_DRAFT }) // 向导表单草稿
+  const [editId, setEditId] = useState(null) // 编辑中的任务 id（null = 创建）
+  const [tasks, setTasks] = useState([]) // 任务列表
+  const [loading, setLoading] = useState(true)
+  const [workspaces, setWorkspaces] = useState([]) // 工作区列表（复用 workspace:list）
+  const [expandedId, setExpandedId] = useState(null) // 展开执行记录的任务 id（null = 全部收起）
+  const [histories, setHistories] = useState({}) // 历史数据：任务 id → 执行记录数组（每次展开/轮询拉最新，不做永久缓存）
+  const expandedRef = useRef(null) // 展开任务 id 的 ref 副本（轮询闭包读取最新值）
+  const promptRef = useRef(null) // prompt 输入框引用（拖拽调整高度用）
+  const dragRef = useRef(null) // 拖拽起始数据
+  // 拉取任务列表
+  const refreshTasks = useCallback(async () => {
+    try {
+      const list = await window.xwork.taskList()
+      setTasks(Array.isArray(list) ? list : [])
+    } catch {
+      /* 主进程不可用时保持现状 */
+    } finally {
+      setLoading(false)
+    }
+    // 执行记录展开期间同步刷新该任务历史：执行完成产生新记录后，展开列表自动追加（无需手动重新展开）
+    const exp = expandedRef.current
+    if (exp) {
+      try {
+        const h = await window.xwork.taskHistory(exp)
+        setHistories((m) => ({ ...m, [exp]: Array.isArray(h) ? h : [] }))
+      } catch {
+        /* 拉取失败保持现有数据 */
+      }
+    }
+  }, [])
+  // 进入页面拉取列表 + 每 5 秒轮询（任务状态/结果实时刷新）
+  useEffect(() => {
+    refreshTasks()
+    const timer = setInterval(refreshTasks, 5000)
+    return () => clearInterval(timer)
+  }, [refreshTasks])
+  // 展开任务 id 同步到 ref（供无依赖的 refreshTasks 闭包读取）
+  useEffect(() => {
+    expandedRef.current = expandedId
+  }, [expandedId])
+  // 拖拽手柄调整 prompt 输入区高度（手柄在模型栏右下角）
+  const startResize = (e) => {
+    e.preventDefault()
+    const ta = promptRef.current
+    if (!ta) return
+    dragRef.current = { startY: e.clientY, startH: ta.offsetHeight }
+    document.body.classList.add('resizing-task')
+    const onMove = (ev) => {
+      const d = dragRef.current
+      if (!d) return
+      const h = Math.max(60, Math.min(window.innerHeight * 0.6, d.startH + (ev.clientY - d.startY)))
+      ta.style.height = h + 'px'
+    }
+    const onUp = () => {
+      dragRef.current = null
+      document.body.classList.remove('resizing-task')
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+  const set = (patch) => setDraft((d) => ({ ...d, ...patch }))
+  // 打开创建向导：重置表单并拉取最新工作区列表；默认选中当前工作区（无匹配则第一个，都无则留空）
+  const openCreate = async () => {
+    setEditId(null)
+    setCreateOpen(true)
+    let list = []
+    try {
+      list = await window.xwork.workspaceList()
+    } catch {
+      list = []
+    }
+    const arr = Array.isArray(list) ? list : []
+    setWorkspaces(arr)
+    const defWs = arr.some((w) => w.dir === workspace) ? workspace : arr[0]?.dir || ''
+    setDraft({ ...EMPTY_TASK_DRAFT, workspace: defWs })
+  }
+  // 打开编辑向导：任务字段预填（timeoutMs → 分钟）
+  const openEdit = async (task) => {
+    setEditId(task.id)
+    setDraft({
+      name: task.name,
+      workspace: task.workspace,
+      prompt: task.prompt,
+      model: task.model,
+      agent: task.agent || 'build',
+      cron: task.schedule || '0 9 * * *',
+      timeout: Math.round((task.timeoutMs || 1800000) / 60000),
+      retries: task.retries ?? 2,
+      confirmed: true // 已存在的任务视为已确认
+    })
+    setCreateOpen(true)
+    try {
+      const list = await window.xwork.workspaceList()
+      setWorkspaces(Array.isArray(list) ? list : [])
+    } catch {
+      setWorkspaces([])
+    }
+  }
+  // 提交创建/编辑（先渲染层校验必填项，再调主进程）
+  const submitTask = async () => {
+    if (!draft.name.trim()) return notify('请填写任务名称')
+    if (!draft.workspace) return notify('请选择任务工作区')
+    if (!draft.prompt.trim()) return notify('请填写执行内容（prompt）')
+    if (!draft.model) return notify('请选择模型')
+    const payload = {
+      name: draft.name.trim(),
+      workspace: draft.workspace,
+      prompt: draft.prompt,
+      model: draft.model,
+      schedule: draft.cron,
+      timeoutMs: (Number(draft.timeout) || 30) * 60000,
+      retries: Number.isInteger(draft.retries) ? draft.retries : 2
+    }
+    try {
+      if (editId) {
+        await window.xwork.taskUpdate(editId, payload)
+        notify('任务已更新')
+      } else {
+        await window.xwork.taskCreate(payload)
+        notify('任务已创建')
+      }
+      setCreateOpen(false)
+      refreshTasks()
+    } catch (e) {
+      notify('保存失败：' + (e && e.message ? e.message : e))
+    }
+  }
+  // 启停切换
+  const toggleEnabled = async (task) => {
+    try {
+      await window.xwork.taskUpdate(task.id, { enabled: !task.enabled })
+      refreshTasks()
+    } catch (e) {
+      notify('操作失败：' + (e && e.message ? e.message : e))
+    }
+  }
+  // 立即执行：点击即本地锁定卡片（禁用编辑/删除/再次执行 + 显示「执行中」），不等 IPC 返回
+  // （tasks:run-now 主进程会阻塞到任务执行完成，期间 UI 反馈靠本地 _running + 5 秒轮询维持）
+  const runNow = async (task) => {
+    if (task._running) return // 防重复点击
+    setTasks((prev) => prev.map((x) => (x.id === task.id ? { ...x, _running: true } : x)))
+    try {
+      const r = await window.xwork.taskRunNow(task.id)
+      if (r && r.ok) notify('任务已开始执行')
+      else if (r && r.reason === 'busy') notify('已有任务在执行中，请稍候')
+      else notify('启动失败')
+    } catch (e) {
+      notify('启动失败：' + (e && e.message ? e.message : e))
+    } finally {
+      refreshTasks() // 执行结束刷新（_running 由主进程 isCurrent 判断恢复为 false）
+    }
+  }
+  // 删除任务
+  const deleteTask = async (task) => {
+    if (!window.confirm(`确认删除定时任务「${task.name}」？将同时清理其会话记录。`)) return
+    try {
+      await window.xwork.taskRemove(task.id)
+      notify('任务已删除')
+      refreshTasks()
+    } catch (e) {
+      notify('删除失败：' + (e && e.message ? e.message : e))
+    }
+  }
+  // 展开/收起执行记录：每次展开都拉取最新（不做永久缓存，避免与按钮计数不一致）
+  const toggleHistory = async (task) => {
+    if (expandedId === task.id) {
+      setExpandedId(null)
+      return
+    }
+    setExpandedId(task.id)
+    try {
+      const h = await window.xwork.taskHistory(task.id)
+      setHistories((m) => ({ ...m, [task.id]: Array.isArray(h) ? h : [] }))
+    } catch {
+      setHistories((m) => ({ ...m, [task.id]: [] }))
+    }
+  }
+  // 可用模型列表（聊天框同源计算）：模型组 → providerID/modelID
+  const models = []
+  for (const g of settingsData?.modelGroups || []) {
+    for (const m of g.models) models.push({ providerID: g.id, modelID: m, label: g.name + ' / ' + m })
+  }
+  // 工作区下拉：编辑时任务工作区若已不在列表，补一项避免值丢失
+  const wsOptions = workspaces.slice()
+  if (draft.workspace && !wsOptions.some((w) => w.dir === draft.workspace)) {
+    wsOptions.unshift({ dir: draft.workspace, name: draft.workspace })
+  }
+  return (
+    <div className="tasks-page">
+      <div className="tasks-head">
+        <div className="tasks-title">
+          <span className="tasks-title-main">⏰ 定时任务</span>
+          <span className="tasks-title-sub">在指定工作区按时间计划自动执行 Agent 任务，完成后系统通知反馈</span>
+        </div>
+        <div className="tb-spacer" />
+        <button className="tasks-create" onClick={openCreate}>
+          + 创建任务
+        </button>
+      </div>
+      <div className="tasks-body">
+        {loading ? (
+          <div className="tasks-loading">加载中…</div>
+        ) : tasks.length === 0 ? (
+          <div className="tasks-empty">
+            <div className="tasks-empty-icon">⏰</div>
+            <div className="tasks-empty-title">暂无定时任务</div>
+            <div className="tasks-empty-sub">
+              创建后可设定：任务工作区、执行内容（prompt）、模型、执行频率（每天 / 每周 / 每 N 小时 / 启动时）
+            </div>
+          </div>
+        ) : (
+          <div className="tasks-list">
+            {tasks.map((t) => (
+              <div key={t.id} className={'task-card' + (t._running ? ' running' : '')}>
+                <div className="task-card-head">
+                  <span className="task-card-name" title={t.prompt}>
+                    {t.name || '（未命名任务）'}
+                  </span>
+                  {t._running && <span className="task-card-badge running">⏳ 执行中…</span>}
+                  <div className="tb-spacer" />
+                  <label className="task-toggle" title={t.enabled ? '点击停用' : '点击启用'}>
+                    <input
+                      type="checkbox"
+                      checked={t.enabled}
+                      disabled={t._running}
+                      onChange={() => toggleEnabled(t)}
+                    />
+                    <span className="task-toggle-track" />
+                  </label>
+                </div>
+                <div className="task-card-meta">
+                  <span title={'cron: ' + t.schedule}>⏱ {t._nextText}</span>
+                  <span className="task-card-ws" title={t.workspace}>
+                    📁 {t.workspace}
+                  </span>
+                </div>
+                <div className="task-card-result">
+                  {t.lastResult ? (
+                    <>
+                      <span className={'task-status st-' + t.lastResult.status}>
+                        {TASK_STATUS_TEXT[t.lastResult.status] || t.lastResult.status}
+                      </span>
+                      <span className="task-summary" title={t.lastResult.summary}>
+                        {t.lastResult.summary}
+                      </span>
+                      <span className="task-dur">{fmtTaskDur(t.lastResult.durationMs)}</span>
+                    </>
+                  ) : (
+                    <span className="task-summary dim">尚未执行</span>
+                  )}
+                </div>
+                <div className="task-card-ops">
+                  <button disabled={t._running} onClick={() => runNow(t)}>
+                    ▶️ 立即执行
+                  </button>
+                  <button disabled={t._running} onClick={() => openEdit(t)}>
+                    ✏️ 编辑
+                  </button>
+                  <button disabled={t._running} onClick={() => deleteTask(t)}>
+                    🗑️ 删除
+                  </button>
+                  <button
+                    className={'task-history-toggle' + (expandedId === t.id ? ' open' : '')}
+                    onClick={() => toggleHistory(t)}
+                    title="展开/收起执行记录"
+                  >
+                    📜 执行记录{t._historyCount > 0 ? `（${t._historyCount}）` : ''}
+                  </button>
+                </div>
+                {expandedId === t.id && (
+                  <div className="task-history">
+                    {histories[t.id] && histories[t.id].length > 0 ? (
+                      <div className="task-history-list">
+                        {histories[t.id].map((h, i) => (
+                          <div key={h.runAt + '-' + i} className="task-history-item">
+                            <div className="task-history-line">
+                              <span className={'task-status st-' + h.status}>
+                                {TASK_STATUS_TEXT[h.status] || h.status}
+                              </span>
+                              <span className="task-history-time">{fmtDateTime(h.runAt)}</span>
+                              <span className="task-dur">{fmtTaskDur(h.durationMs)}</span>
+                              {h.autoAnswered && <span className="task-history-tag">已默认应答</span>}
+                              {h.attempts > 1 && (
+                                <span className="task-history-tag">重试 {h.attempts - 1} 次</span>
+                              )}
+                            </div>
+                            <div className="task-history-summary">{h.summary || '（无摘要）'}</div>
+                            {h.error && h.error !== h.summary && (
+                              <div className="task-history-error">{h.error}</div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="task-history-empty">暂无执行记录</div>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* 创建/编辑任务向导（点击遮罩不关闭，仅通过按钮关闭） */}
+      {createOpen && (
+        <div className="perm-mask">
+          <div className="perm-card task-create-card" onClick={(e) => e.stopPropagation()}>
+            <div className="perm-title">{editId ? '编辑定时任务' : '创建定时任务'}</div>
+            <div className="tc-body">
+              <div className="tc-group">
+                <div className="tc-label">任务名称</div>
+                <input
+                  className="set-input"
+                  placeholder="例如：每日变更摘要"
+                  value={draft.name}
+                  onChange={(e) => set({ name: e.target.value })}
+                />
+              </div>
+
+              <div className="tc-group">
+                <div className="tc-label">任务工作区</div>
+                <WorkspacePicker
+                  className="ws-picker"
+                  workspaces={wsOptions}
+                  value={draft.workspace}
+                  onPick={(dir) => set({ workspace: dir })}
+                  onAdd={async () => {
+                    try {
+                      const list = await window.xwork.workspaceList()
+                      setWorkspaces(Array.isArray(list) ? list : [])
+                    } catch {
+                      /* 列表刷新失败时静默，不影响已选中的新工作区 */
+                    }
+                  }}
+                />
+              </div>
+
+              <div className="tc-group">
+                <div className="tc-label">执行内容（prompt）</div>
+                <div className="tc-prompt-box">
+                  <textarea
+                    ref={promptRef}
+                    className="set-input tc-prompt"
+                    rows={4}
+                    placeholder="例如：读取 CHANGELOG.md 生成昨日变更摘要，输出到 daily.md"
+                    value={draft.prompt}
+                    onChange={(e) => set({ prompt: e.target.value })}
+                  />
+                  <div className="tc-prompt-bar">
+                    <ModelPicker
+                      models={models}
+                      value={draft.model}
+                      onPick={(key) => {
+                        const i = key.lastIndexOf('/')
+                        set({ model: { providerID: key.slice(0, i), modelID: key.slice(i + 1) } })
+                      }}
+                    />
+                  </div>
+                  <div className="tc-resize-bar" title="拖拽调整输入区高度" onMouseDown={startResize} />
+                </div>
+                <div className="tc-hint">
+                  支持占位符：{'{{date}}'}（今天）、{'{{date:-1d}}'}（昨天）、{'{{date:+7d}}'}（一周后）
+                </div>
+              </div>
+
+              <div className="tc-group">
+                <div className="tc-label">执行频率（cron）</div>
+                <div className="tc-row">
+                  <input
+                    className="set-input tc-cron"
+                    value={draft.cron}
+                    onChange={(e) => set({ cron: e.target.value })}
+                    placeholder="分 时 日 月 周，如 0 9 * * *"
+                  />
+                  <button type="button" className="tc-build" onClick={() => setCronOpen(true)}>
+                    🛠 构造
+                  </button>
+                </div>
+                <div className="tc-hint">示例：0 9 * * * 每天 09:00；0 */2 * * * 每 2 小时；0 9 * * 1-5 工作日 09:00</div>
+              </div>
+
+              <div className="tc-group">
+                <div className="tc-label">超时 / 重试</div>
+                <div className="tc-row">
+                  <label className="tc-inline">
+                    执行超时（分钟）
+                    <input
+                      type="number"
+                      min={1}
+                      value={draft.timeout}
+                      onChange={(e) => set({ timeout: Number(e.target.value) })}
+                    />
+                  </label>
+                  <label className="tc-inline">
+                    失败重试（次）
+                    <input
+                      type="number"
+                      min={0}
+                      value={draft.retries}
+                      onChange={(e) => set({ retries: Number(e.target.value) })}
+                    />
+                  </label>
+                </div>
+              </div>
+
+              <div className="tc-group tc-risk">
+                <label className="tc-risk-label">
+                  <input
+                    type="checkbox"
+                    checked={draft.confirmed}
+                    onChange={(e) => set({ confirmed: e.target.checked })}
+                  />
+                  <span>
+                    我已了解：任务将无人值守自动执行（权限为允许档），AI 可能修改工作区文件；最小化到托盘时任务仍照常执行
+                  </span>
+                </label>
+              </div>
+            </div>
+            <div className="perm-btns">
+              <button onClick={() => setCreateOpen(false)}>取消</button>
+              <button className="primary" disabled={!draft.confirmed} onClick={submitTask}>
+                {editId ? '保存修改' : '创建任务'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* cron 构造器（简化版） */}
+      {cronOpen && (
+        <CronBuilder
+          initial={draft.cron}
+          onApply={(c) => {
+            set({ cron: c })
+            setCronOpen(false)
+          }}
+          onClose={() => setCronOpen(false)}
+        />
+      )}
+    </div>
+  )
+}
+
+// cron 字段定义：分/时/日 构造器支持 列表 + 步长；月/周 暂保持 每/单值（待定）
+const CRON_FIELDS = [
+  { key: 'min', label: '分钟', max: 59, list: true },
+  { key: 'hour', label: '小时', max: 23, list: true },
+  { key: 'day', label: '日', max: 31, list: true },
+  { key: 'month', label: '月', max: 12, list: false },
+  { key: 'week', label: '周', max: 6, list: false }
+]
+
+// 把 cron 字符串解析为字段表：每（* / */N） 或 具体值（单值 / 逗号列表）
+function parseCronToFields(cron) {
+  const parts = (cron || '0 9 * * *').trim().split(/\s+/)
+  const out = {}
+  CRON_FIELDS.forEach((f, i) => {
+    const v = parts[i]
+    const step = v && /^\*\/(\d+)$/.exec(v)
+    out[f.key] = step
+      ? { mode: 'every', step: Math.min(Math.max(Number(step[1]), 1), f.max) }
+      : v === undefined || v === '*'
+        ? { mode: 'every', step: 1 }
+        : { mode: 'list', values: v }
+  })
+  return out
+}
+
+// 由字段表生成 cron 字符串
+function buildCronFromFields(f) {
+  return CRON_FIELDS.map((x) => {
+    const v = f[x.key]
+    return v.mode === 'every' ? (v.step > 1 ? `*/${v.step}` : '*') : (v.values.trim() || '*')
+  }).join(' ')
+}
+
+// cron 构造器弹窗：分/时/日 可设「每 N 个」步长（*/N）或逗号列表（0,15,30）；月/周 暂为 每/单值（待定）；点击遮罩不关闭，仅通过按钮关闭
+function CronBuilder({ initial, onApply, onClose }) {
+  const [fields, setFields] = useState(() => parseCronToFields(initial))
+  const setF = (key, val) => setFields((d) => ({ ...d, [key]: val }))
+  const cron = buildCronFromFields(fields)
+  return (
+    <div className="perm-mask">
+      <div className="perm-card cron-builder-card" onClick={(e) => e.stopPropagation()}>
+        <div className="perm-title">🛠 cron 构造器</div>
+        <div className="cb-fields">
+          {CRON_FIELDS.map((f) => {
+            const v = fields[f.key]
+            const every = v.mode === 'every'
+            return (
+              <div className="cb-row" key={f.key}>
+                <span className="cb-label">{f.label}</span>
+                <label className="cb-mode">
+                  <input
+                    type="checkbox"
+                    checked={every}
+                    onChange={(e) => setF(f.key, e.target.checked ? { mode: 'every', step: 1 } : { mode: 'list', values: f.list ? '' : '0' })}
+                  />
+                  每
+                </label>
+                {every ? (
+                  f.list ? (
+                    <>
+                      <input
+                        type="number"
+                        min={1}
+                        max={f.max}
+                        value={v.step}
+                        onChange={(e) => setF(f.key, { mode: 'every', step: Math.max(1, Math.min(Math.round(Number(e.target.value) || 1), f.max)) })}
+                      />
+                      <span className="cb-range">间隔 N 个{f.label}（1 = 每{f.label}）</span>
+                    </>
+                  ) : (
+                    <span className="cb-range">每{f.label}</span>
+                  )
+                ) : f.list ? (
+                  <>
+                    <input
+                      className="cb-values"
+                      type="text"
+                      placeholder="如 0,15,30,45"
+                      value={v.values}
+                      onChange={(e) => setF(f.key, { mode: 'list', values: e.target.value })}
+                    />
+                    <span className="cb-range">0-{f.max}，逗号分隔</span>
+                  </>
+                ) : (
+                  <>
+                    <input
+                      type="number"
+                      min={0}
+                      max={f.max}
+                      value={Number(v.values) || 0}
+                      onChange={(e) => setF(f.key, { mode: 'list', values: String(Math.max(0, Math.min(Math.round(Number(e.target.value) || 0), f.max))) })}
+                    />
+                    <span className="cb-range">0-{f.max}</span>
+                  </>
+                )}
+              </div>
+            )
+          })}
+        </div>
+        <div className="cb-preview">
+          表达式：<code>{cron}</code>
+        </div>
+        <div className="perm-btns">
+          <button onClick={onClose}>取消</button>
+          <button className="primary" onClick={() => onApply(cron)}>
+            应用
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
@@ -3215,6 +3889,7 @@ function AgentPicker({ value, onPick }) {
 function ModelPicker({ models, value, onPick }) {
   const [open, setOpen] = useState(false)
   const ref = useRef(null)
+  const [pos, setPos] = useState(null) // 菜单 fixed 定位（相对按钮）
   // 点击外部 / 失焦时关闭
   useEffect(() => {
     if (!open) return
@@ -3226,6 +3901,26 @@ function ModelPicker({ models, value, onPick }) {
     return () => {
       window.removeEventListener('click', close)
       window.removeEventListener('blur', close)
+    }
+  }, [open])
+  // 菜单经 portal 渲染到 body（弹窗容器裁剪不到），按按钮位置固定定位、向上弹出
+  useLayoutEffect(() => {
+    if (!open) return
+    const update = () => {
+      const btn = ref.current?.querySelector('.model-pick-btn')
+      if (!btn) return
+      const r = btn.getBoundingClientRect()
+      setPos({
+        right: Math.max(8, window.innerWidth - r.right),
+        bottom: Math.max(8, window.innerHeight - r.top + 8)
+      })
+    }
+    update()
+    window.addEventListener('resize', update)
+    window.addEventListener('scroll', update, true)
+    return () => {
+      window.removeEventListener('resize', update)
+      window.removeEventListener('scroll', update, true)
     }
   }, [open])
   const current =
@@ -3240,28 +3935,139 @@ function ModelPicker({ models, value, onPick }) {
         <span className="mp-label">{current ? current.label : '选择模型'}</span>
         <span className="mp-arrow">{open ? '▴' : '▾'}</span>
       </button>
-      {open && (
-        <div className="model-pop">
-          {models.length === 0 ? (
-            <div className="model-pop-empty">暂无可选模型</div>
-          ) : (
-            models.map((m) => (
-              <button
-                key={m.providerID + '/' + m.modelID}
-                className={`model-opt ${
-                  current && current.providerID === m.providerID && current.modelID === m.modelID ? 'active' : ''
-                }`}
-                onClick={() => {
-                  onPick(m.providerID + '/' + m.modelID)
-                  setOpen(false)
-                }}
-              >
-                {m.label}
-              </button>
-            ))
-          )}
-        </div>
-      )}
+      {open &&
+        pos &&
+        createPortal(
+          <div className="model-pop" style={{ position: 'fixed', right: pos.right, bottom: pos.bottom }}>
+            {models.length === 0 ? (
+              <div className="model-pop-empty">暂无可选模型</div>
+            ) : (
+              models.map((m) => (
+                <button
+                  key={m.providerID + '/' + m.modelID}
+                  className={`model-opt ${
+                    current && current.providerID === m.providerID && current.modelID === m.modelID ? 'active' : ''
+                  }`}
+                  onClick={() => {
+                    onPick(m.providerID + '/' + m.modelID)
+                    setOpen(false)
+                  }}
+                >
+                  {m.label}
+                </button>
+              ))
+            )}
+          </div>,
+          document.body
+        )}
+    </div>
+  )
+}
+
+// 工作区选择下拉：交互/动画与「选择模型」一致（自定义菜单 + portal + 弹出动画）
+// 差异：支持自定义宽度（className），菜单向右下弹出（左对齐于按钮、位于按钮下方、宽度跟随按钮）
+function WorkspacePicker({ workspaces, value, onPick, onAdd, className }) {
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const ref = useRef(null)
+  const [pos, setPos] = useState(null)
+  // 点击外部 / 失焦时关闭
+  useEffect(() => {
+    if (!open) return
+    const close = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false)
+    }
+    window.addEventListener('click', close)
+    window.addEventListener('blur', close)
+    return () => {
+      window.removeEventListener('click', close)
+      window.removeEventListener('blur', close)
+    }
+  }, [open])
+  // 菜单经 portal 渲染到 body，fixed 定位：左对齐按钮、按钮下方弹出（空间不足时翻转到上方），宽度跟随按钮
+  useLayoutEffect(() => {
+    if (!open) return
+    const update = () => {
+      const btn = ref.current?.querySelector('.model-pick-btn')
+      if (!btn) return
+      const r = btn.getBoundingClientRect()
+      const menuH = 260
+      const top = r.bottom + 4 + menuH > window.innerHeight - 8 ? Math.max(8, r.top - menuH - 4) : r.bottom + 4
+      setPos({
+        left: Math.max(8, r.left),
+        top,
+        width: Math.max(r.width, 220)
+      })
+    }
+    update()
+    window.addEventListener('resize', update)
+    window.addEventListener('scroll', update, true)
+    return () => {
+      window.removeEventListener('resize', update)
+      window.removeEventListener('scroll', update, true)
+    }
+  }, [open])
+  const current = workspaces.find((w) => w.dir === value)
+  // 顶部固定「选择新的工作区」：系统文件夹选择 → 登记注册表 → 通知父组件刷新列表并选中
+  const pickNewWorkspace = async () => {
+    if (busy) return
+    setBusy(true)
+    try {
+      const dir = await window.xwork.workspacePick()
+      if (!dir) return
+      const res = await window.xwork.workspaceRegister(dir)
+      if (res?.ok === false) {
+        console.warn('[ws] register failed:', res?.error)
+        return
+      }
+      onAdd?.(dir)
+      onPick(dir)
+    } catch (e) {
+      console.warn('[ws] pick new workspace failed:', e.message)
+    } finally {
+      setBusy(false)
+      setOpen(false)
+    }
+  }
+  return (
+    <div className={'model-picker ' + (className || '')} ref={ref}>
+      <button className="model-pick-btn" onClick={() => setOpen(!open)} title="任务执行的工作区">
+        <span className="mp-label">{current ? current.name + '（' + current.dir + '）' : '选择工作区'}</span>
+        <span className="mp-arrow">{open ? '▴' : '▾'}</span>
+      </button>
+      {open &&
+        pos &&
+        createPortal(
+          <div
+            className="model-pop"
+            style={{ position: 'fixed', left: pos.left, top: pos.top, width: pos.width, bottom: 'auto', right: 'auto' }}
+          >
+            <button
+              className="model-opt model-opt-new"
+              onClick={pickNewWorkspace}
+              title="打开文件夹选择界面，选择一个全新的文件夹作为任务工作区"
+            >
+              <span className="mp-new-icon">＋</span>选择新的工作区
+            </button>
+            {workspaces.length === 0 ? (
+              <div className="model-pop-empty">暂无可用工作区</div>
+            ) : (
+              workspaces.map((w) => (
+                <button
+                  key={w.dir}
+                  className={`model-opt ${current && current.dir === w.dir ? 'active' : ''}`}
+                  onClick={() => {
+                    onPick(w.dir)
+                    setOpen(false)
+                  }}
+                >
+                  {w.name}（{w.dir}）
+                </button>
+              ))
+            )}
+          </div>,
+          document.body
+        )}
     </div>
   )
 }
@@ -3409,7 +4215,7 @@ const MessageView = memo(function MessageView({ m, onCopy, onUndo, canUndo, gitA
           }
           return null
         })}
-        {mdText.trim() && <TextBlock key="text" text={mdText} streamed={m.streamed} />}
+        {mdText.trim() && <TextBlock key="text" text={mdText} streamed={m.streamed} revealTo={m.revealTo} />}
       </div>
       {mdText.trim() && !m.streaming && !m.aborted && (
         <button className="copy-btn" title="复制" onClick={() => onCopy(mdText)}>
@@ -3424,20 +4230,22 @@ const MessageView = memo(function MessageView({ m, onCopy, onUndo, canUndo, gitA
 })
 
 // 文本块：曾流式输出的消息走打字机逐字揭示，历史消息直接渲染 Markdown
-function TextBlock({ text, streamed }) {
+// revealTo：恢复会话时已累积文本的长度（视为已揭示），后续增量从该位置继续打字机
+function TextBlock({ text, streamed, revealTo }) {
   if (!streamed) {
     return <div className="md-body" dangerouslySetInnerHTML={{ __html: marked.parse(text) }} />
   }
-  return <TypewriterText text={text} />
+  return <TypewriterText text={text} startFrom={revealTo} />
 }
 
 // 打字机组件：每 25ms 揭示 2 个字符，把引擎的整块 delta 平滑为逐字输出。
 // 用 ref 记录已揭示长度，文本增长时持续追赶而不重置；揭示完成后渲染 Markdown。
-function TypewriterText({ text }) {
+// startFrom：初始已揭示长度（0 = 从空开始；恢复会话传已累积文本长度避免重新打印）
+function TypewriterText({ text, startFrom }) {
   const textRef = useRef(text)
   textRef.current = text
-  const shownRef = useRef(0)
-  const [shown, setShown] = useState(0)
+  const shownRef = useRef(startFrom ?? 0)
+  const [shown, setShown] = useState(startFrom ?? 0)
   useEffect(() => {
     const timer = setInterval(() => {
       if (shownRef.current < textRef.current.length) {
