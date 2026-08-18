@@ -59,6 +59,11 @@ class TaskRun {
     }
     if (this.runner.current === this) this.runner.current = null
     this.runner.scheduleRecycle()
+    // 即用即弃：每次执行独立会话，结束后立即删除（防固定会话上下文累积导致模型复述指令而不执行）
+    const sid = this.session && this.session.id
+    if (sid && this.runner.taskBridge) {
+      this.runner.taskBridge.deleteSession(sid).catch(() => {})
+    }
     if (this.waitResolve) this.waitResolve(this.result)
   }
 }
@@ -78,6 +83,7 @@ class TaskRunner {
     this.engineWorkspace = null // 任务引擎当前工作区（进程级 cwd，不同工作区必须重启）
     this.watchPromise = null // 任务引擎全局事件流
     this.current = null // 当前执行中的 TaskRun（全局串行，同一时间仅一个任务）
+    this.queue = [] // 等待队列 [{ task, resolve }]：执行器忙时的新触发（定时命中/手动立即执行）排队等待，当前任务完成后自动执行
     this.recycleTimer = null // 空闲回收定时器（5 分钟无任务即停引擎）
   }
 
@@ -206,7 +212,7 @@ class TaskRunner {
     run.finish('failed', String(err).slice(0, 300))
   }
 
-  // 取会话最新 assistant 文本作为结果摘要（截断到 200 字）
+  // 取会话最新 assistant 文本作为结果摘要（无长度上限，全文入库；界面按需截断展示）
   async summaryOf(run) {
     try {
       const msgs = await this.taskBridge.getMessages(run.session.id)
@@ -217,7 +223,7 @@ class TaskRunner {
             .map((p) => p.text || '')
             .join('')
             .trim()
-          if (text) return text.slice(0, 200)
+          if (text) return text
         }
       }
     } catch {
@@ -259,65 +265,41 @@ class TaskRunner {
 
   // ---- 会话管理 ----
 
-  // 固定会话：会话 id 持久化在任务.sessionID（引擎分配），跨次执行累积上下文；
-  // 会话被删后重建并更新映射
+  // 每次执行新建独立会话（即用即弃）：固定会话复用会在多次执行后累积上下文，
+  // 模型收到重复指令时倾向复述目标而不执行（实测踩坑）；现改为每次执行新建会话、结束后立即删除。
+  // 如需「跨次执行记忆」的任务，可改为按任务复用（持久化 sessionID）并配套执行前 compact。
   async ensureSession(task) {
-    // 已映射且仍存在 → 复用
-    if (task.sessionID) {
-      try {
-        const sessions = await this.taskBridge.listSessions()
-        const list = Array.isArray(sessions) ? sessions : sessions.sessions || []
-        const found = list.some((s) => s.id === task.sessionID)
-        if (found) return { id: task.sessionID }
-      } catch {
-        /* 列表查询失败则尝试重建 */
-      }
-    }
-    // 不存在 → 创建并以任务名作为标题
     const created = await this.taskBridge.createSession('task-' + task.id, null)
-    const sid = created.id
-    task.sessionID = sid
-    const saved = this.store.get(task.id)
-    if (saved) this.store.upsert({ ...saved, sessionID: sid })
-    return { id: sid }
-  }
-
-  // 上下文收敛：消息量超阈值自动 compact（保留近期内容、历史总结为摘要）
-  async maybeCompact(sid) {
-    try {
-      const msgs = await this.taskBridge.getMessages(sid)
-      const textCount = msgs.length
-      if (textCount < 40) return
-      console.log('[task-engine] compact session', sid, 'messages=', textCount)
-      await this.taskBridge.compactSession(sid, this.current?.task.model)
-      await sleep(3000) // compact 异步执行，等待事件流推进
-    } catch {
-      /* compact 失败不阻断执行（上下文继续累积） */
-    }
+    return { id: created.id }
   }
 
   // ---- 执行流水线 ----
 
-  // 执行任务（调度器 onFire 回调）：串行、带重试、结果持久化 + 通知
-  // 历史只记录最终结果一次（含实际尝试次数），中间失败重试不单独落历史
-  async runTask(task, { force = false } = {}) {
-    if (this.current) return { ok: false, reason: 'busy' }
+  // 执行任务（调度器 onFire 回调）：全局串行，执行器忙时入队等待（当前任务完成后自动执行）；
+  // 带重试、结果持久化 + 通知；历史只记录最终结果一次（含实际尝试次数），中间失败重试不单独落历史
+  async runTask(task) {
+    if (this.current) return this.enqueue(task) // 有任务执行中：排队等待，完成信号在 drainQueue 中发出
     let result = null
     let attempts = 1 // 实际尝试次数（首次 + 最终结果确定前失败的重试）
     const maxAttempts = Math.max(0, task.retries || 0) + 1 // 首次 + 重试次数
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      if (attempt > 1) {
-        console.log('[task-run] retry', task.id, 'attempt', attempt)
-        await sleep(attempt * 5000) // 退避重试
+    try {
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        if (attempt > 1) {
+          console.log('[task-run] retry', task.id, 'attempt', attempt)
+          await sleep(attempt * 5000) // 退避重试
+        }
+        result = await this.executeOnce(task)
+        attempts = attempt
+        if (result.status !== 'failed') break
       }
-      result = await this.executeOnce(task)
-      attempts = attempt
-      if (result.status !== 'failed') break
+      this.persistResult(task, result, { attempts })
+      this.notifyResult(task, result)
+      this.onStatusChange?.(task.id, result)
+      return { ok: result.status === 'completed', result }
+    } finally {
+      // 本任务结束（current 已清空）→ 处理等待队列：让排队的触发逐个自动执行
+      await this.drainQueue()
     }
-    this.persistResult(task, result, { attempts })
-    this.notifyResult(task, result)
-    this.onStatusChange?.(task.id, result)
-    return { ok: result.status === 'completed', result }
   }
 
   // 单次执行：发送消息 + 等待事件完成；按任务超时 abort
@@ -329,14 +311,19 @@ class TaskRunner {
       this.abort(run)
       run.finish('timeout', '执行超时（' + Math.round(task.timeoutMs / 60000) + ' 分钟）')
     }, task.timeoutMs)
+    // 事件完成/超时信号：在发起任何长耗时操作前注册，保证 finish() 总能唤醒等待
+    // （否则超时在 ensureEngine/ensureSession 期间触发时，finish 已执行而 waitResolve 尚为 null，
+    //   sendMessage 后的 Promise 将无 resolve 来源而永久挂起，任务与调度器运行锁一起卡死）
+    const done = new Promise((resolve) => { run.waitResolve = resolve })
     try {
       await this.ensureEngine(task.workspace)
+      if (run.finished) return run.result // 超时已在引擎拉起期间触发，不再发送消息
       run.session = await this.ensureSession(task)
-      await this.maybeCompact(run.session.id)
+      if (run.finished) return run.result
       const prompt = renderPlaceholders(task.prompt)
       await this.taskBridge.sendMessage(run.session.id, prompt, task.model, task.agent)
       // 发送成功，等待事件流判定完成/失败/超时
-      return await new Promise((resolve) => { run.waitResolve = resolve })
+      return await done
     } catch (e) {
       if (!run.finished) {
         run.finish('failed', (e && e.message) || String(e))
@@ -345,10 +332,41 @@ class TaskRunner {
     }
   }
 
-  // 立即执行某任务（UI「立即执行」按钮）：绕过调度器 wait，强制入队
+  // 立即执行某任务（UI「立即执行」按钮）：与定时触发共用串行队列——执行器忙时同样排队等待
   async runNow(task) {
-    if (this.current) return { ok: false, reason: 'busy' }
-    return this.runTask(task, { force: true })
+    return this.runTask(task)
+  }
+
+  // 入队等待：返回一个「任务真正执行完成后才 resolve」的 Promise（结果结构与直接执行一致）；
+  // 同一任务已在队列中则拒绝重复排队（调度器 running 锁已兜底，此处防御直接调用）
+  enqueue(task) {
+    if (this.queue.some((q) => q.task.id === task.id)) {
+      return { ok: false, reason: 'busy' }
+    }
+    return new Promise((resolve) => {
+      this.queue.push({ task, resolve })
+    })
+  }
+
+  // 排空等待队列：逐个执行排队任务（FIFO）。执行前以存储最新状态为准：
+  // 排队期间被删除/禁用的任务丢弃本次排队（resolve discarded，调度器不更新其状态）。
+  // 执行结果 resolve 给入队的调用方（tick onFire / tasks:run-now），使其感知「真正执行」的结果。
+  async drainQueue() {
+    while (this.queue.length && !this.current) {
+      const item = this.queue.shift()
+      const fresh = this.store.get(item.task.id)
+      if (!fresh || !fresh.enabled) {
+        item.resolve({ ok: false, reason: 'discarded' })
+        continue
+      }
+      let res
+      try {
+        res = await this.runTask(fresh) // current 已清空 → 直接执行（不会重新入队）
+      } catch (e) {
+        res = { ok: false, result: { status: 'failed', summary: (e && e.message) || String(e), durationMs: 0, endedAt: Date.now() } }
+      }
+      item.resolve(res)
+    }
   }
 
   // 判断某任务是否正在执行（定时与立即执行共用 current 锁；渲染层 _running 依据）
@@ -382,7 +400,7 @@ class TaskRunner {
     this.store.upsert(t)
   }
 
-  // 系统通知（仅窗口不在前台时由 index.js 的 notify 决策，这里直接调用）
+  // 系统通知（任务通知开关 + 仅窗口不在前台时弹，由 index.js 注入的 notify 函数决策，这里直接调用）
   notifyResult(task, result) {
     const ok = result.status === 'completed'
     const prefix = ok ? '✅' : result.status === 'timeout' ? '⏱' : '❌'

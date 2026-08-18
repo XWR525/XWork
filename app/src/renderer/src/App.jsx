@@ -398,6 +398,7 @@ export default function App() {
   const currentRef = useRef(currentID)
   currentRef.current = currentID
   const busySessionRef = useRef(null) // 引擎当前正在运行任务的会话 id（session.status 实时维护）：切回该会话时恢复 UI busy
+  const compactingSidRef = useRef(null) // 正在压缩的会话 id：其 idle/error 事件到达时复位 compacting（压缩中切走也会复位，避免永久卡死）
   // 会话级流式消息缓存 { [sessionID]: 渲染结构消息数组 }：事件流增量始终写入缓存（不因切走丢弃），
   // 切回任务仍在跑的会话时用缓存恢复，避免引擎「流式中 GET 快照文本为空」导致正文截断
   const streamCacheRef = useRef({})
@@ -714,10 +715,15 @@ export default function App() {
           // 清理不因是否当前会话过滤：切走期间任务结束也要使缓存/busy 恢复标记失效
           delete streamCacheRef.current[p.sessionID]
           if (busySessionRef.current === p.sessionID) busySessionRef.current = null
+          // 压缩会话完成：先于会话匹配复位 compacting——压缩中切换到其他会话时，
+          // 压缩会话的 idle 会因 p.sessionID !== cur 被 break 拦截，若此处不复位会永久卡死
+          if (compactingSidRef.current === p.sessionID) {
+            compactingSidRef.current = null
+            setCompacting(false)
+          }
           if (p.sessionID !== cur) break
           setBusy(false)
           setStopping(false)
-          setCompacting(false) // 压缩会话完成
           loadSession(cur)
           break
         }
@@ -727,8 +733,12 @@ export default function App() {
           // 清理不因是否当前会话过滤：切走期间任务失败也要使缓存/busy 恢复标记失效
           delete streamCacheRef.current[p.sessionID]
           if (busySessionRef.current === p.sessionID) busySessionRef.current = null
+          // 压缩失败也复位（同 idle：不因会话过滤），避免按钮卡在「压缩中…」
+          if (compactingSidRef.current === p.sessionID) {
+            compactingSidRef.current = null
+            setCompacting(false)
+          }
           if (p.sessionID !== cur) break
-          setCompacting(false) // 压缩失败也复位，避免按钮卡在「压缩中…」
           const em = extractError({ error: p.error })
           if (!em) break
           setMessages((ms) => {
@@ -932,12 +942,13 @@ export default function App() {
         '\n\n【工作区文件】已引用以下文件（@ 引用），请读取其内容并基于此处理：\n' +
         addedFiles.map((p) => '@' + p).join('\n')
     }
-    setInput('')
-    // 模型必须显式选择（模型组下拉）；无有效模型时不发送
+    // 模型必须显式选择（模型组下拉）；无有效模型时不发送。
+    // 注意：先校验再清空，避免「未配置模型」时已输入的文本被清空丢失
     if (!modelValid) {
       setToast('请先在设置中配置模型组并选择模型')
       return
     }
+    setInput('')
     let sid = currentID
     // 记录发送前最后一条 assistant 消息时间：POST 失败时据此判断引擎是否已受理本次消息（任务是否在推进）
     const assts = messages.filter((m) => m.role === 'assistant')
@@ -1265,12 +1276,14 @@ export default function App() {
       danger: true,
       onConfirm: async () => {
         setCompacting(true)
+        compactingSidRef.current = currentID // 记录压缩会话：其 idle/error 事件到达时复位（压缩中切走也会复位）
         try {
           const r = await api.compactSession(currentID, modelSel)
           if (!r.ok) throw new Error(r.error || '压缩失败')
           setToast('压缩中，完成后自动刷新…')
         } catch (e) {
           setToast('压缩失败: ' + e.message)
+          compactingSidRef.current = null
           setCompacting(false)
         }
       }
@@ -2209,7 +2222,7 @@ export default function App() {
         </div>
         </>
         ) : (
-        <TasksPage notify={setToast} settingsData={settingsData} workspace={workspace} />
+        <TasksPage notify={setToast} setConfirm={setConfirm} settingsData={settingsData} workspace={workspace} />
         )}
       </div>
 
@@ -2518,7 +2531,7 @@ function fmtTaskDur(ms) {
   if (s < 60) return s + 's'
   return Math.floor(s / 60) + 'm ' + (s % 60) + 's'
 }
-function TasksPage({ notify, settingsData, workspace }) {
+function TasksPage({ notify, setConfirm, settingsData, workspace }) {
   const [createOpen, setCreateOpen] = useState(false) // 创建/编辑向导弹窗
   const [cronOpen, setCronOpen] = useState(false) // cron 构造器弹窗
   const [draft, setDraft] = useState({ ...EMPTY_TASK_DRAFT }) // 向导表单草稿
@@ -2528,6 +2541,7 @@ function TasksPage({ notify, settingsData, workspace }) {
   const [workspaces, setWorkspaces] = useState([]) // 工作区列表（复用 workspace:list）
   const [expandedId, setExpandedId] = useState(null) // 展开执行记录的任务 id（null = 全部收起）
   const [histories, setHistories] = useState({}) // 历史数据：任务 id → 执行记录数组（每次展开/轮询拉最新，不做永久缓存）
+  const [historyDetail, setHistoryDetail] = useState(null) // 执行记录详情弹窗 {task, item}（null = 关闭）
   const expandedRef = useRef(null) // 展开任务 id 的 ref 副本（轮询闭包读取最新值）
   const promptRef = useRef(null) // prompt 输入框引用（拖拽调整高度用）
   const dragRef = useRef(null) // 拖拽起始数据
@@ -2661,31 +2675,40 @@ function TasksPage({ notify, settingsData, workspace }) {
     }
   }
   // 立即执行：点击即本地锁定卡片（禁用编辑/删除/再次执行 + 显示「执行中」），不等 IPC 返回
-  // （tasks:run-now 主进程会阻塞到任务执行完成，期间 UI 反馈靠本地 _running + 5 秒轮询维持）
+  // （tasks:run-now 主进程会阻塞到任务执行完成，返回的 ok 表示「执行成功完成」而非「已开始」，
+  //   失败/超时在 r.result 中；执行期间 UI 反馈靠本地 _running + 5 秒轮询维持）
   const runNow = async (task) => {
     if (task._running) return // 防重复点击
     setTasks((prev) => prev.map((x) => (x.id === task.id ? { ...x, _running: true } : x)))
     try {
       const r = await window.xwork.taskRunNow(task.id)
-      if (r && r.ok) notify('任务已开始执行')
+      if (r && r.ok) notify('任务执行完成')
       else if (r && r.reason === 'busy') notify('已有任务在执行中，请稍候')
-      else notify('启动失败')
+      else if (r && r.result && r.result.status) notify(`任务${TASK_STATUS_TEXT[r.result.status] || r.result.status}`)
+      else notify('任务启动失败')
     } catch (e) {
       notify('启动失败：' + (e && e.message ? e.message : e))
     } finally {
       refreshTasks() // 执行结束刷新（_running 由主进程 isCurrent 判断恢复为 false）
     }
   }
-  // 删除任务
-  const deleteTask = async (task) => {
-    if (!window.confirm(`确认删除定时任务「${task.name}」？将同时清理其会话记录。`)) return
-    try {
-      await window.xwork.taskRemove(task.id)
-      notify('任务已删除')
-      refreshTasks()
-    } catch (e) {
-      notify('删除失败：' + (e && e.message ? e.message : e))
-    }
+  // 删除任务（复用全局确认框，风格与删除工作区一致）
+  const deleteTask = (task) => {
+    setConfirm({
+      title: '删除任务',
+      message: `确定删除定时任务「${task.name}」？将同时清理其会话记录，此操作不可恢复。`,
+      danger: true,
+      confirmLabel: '删除',
+      onConfirm: async () => {
+        try {
+          await window.xwork.taskRemove(task.id)
+          notify('任务已删除')
+          refreshTasks()
+        } catch (e) {
+          notify('删除失败：' + (e && e.message ? e.message : e))
+        }
+      }
+    })
   }
   // 展开/收起执行记录：每次展开都拉取最新（不做永久缓存，避免与按钮计数不一致）
   const toggleHistory = async (task) => {
@@ -2717,10 +2740,10 @@ function TasksPage({ notify, settingsData, workspace }) {
         <div className="tasks-title">
           <span className="tasks-title-main">⏰ 定时任务</span>
           <span className="tasks-title-sub">在指定工作区按时间计划自动执行 Agent 任务，完成后系统通知反馈</span>
+          <span className="tasks-title-sub">请勿关闭电脑或退出客户端，否则任务将无法正常执行</span>
         </div>
-        <div className="tb-spacer" />
         <button className="tasks-create" onClick={openCreate}>
-          + 创建任务
+          🎯 创建任务
         </button>
       </div>
       <div className="tasks-body">
@@ -2731,7 +2754,7 @@ function TasksPage({ notify, settingsData, workspace }) {
             <div className="tasks-empty-icon">⏰</div>
             <div className="tasks-empty-title">暂无定时任务</div>
             <div className="tasks-empty-sub">
-              创建后可设定：任务工作区、执行内容（prompt）、模型、执行频率（每天 / 每周 / 每 N 小时 / 启动时）
+              创建后可设定：任务工作区、执行内容（prompt）、模型、执行频率（每天 / 每周 / 每 N 小时）
             </div>
           </div>
         ) : (
@@ -2767,7 +2790,10 @@ function TasksPage({ notify, settingsData, workspace }) {
                         {TASK_STATUS_TEXT[t.lastResult.status] || t.lastResult.status}
                       </span>
                       <span className="task-summary" title={t.lastResult.summary}>
-                        {t.lastResult.summary}
+                        {t.lastResult.summary
+                          ? t.lastResult.summary.slice(0, 100) +
+                            (t.lastResult.summary.length > 100 ? '…' : '')
+                          : ''}
                       </span>
                       <span className="task-dur">{fmtTaskDur(t.lastResult.durationMs)}</span>
                     </>
@@ -2810,7 +2836,24 @@ function TasksPage({ notify, settingsData, workspace }) {
                                 <span className="task-history-tag">重试 {h.attempts - 1} 次</span>
                               )}
                             </div>
-                            <div className="task-history-summary">{h.summary || '（无摘要）'}</div>
+                            <div className="task-history-summary-row">
+                              <div
+                                className="md-body task-history-summary"
+                                dangerouslySetInnerHTML={{
+                                  __html: marked.parse(
+                                    h.summary
+                                      ? h.summary.slice(0, 100) + (h.summary.length > 100 ? '…' : '')
+                                      : '（无摘要）'
+                                  )
+                                }}
+                              />
+                              <button
+                                className="task-history-detail"
+                                onClick={() => setHistoryDetail({ task: t, item: h })}
+                              >
+                                详情
+                              </button>
+                            </div>
                             {h.error && h.error !== h.summary && (
                               <div className="task-history-error">{h.error}</div>
                             )}
@@ -2827,6 +2870,44 @@ function TasksPage({ notify, settingsData, workspace }) {
           </div>
         )}
       </div>
+
+      {/* 执行记录详情弹窗（展示 summary 全文，Markdown 渲染） */}
+      {historyDetail && (
+        <div className="perm-mask z-top">
+          <div className="history-detail-card">
+            <div className="history-detail-head">
+              <div className="history-detail-title">执行详情</div>
+              <button className="history-detail-close" onClick={() => setHistoryDetail(null)}>
+                ✕
+              </button>
+            </div>
+            <div className="history-detail-sub">
+              {historyDetail.task.name} · {fmtDateTime(historyDetail.item.runAt)}
+            </div>
+            <div className="history-detail-meta">
+              <span className={'task-status st-' + historyDetail.item.status}>
+                {TASK_STATUS_TEXT[historyDetail.item.status] || historyDetail.item.status}
+              </span>
+              <span className="task-dur">{fmtTaskDur(historyDetail.item.durationMs)}</span>
+              {historyDetail.item.autoAnswered && (
+                <span className="task-history-tag">已默认应答</span>
+              )}
+              {historyDetail.item.attempts > 1 && (
+                <span className="task-history-tag">重试 {historyDetail.item.attempts - 1} 次</span>
+              )}
+            </div>
+            <div
+              className="history-detail-body md-body"
+              dangerouslySetInnerHTML={{
+                __html: marked.parse(historyDetail.item.summary || '（无摘要）')
+              }}
+            />
+            {historyDetail.item.error && (
+              <div className="history-detail-error">{historyDetail.item.error}</div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* 创建/编辑任务向导（点击遮罩不关闭，仅通过按钮关闭） */}
       {createOpen && (
@@ -2893,17 +2974,23 @@ function TasksPage({ notify, settingsData, workspace }) {
               <div className="tc-group">
                 <div className="tc-label">执行频率（cron）</div>
                 <div className="tc-row">
-                  <input
-                    className="set-input tc-cron"
-                    value={draft.cron}
-                    onChange={(e) => set({ cron: e.target.value })}
-                    placeholder="分 时 日 月 周，如 0 9 * * *"
-                  />
+                  {/* 构造按钮置行首（始终可点，经构造器修改）；cron 以构造器同款圆角分框展示，不提供直接改文本 */}
                   <button type="button" className="tc-build" onClick={() => setCronOpen(true)}>
                     🛠 构造
                   </button>
+                  <span className="cb-parts tc-cron">
+                    {(() => {
+                      const parts = draft.cron.trim() ? draft.cron.trim().split(/\s+/) : []
+                      // 标准 5 字段逐个分框；非标准（如 @startup）整体一个框；空值显示占位
+                      const show = parts.length === 5 ? parts : [draft.cron.trim() || '未设置']
+                      return show.map((p, i) => (
+                        <span className="cb-part" key={i}>
+                          {p}
+                        </span>
+                      ))
+                    })()}
+                  </span>
                 </div>
-                <div className="tc-hint">示例：0 9 * * * 每天 09:00；0 */2 * * * 每 2 小时；0 9 * * 1-5 工作日 09:00</div>
               </div>
 
               <div className="tc-group">
@@ -2968,26 +3055,45 @@ function TasksPage({ notify, settingsData, workspace }) {
   )
 }
 
-// cron 字段定义：分/时/日 构造器支持 列表 + 步长；月/周 暂保持 每/单值（待定）
+// cron 字段定义：分/时/日 为「每分钟/每隔N/指定」三选一单选；月/周 为勾选框（全选=每月/每周，部分=指定）
+const MONTH_OPTS = Array.from({ length: 12 }, (_, i) => ({ value: i + 1, label: `${i + 1}月` }))
+// 周勾选框：周一起首、周日末尾（cron 值仍 0=周日，仅展示顺序调整）
+const WEEK_OPTS = [
+  { value: 1, label: '一', title: '周一' },
+  { value: 2, label: '二', title: '周二' },
+  { value: 3, label: '三', title: '周三' },
+  { value: 4, label: '四', title: '周四' },
+  { value: 5, label: '五', title: '周五' },
+  { value: 6, label: '六', title: '周六' },
+  { value: 0, label: '日', title: '周日' }
+]
 const CRON_FIELDS = [
-  { key: 'min', label: '分钟', max: 59, list: true },
-  { key: 'hour', label: '小时', max: 23, list: true },
-  { key: 'day', label: '日', max: 31, list: true },
-  { key: 'month', label: '月', max: 12, list: false },
-  { key: 'week', label: '周', max: 6, list: false }
+  { key: 'min', label: '分钟', min: 0, max: 59, list: true },
+  { key: 'hour', label: '小时', min: 0, max: 23, list: true },
+  { key: 'day', label: '日', min: 1, max: 31, list: true },
+  { key: 'month', label: '月', min: 1, max: 12, checks: true, opts: MONTH_OPTS },
+  { key: 'week', label: '周', min: 0, max: 6, checks: true, opts: WEEK_OPTS }
 ]
 
-// 把 cron 字符串解析为字段表：每（* / */N） 或 具体值（单值 / 逗号列表）
+// 把 cron 字符串解析为字段表：all（*）/ step（*/N）/ list（逗号列表）；月/周 仅 all/list（勾选框）
 function parseCronToFields(cron) {
   const parts = (cron || '0 9 * * *').trim().split(/\s+/)
   const out = {}
   CRON_FIELDS.forEach((f, i) => {
     const v = parts[i]
     const step = v && /^\*\/(\d+)$/.exec(v)
+    if (f.checks) {
+      // 月/周：* 或 */N 展开（兼容已有 */N 手工输入）→ 全选为 all，否则为 list
+      const vals = step ? (() => { const arr = []; for (let x = f.min; x <= f.max; x += Number(step[1])) arr.push(x); return arr })()
+        : v === undefined || v === '*' ? f.opts.map((o) => o.value) : null
+      if (vals) out[f.key] = vals.length === f.opts.length ? { mode: 'all' } : { mode: 'list', values: vals.join(',') }
+      else out[f.key] = { mode: 'list', values: v }
+      return
+    }
     out[f.key] = step
-      ? { mode: 'every', step: Math.min(Math.max(Number(step[1]), 1), f.max) }
+      ? { mode: 'step', step: Math.min(Math.max(Number(step[1]), 1), f.max) }
       : v === undefined || v === '*'
-        ? { mode: 'every', step: 1 }
+        ? { mode: 'all' }
         : { mode: 'list', values: v }
   })
   return out
@@ -2997,15 +3103,64 @@ function parseCronToFields(cron) {
 function buildCronFromFields(f) {
   return CRON_FIELDS.map((x) => {
     const v = f[x.key]
-    return v.mode === 'every' ? (v.step > 1 ? `*/${v.step}` : '*') : (v.values.trim() || '*')
+    if (v.mode === 'all') return '*'
+    if (v.mode === 'step') return v.step > 1 ? `*/${v.step}` : '*'
+    return v.values.trim() || '*'
   }).join(' ')
 }
 
-// cron 构造器弹窗：分/时/日 可设「每 N 个」步长（*/N）或逗号列表（0,15,30）；月/周 暂为 每/单值（待定）；点击遮罩不关闭，仅通过按钮关闭
+// 时间点格式化（构造器预览）：今天/明天 HH:mm，其余 M月D日 HH:mm
+function formatRunTime(ts) {
+  const d = new Date(ts)
+  const now = new Date()
+  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  if (d.toDateString() === now.toDateString()) return `今天 ${hm}`
+  const tomorrow = new Date(now)
+  tomorrow.setDate(tomorrow.getDate() + 1)
+  if (d.toDateString() === tomorrow.toDateString()) return `明天 ${hm}`
+  return `${d.getMonth() + 1}月${d.getDate()}日 ${hm}`
+}
+
+// cron 构造器弹窗：分/时/日 为「每分钟/每隔N/指定」单选（必选其一），指定后接逗号列表输入框；月/周 为勾选框（全选=每月/每周，部分=指定）；点击遮罩不关闭，仅通过按钮关闭
 function CronBuilder({ initial, onApply, onClose }) {
   const [fields, setFields] = useState(() => parseCronToFields(initial))
-  const setF = (key, val) => setFields((d) => ({ ...d, [key]: val }))
-  const cron = buildCronFromFields(fields)
+  // @startup 等特殊计划无法用 5 字段构造器表达：未改动字段时原样保留，
+  // 一旦用户修改任一字段即切换为普通构造模式（以默认每天 9:00 为起点），避免拼出非法表达式
+  const [rawOverride, setRawOverride] = useState(initial === '@startup' ? '@startup' : null)
+  const setF = (key, val) =>
+    setFields((d) => {
+      const base = rawOverride ? parseCronToFields('0 9 * * *') : d
+      setRawOverride(null)
+      return { ...base, [key]: val }
+    })
+  const cron = rawOverride ?? buildCronFromFields(fields)
+  const [runs, setRuns] = useState([])
+  // cron 变化后（防抖）计算接下来 5 次运行时间点（底部预览）
+  useEffect(() => {
+    let alive = true
+    const timer = setTimeout(async () => {
+      try {
+        const r = await window.xwork.taskNextRuns(cron, 5)
+        if (alive) setRuns(Array.isArray(r) ? r : [])
+      } catch {
+        if (alive) setRuns([])
+      }
+    }, 200)
+    return () => {
+      alive = false
+      clearTimeout(timer)
+    }
+  }, [cron])
+  // 月/周 勾选框切换：全选 → all（每月/每周），部分/0 个 → list（逗号列表）
+  const toggleCheck = (key, val, checked) => {
+    const v = fields[key]
+    const f = CRON_FIELDS.find((x) => x.key === key)
+    const cur = new Set(v.mode === 'all' ? f.opts.map((x) => x.value) : (v.values ? v.values.split(',').map(Number) : []))
+    if (checked) cur.add(val)
+    else cur.delete(val)
+    const sorted = [...cur].sort((a, b) => a - b)
+    setF(key, sorted.length === f.opts.length ? { mode: 'all' } : { mode: 'list', values: sorted.join(',') })
+  }
   return (
     <div className="perm-mask">
       <div className="perm-card cron-builder-card" onClick={(e) => e.stopPropagation()}>
@@ -3013,62 +3168,90 @@ function CronBuilder({ initial, onApply, onClose }) {
         <div className="cb-fields">
           {CRON_FIELDS.map((f) => {
             const v = fields[f.key]
-            const every = v.mode === 'every'
-            return (
+            return f.list ? (
               <div className="cb-row" key={f.key}>
                 <span className="cb-label">{f.label}</span>
-                <label className="cb-mode">
-                  <input
-                    type="checkbox"
-                    checked={every}
-                    onChange={(e) => setF(f.key, e.target.checked ? { mode: 'every', step: 1 } : { mode: 'list', values: f.list ? '' : '0' })}
-                  />
-                  每
-                </label>
-                {every ? (
-                  f.list ? (
-                    <>
-                      <input
-                        type="number"
-                        min={1}
-                        max={f.max}
-                        value={v.step}
-                        onChange={(e) => setF(f.key, { mode: 'every', step: Math.max(1, Math.min(Math.round(Number(e.target.value) || 1), f.max)) })}
-                      />
-                      <span className="cb-range">间隔 N 个{f.label}（1 = 每{f.label}）</span>
-                    </>
-                  ) : (
-                    <span className="cb-range">每{f.label}</span>
-                  )
-                ) : f.list ? (
-                  <>
-                    <input
-                      className="cb-values"
-                      type="text"
-                      placeholder="如 0,15,30,45"
-                      value={v.values}
-                      onChange={(e) => setF(f.key, { mode: 'list', values: e.target.value })}
-                    />
-                    <span className="cb-range">0-{f.max}，逗号分隔</span>
-                  </>
-                ) : (
-                  <>
+                <div className="cb-modes">
+                  <label className="cb-radio">
+                    <input type="radio" name={f.key} checked={v.mode === 'all'} onChange={() => setF(f.key, { mode: 'all' })} />
+                    每{f.label}
+                  </label>
+                  <label className="cb-radio">
+                    <input type="radio" name={f.key} checked={v.mode === 'step'} onChange={() => setF(f.key, { mode: 'step', step: 1 })} />
+                    每隔
                     <input
                       type="number"
-                      min={0}
+                      min={1}
                       max={f.max}
-                      value={Number(v.values) || 0}
-                      onChange={(e) => setF(f.key, { mode: 'list', values: String(Math.max(0, Math.min(Math.round(Number(e.target.value) || 0), f.max))) })}
+                      value={v.mode === 'step' ? v.step : 1}
+                      disabled={v.mode !== 'step'}
+                      onClick={(e) => e.stopPropagation()}
+                      onChange={(e) => setF(f.key, { mode: 'step', step: Math.max(1, Math.min(Math.round(Number(e.target.value) || 1), f.max)) })}
                     />
-                    <span className="cb-range">0-{f.max}</span>
-                  </>
-                )}
+                    {f.label}
+                  </label>
+                  <div className="cb-line">
+                    <label className="cb-radio">
+                      <input type="radio" name={f.key} checked={v.mode === 'list'} onChange={() => setF(f.key, { mode: 'list', values: '' })} />
+                      指定
+                    </label>
+                    {v.mode === 'list' && (
+                      <input
+                        className="cb-values"
+                        type="text"
+                        placeholder={`${f.min}-${f.max}的数字,逗号分隔`}
+                        value={v.values}
+                        onChange={(e) => setF(f.key, { mode: 'list', values: e.target.value.replace(/，/g, ',') })}
+                      />
+                    )}
+                  </div>
+                </div>
               </div>
-            )
+            ) : f.checks ? (
+              <div className="cb-row" key={f.key}>
+                <span className="cb-label">{f.label}</span>
+                <div className="cb-checks">
+                  {f.opts.map((o) => {
+                    const sel = v.mode === 'all' ? f.opts.map((x) => x.value) : (v.values ? v.values.split(',').map(Number) : [])
+                    return (
+                      <label className="cb-check" key={o.value} title={o.title}>
+                        <input
+                          type="checkbox"
+                          checked={sel.includes(o.value)}
+                          onChange={(e) => toggleCheck(f.key, o.value, e.target.checked)}
+                        />
+                        {o.label}
+                      </label>
+                    )
+                  })}
+                </div>
+              </div>
+            ) : null
           })}
         </div>
         <div className="cb-preview">
-          表达式：<code>{cron}</code>
+          <span className="cb-preview-label">表达式：</span>
+          <span className="cb-parts">
+            {cron.split(' ').map((p, i) => (
+              <span className="cb-part" key={i}>
+                {p}
+              </span>
+            ))}
+          </span>
+        </div>
+        <div className="cb-next">
+          <div className="cb-next-title">接下来5次运行时间点</div>
+          {runs.length ? (
+            <div className="cb-next-list">
+              {runs.map((t) => (
+                <span className="cb-next-item" key={t}>
+                  {formatRunTime(t)}
+                </span>
+              ))}
+            </div>
+          ) : (
+            <div className="cb-next-empty">无法计算（表达式无效）</div>
+          )}
         </div>
         <div className="perm-btns">
           <button onClick={onClose}>取消</button>

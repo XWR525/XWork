@@ -9,6 +9,12 @@ function effectiveConfig() {
 
 // 主进程入口：窗口管理 + IPC 桥 + 引擎生命周期
 const { app, BrowserWindow, ipcMain, dialog, shell, Menu, Notification, Tray, nativeImage } = require('electron')
+// Windows 通知（toast）的应用名取自 AppUserModelID：不设置时回退 Electron 默认值（electron.app.Electron），
+// 通知显示名会变成 "Electron"；显式设为安装包 appId（package.json build.appId）后，安装包快捷方式携带该 AUMID，
+// 系统通知即正确显示应用名（XWork）
+if (process.platform === 'win32') {
+  app.setAppUserModelId('com.xwork.desktop')
+}
 const path = require('node:path')
 const fs = require('node:fs')
 const { execSync } = require('node:child_process')
@@ -76,6 +82,13 @@ function maybeNotify(evt) {
     if (q?.question) notify('AI 向你提问：' + String(q.question).slice(0, 40))
   }
 }
+// 任务完成/失败/超时通知：与 maybeNotify 共用决策（任务通知开关 + 仅窗口不在前台时弹）。
+// 由 TaskRunner 注入调用（定时任务结果通知），避免绕过设置与前台判断
+function taskNotify(body) {
+  if (!settings.load().notifyTask) return
+  if (win && !win.isDestroyed() && win.isFocused()) return
+  notify(body)
+}
 // 创建系统托盘：单击恢复窗口；右键菜单「显示主窗口 / 退出」
 function createTray() {
   if (tray) return
@@ -109,7 +122,7 @@ const opencodeConfig = path.join(xdgHome, 'config', 'opencode', 'opencode.json')
 const taskStore = new TaskStore(path.join(xdgHome, 'xwork-tasks.json'))
 const taskRunner = new TaskRunner({
   store: taskStore,
-  notify,
+  notify: taskNotify, // 任务通知：任务通知开关 + 仅窗口不在前台时弹（与 maybeNotify 同决策）
   settings,
   effectiveConfig,
   ensureGit: (dir, opts) => ensureWorkdirGit(dir, opts),
@@ -262,9 +275,12 @@ app.whenReady().then(async () => {
       properties: { message: e.message }
     })
   }
-  // 定时任务：启动调度器（整分 tick）+ 触发应用启动时任务（任务引擎独立于主引擎，主引擎失败不影响调度）
+  // 定时任务：启动调度器（整分 tick）。“启动时运行”（@startup）功能已移除：
+  // 不再触发（fireNow），并自动删除历史 @startup 任务（任务引擎独立于主引擎，主引擎失败不影响调度）
   taskScheduler.start()
-  taskScheduler.fireNow()
+  for (const t of taskStore.list()) {
+    if (t.schedule === '@startup') taskStore.remove(t.id)
+  }
 })
 
 ipcMain.handle('engine:start', async () => {
@@ -980,6 +996,7 @@ function validateTask(raw) {
   if (!norm.prompt) throw new Error('请填写执行内容（prompt）')
   if (!norm.model || !norm.model.modelID) throw new Error('请选择模型')
   if (!isValidCron(norm.schedule)) throw new Error('执行频率表达式不合法')
+  if (norm.schedule === '@startup') throw new Error('「启动时运行」已不再支持，请设置具体执行频率')
   return norm
 }
 
@@ -1002,6 +1019,24 @@ ipcMain.handle('tasks:list', () =>
 ipcMain.handle('tasks:history', (_e, id) => {
   const t = taskStore.get(id)
   return t ? [...(t.history || [])].reverse() : []
+})
+
+// 计算 cron 接下来 N 次运行时间点（构造器预览用；无效表达式返回空数组）
+ipcMain.handle('tasks:next-runs', (_e, expr, count) => {
+  const n = Number.isInteger(count) && count > 0 ? count : 5
+  try {
+    const out = []
+    let from = new Date()
+    for (let i = 0; i < n; i++) {
+      const t = nextRunAfter(expr, from)
+      if (t === null) break
+      out.push(t)
+      from = new Date(t)
+    }
+    return out
+  } catch {
+    return []
+  }
 })
 
 // 创建任务
@@ -1035,8 +1070,15 @@ ipcMain.handle('tasks:remove', async (_e, id) => {
 })
 
 // 立即执行：绕过调度器等待，强制入队（任务引擎串行，忙碌时返回 busy）
+// 执行前向调度器登记运行锁（防执行期间 tick 命中同一任务重复触发），finally 释放
 ipcMain.handle('tasks:run-now', async (_e, id) => {
   const cur = taskStore.get(id)
   if (!cur) throw new Error('任务不存在')
-  return taskRunner.runNow(cur)
+  if (taskScheduler.isRunning(id)) throw new Error('任务正在进行，无法执行')
+  taskScheduler.markRunning(id)
+  try {
+    return await taskRunner.runNow(cur)
+  } finally {
+    taskScheduler.markDone(id)
+  }
 })

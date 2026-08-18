@@ -267,14 +267,22 @@ class Scheduler {
       if (task.schedule === '@startup') continue // 启动时由 fireNow 触发，不走时钟
       if (!matchCronAt(task.schedule, d)) continue
       fired++
-      task.lastRunAt = this.now()
-      task.nextRunAt = nextRunAfter(task.schedule, task.lastRunAt)
-      this.store.upsert(task)
       this.running.add(task.id)
+      // 先执行、后更新状态：onFire 返回 busy（已有任务在执行，本次命中未真正执行——
+      // 立即执行 runNow 或定时任务互斥都会命中）或 discarded（入队后任务被删除/禁用，
+      // 本次触发被丢弃）时不更新 lastRunAt/nextRunAt，避免任务被标记为已执行、下次时间被
+      // 推后一个周期（实际未跑，静默漏跑），或把已删除的任务写回复活
+      let ok = false
       try {
-        await this.onFire?.(task)
+        const res = await this.onFire?.(task)
+        ok = !res || (res.reason !== 'busy' && res.reason !== 'discarded')
       } catch {
         /* 执行器自身错误由执行器处理，调度器不中断 */
+      }
+      if (ok) {
+        task.lastRunAt = d.getTime()
+        task.nextRunAt = nextRunAfter(task.schedule, task.lastRunAt)
+        this.store.upsert(task)
       }
     }
     return fired
@@ -284,15 +292,24 @@ class Scheduler {
   async fireNow() {
     for (const task of this.store.list()) {
       if (!task.enabled || task.schedule !== '@startup' || this.running.has(task.id)) continue
-      task.lastRunAt = this.now()
-      this.store.upsert(task)
       this.running.add(task.id)
+      let ok = false
       try {
-        await this.onFire?.(task)
+        const res = await this.onFire?.(task)
+        ok = !res || (res.reason !== 'busy' && res.reason !== 'discarded')
       } catch {
         /* 同 tick */
       }
+      if (ok) {
+        task.lastRunAt = this.now()
+        this.store.upsert(task)
+      }
     }
+  }
+
+  // 外部登记运行锁（立即执行 runNow 时调用，防 tick 重复命中同一任务；执行完成后由 markDone 释放）
+  markRunning(id) {
+    this.running.add(id)
   }
 
   // 执行完成/失败后释放运行锁（由执行器调用）

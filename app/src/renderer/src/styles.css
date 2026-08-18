@@ -3177,6 +3177,10 @@ body.resizing-task .task-side {
   align-items: center;
   gap: 14px;
   flex-shrink: 0;
+  /* 与任务列表同宽（70%）并居中：描述文本左端对齐列表左端，创建按钮右端对齐列表右端 */
+  width: 70%;
+  margin: 0 auto;
+  justify-content: space-between;
 }
 
 .tasks-title {
@@ -3216,7 +3220,7 @@ body.resizing-task .task-side {
   min-height: 0;
   display: flex;
   align-items: flex-start;
-  justify-content: center;
+  justify-content: center; /* 卡片列表水平居中 */
   overflow: hidden;
   padding-top: 10px;
 }
@@ -3254,10 +3258,9 @@ body.resizing-task .task-side {
   line-height: 1.6;
 }
 
-/* 任务列表 */
+/* 任务列表：宽度为界面内容区 70%（随窗口宽度动态变化），左端与描述文本对齐 */
 .tasks-list {
-  width: 100%;
-  max-width: 780px;
+  width: 70%;
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -3487,14 +3490,51 @@ body.resizing-task .task-side {
   background: rgba(63, 120, 224, 0.15);
   color: var(--accent);
 }
+.task-history-summary-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
 .task-history-summary {
+  flex: 1;
+  min-width: 0;
   margin-top: 4px;
   font-size: 12px;
   color: var(--text);
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
+  /* summary 已按 100 字截断，无需再 line-clamp；压缩 md 子元素外边距防撑高 */
+  max-height: 120px;
   overflow: hidden;
+}
+.task-history-summary.md-body > :first-child {
+  margin-top: 0;
+}
+.task-history-summary.md-body > :last-child {
+  margin-bottom: 0;
+}
+.task-history-summary.md-body :is(h1, h2, h3, h4, h5, h6, p, ul, ol, blockquote, pre) {
+  margin: 4px 0;
+}
+.task-history-summary.md-body pre {
+  padding: 4px 6px;
+  max-height: 80px;
+  overflow: auto;
+}
+.task-history-summary.md-body code {
+  font-size: 11px;
+}
+.task-history-detail {
+  flex-shrink: 0;
+  margin-top: 4px;
+  padding: 1px 8px;
+  font-size: 11px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+}
+.task-history-detail:hover {
+  background: var(--panel2);
 }
 .task-history-error {
   margin-top: 4px;
@@ -3507,6 +3547,75 @@ body.resizing-task .task-side {
   font-size: 12px;
   color: var(--text-dim);
   text-align: center;
+}
+
+/* ---------- 执行记录详情弹窗 ---------- */
+.history-detail-card {
+  width: 640px;
+  max-width: 90vw;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+.history-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px 6px;
+}
+.history-detail-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+.history-detail-close {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.history-detail-close:hover {
+  color: var(--text);
+  background: var(--panel2);
+}
+.history-detail-sub {
+  padding: 0 16px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.history-detail-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px 10px;
+  font-size: 11px;
+  border-bottom: 1px solid var(--border);
+}
+.history-detail-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 16px;
+  font-size: 13px;
+  color: var(--text);
+}
+.history-detail-error {
+  margin: 0 16px 12px;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--danger);
+  background: rgba(222, 85, 85, 0.08);
+  border: 1px solid rgba(222, 85, 85, 0.25);
+  border-radius: 6px;
+  word-break: break-all;
+  white-space: pre-wrap;
 }
 
 /* ---------- 创建任务向导（弹窗） ---------- */
@@ -3625,10 +3734,10 @@ body.resizing-task {
   cursor: ns-resize;
 }
 
-/* cron 输入 + 构造按钮 */
+/* cron 圆角分框展示（复用构造器 .cb-part）+ 构造按钮 */
 .tc-cron {
   flex: 1;
-  font-family: inherit; /* 与 XWork 其它输入框字体保持一致 */
+  justify-content: flex-start;
 }
 
 /* 工作区下拉：按钮宽度 = 弹窗宽度的 70%（弹窗为 70vw，故按钮 49vw），按钮文字两端撑满 */
@@ -3656,6 +3765,14 @@ body.resizing-task {
 .tc-build:hover {
   color: var(--accent);
   border-color: var(--accent);
+}
+
+.tc-build:disabled,
+.tc-build:disabled:hover {
+  cursor: not-allowed;
+  color: var(--text-faint, var(--text-dim));
+  border-color: var(--border);
+  opacity: 0.55;
 }
 
 /* 超时/重试 内联数字输入 */
@@ -3716,6 +3833,10 @@ body.resizing-task {
   gap: 10px;
   font-size: 12px;
   color: var(--text);
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
 }
 
 .cb-label {
@@ -3756,6 +3877,79 @@ body.resizing-task {
   font-size: 12px;
 }
 
+/* 分/时/日 三选一单选块：每分钟 / 每隔N / 指定 */
+.cb-modes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.cb-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.cb-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.cb-radio input[type='radio'] {
+  accent-color: var(--accent);
+  margin: 0;
+}
+
+.cb-radio input[type='number'] {
+  width: 64px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.cb-radio input[type='number']:disabled {
+  opacity: 0.45;
+}
+
+.cb-line .cb-values {
+  flex: 1;
+  min-width: 140px;
+}
+
+/* 月/周 勾选框组（全选=每月/每周，部分=指定） */
+.cb-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  flex: 1;
+  min-width: 0;
+  padding: 2px 0;
+}
+
+.cb-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.cb-check input[type='checkbox'] {
+  accent-color: var(--accent);
+  margin: 0;
+}
+
 .cb-row input:disabled {
   opacity: 0.45;
 }
@@ -3772,11 +3966,65 @@ body.resizing-task {
   border-radius: 6px;
   background: var(--bg);
   font-size: 12px;
-  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
   color: var(--text-dim);
 }
 
-.cb-preview code {
+.cb-preview-label {
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.cb-parts {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.cb-part {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-deep, var(--bg));
   color: var(--accent);
-  font-family: monospace;
+  font-size: 12px;
+}
+
+/* 接下来5次运行时间点（构造器底部预览） */
+.cb-next {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+}
+
+.cb-next-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+.cb-next-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.cb-next-item {
+  font-size: 12px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.cb-next-empty {
+  font-size: 12px;
+  color: var(--text-dim);
 }

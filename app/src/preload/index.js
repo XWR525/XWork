@@ -82,6 +82,7 @@ contextBridge.exposeInMainWorld('xwork', {
   // 定时任务：列表/创建/更新/删除/立即执行
   taskList: () => ipcRenderer.invoke('tasks:list'),
   taskHistory: (id) => ipcRenderer.invoke('tasks:history', id),
+  taskNextRuns: (expr, count) => ipcRenderer.invoke('tasks:next-runs', expr, count),
   taskCreate: (task) => ipcRenderer.invoke('tasks:create', task),
   taskUpdate: (id, patch) => ipcRenderer.invoke('tasks:update', id, patch),
   taskRemove: (id) => ipcRenderer.invoke('tasks:remove', id),

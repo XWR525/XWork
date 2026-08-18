@@ -98,6 +98,7 @@ function restoreMissingFiles({ git, snapshotDir, workspace, snapshot }) {
   const restored = []
   const skipped = []
   for (const [p, blob] of Object.entries(S)) {
+    if (isSkippedPath(p)) continue // 与工作区扫描同步跳过依赖/产物目录（快照与工作区都不对比，避免阻塞）
     const abs = path.join(workspace, p)
     if (fs.existsSync(abs)) continue
     try {
@@ -121,8 +122,35 @@ function gitBlobHash(buf) {
   return crypto.createHash('sha1').update(`blob ${buf.length}\0`).update(buf).digest('hex')
 }
 
-// 递归收集工作区全部文件（相对路径，正斜杠），排除 .git 目录
-function walkWorkspace(dir, base) {
+// 扫描时跳过的常见大目录（与 app.config.json 的 hideDirs 对齐）：
+// 撤销影响收集需同步全量对比工作区文件，跳过依赖/产物目录避免大仓库下主进程长时间阻塞
+const SKIP_DIRS = new Set([
+  '.opencode',
+  '.agents',
+  'node_modules',
+  '.git',
+  '.svn',
+  '.next',
+  'dist',
+  'build',
+  'out',
+  '.venv',
+  'venv',
+  '__pycache__',
+  '.idea',
+  '.vscode'
+])
+
+// 相对路径是否落在被跳过的目录下（路径段匹配，忽略大小写，与 norm 一致）
+function isSkippedPath(rel) {
+  for (const seg of rel.split('/')) {
+    if (SKIP_DIRS.has(seg.toLowerCase())) return true
+  }
+  return false
+}
+
+// 递归收集工作区全部文件（相对路径，正斜杠）；skipDirs 中的目录整棵跳过
+function walkWorkspace(dir, base, skipDirs = SKIP_DIRS) {
   let entries
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true })
@@ -131,9 +159,9 @@ function walkWorkspace(dir, base) {
   }
   const out = []
   for (const ent of entries) {
-    if (ent.name === '.git') continue
+    if (skipDirs && skipDirs.has(ent.name.toLowerCase())) continue
     const rel = base ? `${base}/${ent.name}` : ent.name
-    if (ent.isDirectory()) out.push(...walkWorkspace(path.join(dir, ent.name), rel))
+    if (ent.isDirectory()) out.push(...walkWorkspace(path.join(dir, ent.name), rel, skipDirs))
     else if (ent.isFile()) out.push(rel)
   }
   return out
@@ -180,12 +208,13 @@ function collectUndoImpact({ git, snapshotDir, workspace, snapshot }) {
       if (m) sizeByHash[m[1]] = Number(m[2])
     }
   }
-  // 工作区文件集合（相对路径），按归一化键索引
+  // 工作区文件集合（相对路径），按归一化键索引（walkWorkspace 已跳过依赖/产物目录）
   const wByNorm = new Map(walkWorkspace(workspace).map((p) => [norm(p), p]))
   const impact = []
   const classified = new Set() // 已在快照中分类的归一化路径
   // 1) 快照有的文件：当前无 → 删除；当前有且内容不同 → 还原
   for (const [p, blob] of Object.entries(S)) {
+    if (isSkippedPath(p)) continue // 快照侧与被跳过的目录同步排除，避免误报 delete
     const n = norm(p)
     classified.add(n)
     const cur = wByNorm.get(n)
