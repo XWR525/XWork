@@ -245,9 +245,18 @@ function startGlobalWatch() {
 
 app.whenReady().then(async () => {
   const cfg = settings.load()
+  // 工作区存在性校验：上次打开的工作区可能已被删除/移动，若以其为引擎 cwd 启动，
+  // Windows 上 spawn 直接 ENOENT 崩溃（错误对象指向 exe 路径，极易误导为引擎缺失）。
+  // 不存在则回退空工作区并清空持久化，保证应用始终可启动
+  let ws = cfg.workspace
+  if (ws && !fs.existsSync(ws)) {
+    console.warn('[ws] 上次工作区不存在，已回退空工作区:', ws)
+    ws = null
+    settings.save({ workspace: '' })
+  }
   engine = new Engine({
     xdgHome,
-    cwd: cfg.workspace || null, // 工作区（上次打开的目录）
+    cwd: ws, // 工作区（上次打开的目录；已校验存在）
     port: effectiveConfig().enginePort, // 引擎端口（用户可在设置面板「配置」页覆盖，重启应用后生效）
     extraEnv: () => settings.env(), // 注入模型 API Key 环境变量
     onExit: (code) => {
@@ -265,7 +274,7 @@ app.whenReady().then(async () => {
   try {
     applyToOpencode(opencodeConfig, settings) // 保证 provider 段与设置一致
     // 工作区建立时静默 git init：引擎快照每轮对话前写入，事后 init 无法追溯此前轮次（见 ensureWorkdirGit）
-    ensureWorkdirGit(cfg.workspace, { init: true })
+    ensureWorkdirGit(ws, { init: true })
     await engine.start()
     startGlobalWatch()
   } catch (e) {
@@ -681,6 +690,8 @@ function ensureWorkdirGit(dir, opts = {}) {
   }
   if (isGit) return { ok: true, available: true, isGit: true }
   if (opts.init) {
+    // 无工作区（null/空）：无目录可 init，直接返回（避免误在应用目录执行 git init）
+    if (!dir) return { ok: true, available: true, isGit: false }
     try {
       execSync(`"${git}" init`, { cwd: dir, stdio: 'ignore', windowsHide: true })
       console.log('[git:ensure] git init done at', dir)

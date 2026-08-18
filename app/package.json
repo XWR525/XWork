@@ -1,7 +1,7 @@
 {
   "name": "xwork",
   "productName": "XWork",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "description": "XWork - 基于 opencode 的可视化 AI 工作台",
   "main": "out/main/index.js",
   "author": "XWork",

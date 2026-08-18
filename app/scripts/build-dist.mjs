@@ -65,29 +65,48 @@ const gitExe = path.join(gitDir, 'cmd', 'git.exe')
 if (fs.existsSync(gitExe)) {
   console.log('==> 内置 MinGit 已存在，跳过下载:', gitExe)
 } else {
-  const zipUrl = `https://github.com/git-for-windows/git/releases/download/v${MINGIT_VERSION}.windows.1/MinGit-${MINGIT_VERSION}-64-bit.zip`
+  // 镜像优先（国内网络），GitHub 回退；带超时与进度输出，避免长时间无反馈地挂起
+  const urls = [
+    `https://registry.npmmirror.com/-/binary/git-for-windows/v${MINGIT_VERSION}.windows.1/MinGit-${MINGIT_VERSION}-64-bit.zip`,
+    `https://github.com/git-for-windows/git/releases/download/v${MINGIT_VERSION}.windows.1/MinGit-${MINGIT_VERSION}-64-bit.zip`
+  ]
   const tmpZip = path.join(appDir, 'build', `MinGit-${MINGIT_VERSION}.zip`)
   console.log(`==> 下载 MinGit ${MINGIT_VERSION} → resources/git（引擎撤销功能依赖）`)
-  try {
-    const res = await fetch(zipUrl, { redirect: 'follow' })
-    if (!res.ok) throw new Error('HTTP ' + res.status)
-    const buf = Buffer.from(await res.arrayBuffer())
-    fs.mkdirSync(path.dirname(tmpZip), { recursive: true })
-    fs.writeFileSync(tmpZip, buf)
-    console.log('==> MinGit zip 已下载: ' + Math.round(buf.length / 1024 / 1024) + ' MB')
-    // Windows 自带 bsdtar 可解压 zip，比纯 JS 解压快得多；先清空目录避免残留不完整内容
-    fs.rmSync(gitDir, { recursive: true, force: true })
-    fs.mkdirSync(gitDir, { recursive: true })
-    const r = spawnSync('tar', ['-xf', tmpZip, '-C', gitDir], { stdio: 'inherit' })
-    fs.unlinkSync(tmpZip)
-    if (r.status !== 0 || !fs.existsSync(gitExe)) throw new Error('解压后未找到 cmd/git.exe')
-    console.log('==> MinGit 已解压到 resources/git (' + Math.round(fs.statSync(gitExe).size / 1024 / 1024) + ' MB 解压目录)')
-  } catch (e) {
-    console.error('!! MinGit 下载/解压失败: ' + e.message)
-    console.error('   安装包将不包含内置 git，undo 功能需用户机器安装 Git（无 git 时该功能禁用）。')
-    console.error('   网络恢复后请删除 app/resources/git 目录重新打包。')
-    process.exit(1)
+  let buf = null
+  for (const url of urls) {
+    try {
+      console.log('    源: ' + url.replace(/^https:\/\//, ''))
+      const res = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(10 * 60 * 1000) })
+      if (!res.ok) throw new Error('HTTP ' + res.status)
+      const total = Number(res.headers.get('content-length') || 0)
+      const reader = res.body.getReader()
+      const chunks = []
+      let got = 0
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        chunks.push(value)
+        got += value.length
+        if (total) process.stdout.write(`\r    已下载 ${(got / 1048576).toFixed(1)} MB / ${(total / 1048576).toFixed(1)} MB`)
+      }
+      process.stdout.write('\n')
+      buf = Buffer.concat(chunks)
+      break
+    } catch (e) {
+      console.log('    ' + url.replace(/^https:\/\//, '') + ' 下载失败，切换下一源: ' + e.message)
+    }
   }
+  if (!buf) throw new Error('全部下载源失败')
+  fs.mkdirSync(path.dirname(tmpZip), { recursive: true })
+  fs.writeFileSync(tmpZip, buf)
+  console.log('==> MinGit zip 已下载: ' + Math.round(buf.length / 1024 / 1024) + ' MB')
+  // Windows 自带 bsdtar 可解压 zip，比纯 JS 解压快得多；先清空目录避免残留不完整内容
+  fs.rmSync(gitDir, { recursive: true, force: true })
+  fs.mkdirSync(gitDir, { recursive: true })
+  const r = spawnSync('tar', ['-xf', tmpZip, '-C', gitDir], { stdio: 'inherit' })
+  fs.unlinkSync(tmpZip)
+  if (r.status !== 0 || !fs.existsSync(gitExe)) throw new Error('解压后未找到 cmd/git.exe')
+  console.log('==> MinGit 已解压到 resources/git (' + Math.round(fs.statSync(gitExe).size / 1024 / 1024) + ' MB 解压目录)')
 }
 
 // 4. electron-builder 产出 NSIS 安装包（产物在 release/）

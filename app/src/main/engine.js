@@ -182,6 +182,11 @@ class Engine {
     for (const d of ['config', 'state', 'data']) {
       fs.mkdirSync(path.join(this.xdgHome, d), { recursive: true })
     }
+    // cwd 不存在时 Windows 上 spawn 抛 ENOENT（错误对象指向 exe 路径，极易误导为引擎缺失）：
+    // 前置校验并给出明确错误，方便定位
+    if (this.cwd && !fs.existsSync(this.cwd)) {
+      throw new Error('工作区目录不存在: ' + this.cwd)
+    }
     const child = spawn(
       this.exe,
       ['serve', '--port', String(this.port), '--hostname', '127.0.0.1'],
@@ -195,6 +200,10 @@ class Engine {
     this.child = child
     this.owned = true
     console.log('[engine] start(): spawned new process pid=', child.pid, 'cwd=', this.cwd)
+    // spawn 失败（如 exe 权限/路径问题）不会触发 'exit'，需监听 'error' 及时感知，避免 pid=undefined 后空等超时
+    child.on('error', (err) => {
+      console.error('[engine] spawn error:', err.message)
+    })
     let outBuf = ''
     child.stdout?.on('data', (d) => (outBuf += d))
     child.stderr?.on('data', (d) => (outBuf += d))
