@@ -38,7 +38,10 @@ class Bridge {
   }
 
   async createSession(title, permission) {
-    const body = { title }
+    // title 可选：不传/空串时省略该字段，由 opencode 引擎自动生成标题
+    // （初始为默认名 "New session-<时间>"，收到首条 user 消息后用内置 title agent 异步生成精炼标题）
+    const body = {}
+    if (title) body.title = title
     if (permission && permission.length) body.permission = permission
     const res = await fetch(`${this.base}/session`, {
       method: 'POST',

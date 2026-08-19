@@ -22,13 +22,36 @@ const run = (cmd, args, label) => {
   }
 }
 
+// 同步等待（主线程可用 Atomics.wait 阻塞）
+const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+
+// 删除目录；Windows 下文件被占用会抛 EBUSY/EPERM，这里等待锁释放并重试，
+// 避免 electron-builder 清理旧产物时因文件被占用（如 IDE/资源管理器预览）直接失败
+function rmRetry(dir, { attempts = 30, delayMs = 1000 } = {}) {
+  if (!fs.existsSync(dir)) return
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true })
+      return
+    } catch (e) {
+      if (i === attempts) {
+        console.error('!! 无法删除 ' + dir + '：' + e.code + ' ' + e.message)
+        console.error('   该目录正被其它进程占用（常见：正在运行的 XWork/electron、资源管理器、编辑器预览）。请关闭相关程序后重试。')
+        process.exit(1)
+      }
+      console.log('==> ' + dir + ' 正被占用，' + (delayMs / 1000) + 's 后重试 (' + i + '/' + attempts + ')：' + e.code)
+      sleep(delayMs)
+    }
+  }
+}
+
 // 1. 构建渲染层/主进程/预加载（electron-vite build → out/）
 run('npx', ['electron-vite', 'build'], '构建 out/（electron-vite build）')
 
 // 2. 生成应用图标（存在则跳过）
 const ico = path.join(appDir, 'build', 'icon.ico')
 if (!fs.existsSync(ico)) {
-  run('node', ['scripts/gen-icon.mjs'], '生成应用图标 build/icon.ico')
+  run('node', ['scripts/gen-icons.mjs'], '生成应用图标 build/icon.ico')
 } else {
   console.log('==> 图标已存在，跳过生成:', ico)
 }
@@ -108,6 +131,9 @@ if (fs.existsSync(gitExe)) {
   if (r.status !== 0 || !fs.existsSync(gitExe)) throw new Error('解压后未找到 cmd/git.exe')
   console.log('==> MinGit 已解压到 resources/git (' + Math.round(fs.statSync(gitExe).size / 1024 / 1024) + ' MB 解压目录)')
 }
+
+// 3.75 清理上次构建产物 release/（旧文件被占用时等待锁释放，避免 electron-builder EBUSY 失败）
+rmRetry(path.join(appDir, 'release'))
 
 // 4. electron-builder 产出 NSIS 安装包（产物在 release/）
 // 默认 --publish never：本地构建不上传 GitHub Release（避免 CI 检测触发隐式发布而要求 GH_TOKEN）；

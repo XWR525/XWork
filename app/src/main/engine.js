@@ -194,9 +194,13 @@ class Engine {
         cwd: this.cwd || undefined, // 工作区 = 引擎启动目录（opencode 项目根）
         env: { ...xdgEnv(this.xdgHome), ...(this.extraEnv ? this.extraEnv() : {}) },
         stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true
+        windowsHide: true,
+        // detached：引擎脱离本实例进程树/job（Windows 上 libuv 同时带 CREATE_BREAKAWAY_FROM_JOB）。
+        // 多实例共享引擎时，任一实例退出都不会连带终止引擎；引擎生命周期只由「最后一个实例退出」显式 stop 控制
+        detached: true
       }
     )
+    child.unref() // 父进程退出不等待引擎（引擎存亡由端口健康检查与显式 stop 管理）
     this.child = child
     this.owned = true
     console.log('[engine] start(): spawned new process pid=', child.pid, 'cwd=', this.cwd)

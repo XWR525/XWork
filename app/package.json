@@ -1,7 +1,7 @@
 {
   "name": "xwork",
   "productName": "XWork",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "XWork - 基于 opencode 的可视化 AI 工作台",
   "main": "out/main/index.js",
   "author": "XWork",
@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "build": "electron-vite build",
-    "icon": "node scripts/gen-icon.mjs",
+    "icon": "node scripts/gen-icons.mjs",
     "build:dist": "node scripts/build-dist.mjs"
   },
   "build": {
@@ -59,6 +59,7 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "XWork",
+      "include": "build/installer.nsh",
       "artifactName": "XWork-Installer-${version}.exe"
     }
   },

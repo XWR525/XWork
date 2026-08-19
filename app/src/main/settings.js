@@ -23,17 +23,17 @@ const DEFAULT_SETTINGS = {
   closeAction: 'quit', // 点击关闭按钮时的动作：quit = 关闭程序（默认）| tray = 最小化到托盘
   notifyTask: true, // 任务通知：AI 完成回复 / 向你提问时弹系统通知（仅窗口不在前台时）
   // 权限策略：AI 各操作类型的三档配置（创建会话时转为 opencode 规则数组）
-  // 标准档：只读/搜索/联网/子任务放行，改文件/执行命令/工作区外访问需确认
+  // 默认严格档：全部操作需询问；用户可在设置面板「权限」页切换为 标准/宽松 档
   permission: {
-    read: 'allow',
+    read: 'ask',
     edit: 'ask',
     bash: 'ask',
-    glob: 'allow',
-    grep: 'allow',
-    list: 'allow',
-    webfetch: 'allow',
-    websearch: 'allow',
-    task: 'allow',
+    glob: 'ask',
+    grep: 'ask',
+    list: 'ask',
+    webfetch: 'ask',
+    websearch: 'ask',
+    task: 'ask',
     external_directory: 'ask',
     question: 'ask'
   },
@@ -207,6 +207,19 @@ class Settings {
   }
 }
 
+// 固定内置的 AI 身份指令：写入引擎全局 AGENTS.md（opencode 启动时自动加载到所有会话），
+// 使模型自我认知为 XWork 而非 opencode；对话引擎与任务引擎共用 applyToOpencode，一次写入两者均生效
+const XWORK_IDENTITY = `# XWork 身份声明
+
+你是 XWork —— 桌面端 AI 工作台 XWork 的内置 AI 助手（XWork 基于开源Agent引擎构建，对用户统一以 XWork 身份出现）。
+
+当用户询问你的身份、名字或出身（例如「你是谁」「你叫什么」「你是哪个 AI」）时，明确回答你是「XWork」。
+
+# 语言要求
+
+回复用户时始终使用中文（这是固定要求）：所有叙述、解释、总结、提问、反馈一律用中文输出；代码、命令、文件名、API 名称、专有名词等可保留原文，但围绕它们的说明文字必须是中文。除非用户在本条会话中明确要求使用其它语言，否则不要切换为英文或其它语言。
+`
+
 // 将设置应用到 opencode.json（保留既有字段，按模型组写入/移除自定义 provider）
 // opts.allPermissions=true：任务引擎配置（无人值守，全部操作类型 allow，不弹确认框；question 由事件流自动应答）
 function applyToOpencode(configFile, settings, opts = {}) {
@@ -264,6 +277,8 @@ function applyToOpencode(configFile, settings, opts = {}) {
   cfg.permission = permission
   fs.mkdirSync(path.dirname(configFile), { recursive: true })
   fs.writeFileSync(configFile, JSON.stringify(cfg, null, 2))
+  // 注入 AI 身份指令：写入同目录的全局 AGENTS.md，opencode 自动加载，无需改动 opencode.json
+  fs.writeFileSync(path.join(path.dirname(configFile), 'AGENTS.md'), XWORK_IDENTITY)
 }
 
 module.exports = { Settings, applyToOpencode, MASK }

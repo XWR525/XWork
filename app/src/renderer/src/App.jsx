@@ -1,6 +1,7 @@
 import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { marked } from 'marked'
+import ABOUT_LOGO from './assets/logo.svg'
 marked.setOptions({ gfm: true, breaks: true })
 
 // 空会话问候语：按时间段分组，随机取一条（localStorage 记录上次索引避免连续重复）
@@ -957,7 +958,8 @@ export default function App() {
       if (!sid) {
         // 新会话不再携带权限快照：权限由引擎全局配置（opencode.json permission）统一判断，
         // 修改权限设置并重启引擎后对所有会话生效；历史会话的兜底处理见 permission.asked
-        const created = await api.sessionCreate(text.slice(0, 24) || '新对话')
+        // 不传标题：由 opencode 引擎自动生成（首条消息后异步生成，经 session.updated 事件刷新列表展示）
+        const created = await api.sessionCreate('')
         sid = created.id
         setCurrentID(sid)
         refreshSessions()
@@ -1230,7 +1232,7 @@ export default function App() {
       const data = await api.getSettings()
       setSettingsData(data)
       // 同步权限配置到 ref（自动应答兜底实时读取）
-      permCfgRef.current = (data && data.permission) || PERMISSION_PRESETS.标准
+      permCfgRef.current = (data && data.permission) || PERMISSION_PRESETS.严格
     } catch (e) {
       console.error('load models failed', e)
       if (!quiet) setToast('加载设置失败: ' + e.message)
@@ -1762,10 +1764,10 @@ export default function App() {
           </div>
         )}
         <div className="tb-spacer" />
-        <button className="settings-btn" onClick={() => setPage(page === 'tasks' ? 'chat' : 'tasks')} title={page === 'tasks' ? '回到主页' : '定时任务（开发中）'}>
+        <button className="settings-btn" onClick={() => setPage(page === 'tasks' ? 'chat' : 'tasks')} title={page === 'tasks' ? '回到主页' : '定时任务（预览版）'}>
           {page === 'tasks' ? '🔙 回到主页' : '⏰ 定时任务'}
         </button>
-        <button className="settings-btn" onClick={openSkillHub} title="技能中心（开发中）">
+        <button className="settings-btn" onClick={openSkillHub} title="Skill Hub（预览版）">
           🧩 Skill Hub
         </button>
         <button className="settings-btn" onClick={openSettings} title="模型与设置">
@@ -2778,7 +2780,7 @@ function TasksPage({ notify, setConfirm, settingsData, workspace }) {
                   </label>
                 </div>
                 <div className="task-card-meta">
-                  <span title={'cron: ' + t.schedule}>⏱ {t._nextText}</span>
+                  <span title={'Cron: ' + t.schedule}>⏱ {t._nextText}</span>
                   <span className="task-card-ws" title={t.workspace}>
                     📁 {t.workspace}
                   </span>
@@ -2966,17 +2968,14 @@ function TasksPage({ notify, setConfirm, settingsData, workspace }) {
                   </div>
                   <div className="tc-resize-bar" title="拖拽调整输入区高度" onMouseDown={startResize} />
                 </div>
-                <div className="tc-hint">
-                  支持占位符：{'{{date}}'}（今天）、{'{{date:-1d}}'}（昨天）、{'{{date:+7d}}'}（一周后）
-                </div>
               </div>
 
               <div className="tc-group">
-                <div className="tc-label">执行频率（cron）</div>
+                <div className="tc-label">执行频率（Cron）</div>
                 <div className="tc-row">
                   {/* 构造按钮置行首（始终可点，经构造器修改）；cron 以构造器同款圆角分框展示，不提供直接改文本 */}
                   <button type="button" className="tc-build" onClick={() => setCronOpen(true)}>
-                    🛠 构造
+                    ⏱️ 构造
                   </button>
                   <span className="cb-parts tc-cron">
                     {(() => {
@@ -3164,7 +3163,7 @@ function CronBuilder({ initial, onApply, onClose }) {
   return (
     <div className="perm-mask">
       <div className="perm-card cron-builder-card" onClick={(e) => e.stopPropagation()}>
-        <div className="perm-title">🛠 cron 构造器</div>
+        <div className="perm-title">⏱️ Cron 构造器</div>
         <div className="cb-fields">
           {CRON_FIELDS.map((f) => {
             const v = fields[f.key]
@@ -3800,7 +3799,7 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, appConfig, o
               {/* 基础版本信息：应用名 + 右侧检查更新入口（进设置第一眼可见） */}
               <div className="set-group">
                 <div className="about-head">
-                  <div className="about-logo">X</div>
+                  <img className="about-logo" src={ABOUT_LOGO} alt="XWork" />
                   <div className="about-id">
                     <div className="about-name">{appInfo?.name || 'XWork'}</div>
                     <div className="about-ver">版本 {appInfo?.version || '—'}</div>

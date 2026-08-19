@@ -41,9 +41,9 @@ let trayNotified = false
 // 手动停止的会话：跳过该会话下一次 session.idle 的「已完成」通知（停止 ≠ 完成，避免误导）
 const skipIdleNotif = new Map()
 
-// 托盘图标：内嵌 16x16 PNG（蓝色圆角方块 + 白色 X），不依赖外部文件，开发/打包均可靠
+// 托盘图标：内嵌 16x16 PNG（由用户应用图标生成，scripts/gen-icons.mjs），不依赖外部文件，开发/打包均可靠
 const TRAY_ICON = nativeImage.createFromDataURL(
-  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWElEQVR4nGNgoDawr3jwHx/Gq/n///94NYMwCODUDAP4NMMAVmfjMwSbHFZ/Y1OIy2CcAYcL4AxQQv7FFS60M4AiL1AUiPhswyZHvYRElaSML0aIzkzkAACTrxDPgW0/SAAAAABJRU5ErkJggg=='
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAkklEQVR42mP4//+/0////5/8Jx2A9DgxkKkZbgjDfwrBcDEgODHv//WbN8ECLoFROBVv2r7pv2tQNBj7Tr2L6gKQISDN379//+/VexEsBqJB2LPnwn+P7otgjTAAY8MNAGlGth2mGYaRNcHYRw4fhRgA06xvZgc3BJcBICynqoHpAmIByAJklwyTdEBxZqIoOwMAsxy2LY9JrNoAAAAASUVORK5CYII='
 )
 // 显示主窗口：最小化则恢复，然后显示并聚焦
 function showMainWindow() {
@@ -176,12 +176,15 @@ function wsRecord(dir) {
 
 function createWindow() {
   const w = effectiveConfig().window
+  // 窗口图标：开发模式取 build/icon.ico（打包安装后 exe 自带图标，该路径不存在则不设）
+  const winIconPath = path.join(app.getAppPath(), 'build', 'icon.ico')
   win = new BrowserWindow({
     width: w.width,
     height: w.height,
     minWidth: w.minWidth,
     minHeight: w.minHeight,
     title: 'XWork',
+    ...(fs.existsSync(winIconPath) ? { icon: winIconPath } : {}),
     // 无边框自绘标题栏（与暗色 UI 统一），窗口控制由渲染层按钮 + IPC 完成
     frame: false,
     backgroundColor: w.backgroundColor,
@@ -244,6 +247,7 @@ function startGlobalWatch() {
 }
 
 app.whenReady().then(async () => {
+  registerEngineInstance() // 多实例共享引擎协调：登记本实例 PID（退出时据此判断是否还有其它实例）
   const cfg = settings.load()
   // 工作区存在性校验：上次打开的工作区可能已被删除/移动，若以其为引擎 cwd 启动，
   // Windows 上 spawn 直接 ENOENT 崩溃（错误对象指向 exe 路径，极易误导为引擎缺失）。
@@ -990,10 +994,54 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
+// ---------- 多实例共享引擎协调 ----------
+// 多开 XWork 时所有实例共享同一个引擎进程（首个实例 spawn，后续实例复用同一端口）。
+// 若任一实例退出都停止引擎（before-quit → engine.stop），会连带其它实例一起失去服务。
+// 方案：在 xdgHome 维护活跃实例 PID 注册文件，仅当「最后一个存活实例」退出时才停止引擎。
+const engineInstancesFile = () => path.join(xdgHome, 'engine-instances.json')
+function loadEngineInstancePids() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(engineInstancesFile(), 'utf8'))
+    return Array.isArray(raw?.pids) ? raw.pids.filter((p) => typeof p === 'number') : []
+  } catch {
+    return []
+  }
+}
+function isPidAlive(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+function registerEngineInstance() {
+  const pids = loadEngineInstancePids().filter((p) => p !== process.pid && isPidAlive(p))
+  pids.push(process.pid)
+  try {
+    fs.writeFileSync(engineInstancesFile(), JSON.stringify({ pids }, null, 2))
+  } catch {
+    /* 注册失败不影响运行（最坏情况：退出时可能误停共享引擎） */
+  }
+}
+// 注销本实例，返回仍存活的其它实例数（>0 表示共享引擎仍被其它实例使用，不应停止）
+function unregisterEngineInstance() {
+  const pids = loadEngineInstancePids().filter((p) => p !== process.pid && isPidAlive(p))
+  try {
+    fs.writeFileSync(engineInstancesFile(), JSON.stringify({ pids }, null, 2))
+  } catch {
+    /* 同上 */
+  }
+  return pids.length
+}
+
 app.on('before-quit', () => {
   isQuitting = true
   sseActive = false
-  engine?.stop()
+  // 多实例共享引擎：仅当自己是最后一个存活实例时才停止引擎，否则其它 XWork 仍在使用共享服务
+  if (unregisterEngineInstance() === 0) {
+    engine?.stop()
+  }
   taskScheduler.stop()
   taskRunner.dispose()
 })

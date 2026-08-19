@@ -1346,7 +1346,8 @@ body.resizing-task .task-side {
   display: flex;
   align-items: center;
   gap: 5px;
-  max-width: 200px;
+  /* 宽度随内容自适应：长模型名完整展示（不截断为 …）；外层 .model-picker 已 flex-shrink:0 防压缩 */
+  max-width: none;
   height: 22px;
   padding: 0 8px;
   font-size: 12px;
@@ -2742,14 +2743,10 @@ body.resizing-task .task-side {
 .about-logo {
   width: 48px;
   height: 48px;
-  border-radius: 12px;
-  background: linear-gradient(135deg, #3b82f6, #1e40af);
-  color: #fff;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 22px;
-  font-weight: 700;
+  /* SVG 画布为直角矩形（背景近白 #fffffd），需用 CSS 圆角裁切四角；半径取约 27% 边长，
+     与托盘/窗口图标的圆角风格保持一致（会用裁切后的白色四角露出容器背景） */
+  border-radius: 13px;
+  object-fit: contain;
   flex-shrink: 0;
 }
 
@@ -3647,11 +3644,6 @@ body.resizing-task .task-side {
   font-size: 12px;
   font-weight: 600;
   color: var(--text);
-}
-
-.tc-hint {
-  font-size: 11px;
-  color: var(--text-dim);
 }
 
 .tc-row {
