@@ -19,7 +19,7 @@ const DEFAULT_SETTINGS = {
   // 模型使用统计：providerID/modelID → 消息发送计数（新对话默认最常用模型）
   modelUsage: {},
   workspace: '', // 当前工作区目录（空 = 默认启动目录）
-  theme: 'dark', // 界面主题：dark | light（仅影响渲染层，不参与引擎配置）
+  theme: 'light', // 界面主题：dark | light（仅影响渲染层，不参与引擎配置）
   closeAction: 'quit', // 点击关闭按钮时的动作：quit = 关闭程序（默认）| tray = 最小化到托盘
   notifyTask: true, // 任务通知：AI 完成回复 / 向你提问时弹系统通知（仅窗口不在前台时）
   // 权限策略：AI 各操作类型的三档配置（创建会话时转为 opencode 规则数组）

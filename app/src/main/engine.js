@@ -79,7 +79,11 @@ function xdgEnv(xdgHome) {
   // 内置后回退功能开箱即用，不依赖用户机器安装 git
   const builtin = builtinGitDir()
   if (builtin) {
-    env.PATH = [path.join(builtin, 'cmd'), path.join(builtin, 'mingw64', 'bin'), ...(env.PATH || '').split(';')].join(';')
+    // Windows 上 {...process.env} 是普通对象，键名大小写敏感：实际键可能是 Path/PATH/path，
+    // 必须按实际键名读取与回写，否则 env.PATH 读取恒为 undefined（原系统 PATH 被整段丢弃），
+    // 且赋值会产生与原键重复的环境变量，子进程解析到仅含内置 Git 的坏 PATH
+    const key = Object.keys(env).find((k) => k.toUpperCase() === 'PATH') || 'Path'
+    env[key] = [path.join(builtin, 'cmd'), path.join(builtin, 'mingw64', 'bin'), ...(env[key] || '').split(';').filter(Boolean)].join(';')
   }
   return env
 }

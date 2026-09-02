@@ -6,7 +6,7 @@
     "height": 780,
     "minWidth": 900,
     "minHeight": 600,
-    "backgroundColor": "#0f1115"
+    "backgroundColor": "#f2f4f8"
   },
   "hideDirs": [
     ".opencode",

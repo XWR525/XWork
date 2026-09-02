@@ -205,6 +205,29 @@ function createWindow() {
   win.webContents.on('did-finish-load', () => {
     win.webContents.send('engine:event', { type: 'app.ready', properties: {} })
   })
+  // 外部链接拦截：对话内容中点击 http(s) 链接改用系统默认浏览器打开，主窗口不导航。
+  // file:// 与 dev server origin 属内部导航，放行（Vite 整页刷新依赖同源导航）
+  const devOrigin = process.env.ELECTRON_RENDERER_URL ? new URL(process.env.ELECTRON_RENDERER_URL).origin : null
+  const isExternalUrl = (u) => {
+    try {
+      const x = new URL(u)
+      if (x.protocol === 'file:') return false
+      if (devOrigin && x.origin === devOrigin) return false
+      return x.protocol === 'http:' || x.protocol === 'https:'
+    } catch {
+      return false
+    }
+  }
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (isExternalUrl(url)) shell.openExternal(url)
+    return { action: 'deny' }
+  })
+  win.webContents.on('will-navigate', (e, url) => {
+    if (isExternalUrl(url)) {
+      e.preventDefault()
+      shell.openExternal(url)
+    }
+  })
   // 关闭时动作：设置开启「最小化到托盘」时拦截关闭 → 隐藏窗口（引擎继续后台运行）；
   // 从托盘「退出」或真正退出时 isQuitting=true，放行关闭
   win.on('close', (e) => {
@@ -826,9 +849,46 @@ ipcMain.handle('message:send', async (_e, sessionID, text, model, agent) => {
 
 ipcMain.handle('message:list', (_e, sessionID) => bridge.getMessages(sessionID))
 
-ipcMain.handle('message:abort', (_e, sessionID) => {
+// ---- 中止任务配套：终止引擎派生出的命令子进程树 ----
+// opencode 的 abort 只中断引擎内部的任务循环，不会终止其已 spawn 的指令子进程（如 python 脚本）；
+// Windows 也没有类 Unix 的信号/进程树级联终止。因此中止任务时枚举引擎进程的直接子进程，
+// 对每个递归 taskkill /T（连同其全部分支），使「点击停止」能连带结束正在运行的外部程序。
+// 引擎本体保留（会话需继续服务 / 多会话可复用）。
+// 副作用：同一引擎进程下其他会话正在运行的命令也会一并结束（一次通常只有一个 busy 会话）。
+function childPidsOf(ppid) {
+  try {
+    const out = execSync(
+      `powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'ParentProcessId=${ppid}' | Select-Object -ExpandProperty ProcessId"`,
+      { encoding: 'utf8', windowsHide: true }
+    )
+    return out.split(/\r?\n/).map((s) => s.trim()).filter((s) => /^\d+$/.test(s))
+  } catch {
+    return []
+  }
+}
+
+function killEngineChildren() {
+  if (!engine || !engine.child) return // 复用外部引擎场景：无自有 child，交由业务方自行管理
+  for (const pid of childPidsOf(engine.child.pid)) {
+    try {
+      execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore', windowsHide: true })
+    } catch {
+      /* 进程可能已自行退出 */
+    }
+  }
+}
+
+ipcMain.handle('message:abort', async (_e, sessionID) => {
   if (sessionID) skipIdleNotif.set(sessionID, true) // 手动停止 ≠ 完成：跳过该会话的「已完成」通知
-  return bridge.abortMessage(sessionID)
+  try {
+    const r = await bridge.abortMessage(sessionID)
+    killEngineChildren() // 连带终止引擎为指令派生的子进程（python 等外部程序）
+    return r
+  } catch (e) {
+    // abort 失败也尽力清掉外部子进程，避免残留继续运行
+    killEngineChildren()
+    throw e
+  }
 })
 
 // 压缩会话：委托引擎原生 summarize（等效 TUI /compact，需指定总结所用模型，异步执行，进度经全局事件流推送）

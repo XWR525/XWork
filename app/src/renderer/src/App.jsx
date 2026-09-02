@@ -197,17 +197,22 @@ function applyPartUpdated(ms, part, mid) {
     return clone
   }
   if (part.type === 'tool') {
+    // 引擎推送的 time.end 语义是「系统对指令产生响应」的时刻（工具结果就绪即停止计时），
+    // 不含「结果完全输出结束」的流式时长。这里对每次工具状态更新都刷新本地时间戳 _tEnd，
+    // 作为工具最后一次产生输出的时刻（≈结果完全输出结束），供工具卡耗时展示使用。
+    const _tEnd = Date.now()
+    const timed = (st) => (st ? { ...st, time: { ...(st.time || {}), _tEnd } } : st)
     const i = ms.findIndex((m) => m.id === mid)
     if (i < 0) {
       // 消息尚未出现（无文本增量）→ 创建占位追加到末尾，保证实时状态可渲染
-      return [...ms, { id: mid, role: 'assistant', streamed: true, parts: [{ id: part.id, callID: part.callID, type: 'tool', tool: part.tool, state: part.state }] }]
+      return [...ms, { id: mid, role: 'assistant', streamed: true, parts: [{ id: part.id, callID: part.callID, type: 'tool', tool: part.tool, state: timed(part.state) }] }]
     }
     const clone = ms.slice()
     const m = clone[i]
     const parts = m.parts.slice()
     const ti = parts.findIndex((x) => x.type === 'tool' && (x.id === part.id || x.callID === part.callID))
-    if (ti >= 0) parts[ti] = { ...parts[ti], tool: part.tool, state: part.state }
-    else parts.push({ id: part.id, callID: part.callID, type: 'tool', tool: part.tool, state: part.state })
+    if (ti >= 0) parts[ti] = { ...parts[ti], tool: part.tool, state: timed(part.state) }
+    else parts.push({ id: part.id, callID: part.callID, type: 'tool', tool: part.tool, state: timed(part.state) })
     clone[i] = { ...m, parts, streamed: true }
     return clone
   }
@@ -337,7 +342,8 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [input, setInput] = useState('')
-  const [perm, setPerm] = useState(null) // 待处理的权限请求
+  const [permQueue, setPermQueue] = useState([]) // 待处理的权限请求队列（引擎可能并发弹出多个 ask，逐个确认）
+  const perm = permQueue[0] // 当前展示的请求 = 队首，确认后自动轮到下一个
   const [confirm, setConfirm] = useState(null) // 项目风格确认框 {title, message, danger?, confirmLabel?, onConfirm}
   const [question, setQuestion] = useState(null) // AI 提问 {id, sessionID, questions[]}
   const [qSel, setQSek] = useState([]) // 每题选中的选项 label（string[][]）
@@ -367,7 +373,7 @@ export default function App() {
   // 已保存的权限配置（自动应答兜底用）：onEvent 回调是 [ ] 闭包，必须经 ref 读取最新值
   const permCfgRef = useRef(null)
   const [appInfo, setAppInfo] = useState(null) // 应用版本信息（「关于」面板）
-  const [theme, setTheme] = useState('dark') // 界面主题：dark | light
+  const [theme, setTheme] = useState('light') // 界面主题：dark | light
   const [modelSel, setModelSel] = useState(null) // 当前会话选择的模型 {providerID, modelID}，null = 未选择（发送前必须有效）
   const [agent, setAgent] = useState('build') // 当前会话的模式（opencode agent：build 默认 / plan 只读规划）
 
@@ -767,7 +773,9 @@ export default function App() {
               .then((ok) => console.log('[perm.asked] respond result:', ok))
               .catch((e) => console.error('[perm.asked] respond failed:', e.message))
           } else {
-            setPerm(p)
+            // 入队（按 id 去重）：引擎可能并发发出多个权限请求，逐个展示确认；
+            // 若直接覆盖，未响应的请求会永远卡在引擎侧导致任务阻塞
+            setPermQueue((q) => (q.some((x) => x.id === p.id) ? q : [...q, p]))
           }
           break
         }
@@ -1017,12 +1025,15 @@ export default function App() {
 
   const respondPerm = async (response) => {
     if (!perm) return
+    const { sessionID, id } = perm
     try {
-      await api.permissionRespond(perm.sessionID, perm.id, response)
+      await api.permissionRespond(sessionID, id, response)
     } catch (e) {
       console.error('permission respond failed', e)
     }
-    setPerm(null)
+    // 按 id 移除而非简单弹出队首：即使响应期间又来了新请求 / 响应失败，
+    // 也只清掉本次已处理的这一条，不会误清队列里其他等待确认的请求
+    setPermQueue((q) => q.filter((x) => x.id !== id))
   }
 
   // 切换某题的选项选中状态（单选互斥，多选可多选）；点击预设选项时退出「其它」模式
@@ -1093,7 +1104,7 @@ export default function App() {
     }
   }, [])
 
-  // 启动时加载已保存的界面主题（旧 preload 无 getTheme 时保持默认暗色）
+  // 启动时加载已保存的界面主题（旧 preload 无 getTheme 时保持默认亮色）
   useEffect(() => {
     if (typeof api.getTheme !== 'function') return
     api
@@ -3272,19 +3283,19 @@ function GroupFormFields({ draft, setDraft, apiKeyPlaceholder, test, onTest, onC
   return (
     <>
       <div className="set-group">
-        <div className="set-label">组名（如 DeepSeek / Kimi）</div>
+        <div className="set-label">组名（如 DeepSeek / Kimi，可自定义）</div>
         <input
           className="set-input"
-          placeholder="Kimi"
+          placeholder="DeepSeek"
           value={draft.name}
           onChange={(e) => setDraft({ ...draft, name: e.target.value })}
         />
       </div>
       <div className="set-group">
-        <div className="set-label">Base URL（OpenAI 兼容）</div>
+        <div className="set-label">Base URL（OpenAI 兼容，不要带 /chat/completions 后缀）</div>
         <input
           className="set-input"
-          placeholder="https://api.moonshot.cn/v1"
+          placeholder="https://api.deepseek.com"
           value={draft.baseURL}
           onChange={(e) => setDraft({ ...draft, baseURL: e.target.value })}
         />
@@ -3304,7 +3315,7 @@ function GroupFormFields({ draft, setDraft, apiKeyPlaceholder, test, onTest, onC
         <textarea
           className="set-input mg-models"
           rows={3}
-          placeholder={'kimi-k2-0711-preview\nmoonshot-v1-8k'}
+          placeholder={'deepseek-v4-flash\ndeepseek-v4-pro'}
           value={draft.modelsText}
           onChange={(e) => setDraft({ ...draft, modelsText: e.target.value })}
         />
@@ -4256,18 +4267,27 @@ function WorkspacePicker({ workspaces, value, onPick, onAdd, className }) {
 
 // 工具调用卡片（任务执行面板）
 // memo：part 为消息 part 引用（delta 只替换变化的 part），未变化的工具卡不重渲染
+// 输入/输出默认截断展示（超过 LIMIT 字显示前段 + "展开全文"按钮），展开后直接渲染完整值，
+// 因此工具执行中展开可实时看到最新输出（每次 part 状态更新本组件会重渲染取到最新 output）
 const ToolCard = memo(function ToolCard({ part }) {
   const [open, setOpen] = useState(false)
+  const [expIn, setExpIn] = useState(false)
+  const [expOut, setExpOut] = useState(false)
   const st = part.state?.status || 'pending'
   const input = part.state?.input
   const output = part.state?.output ?? part.state?.metadata?.output ?? ''
-  // 引擎为每个工具调用记录 state.time = { start, end }（epoch 毫秒）；进行中只有 start
+  // 引擎为每个工具调用记录 state.time = { start, end }（epoch 毫秒）。
+  // 引擎的 end 指「产生响应」的时刻；_tEnd 为渲染层记录的工具最后一次状态更新时间，
+  // 更能反映「结果完全输出结束」。进行中 _tEnd 随每次输出刷新，耗时会实时增长。
   const t = part.state?.time || {}
   const clock = fmtClock(t.start)
-  const dur = fmtDur(t.start, t.end)
-  const fmt = (v) => {
-    const s = typeof v === 'string' ? v : JSON.stringify(v, null, 2)
-    return s.length > 800 ? s.slice(0, 800) + '\n…（已截断）' : s
+  const dur = fmtDur(t.start, t._tEnd || t.end)
+  const LIMIT = 800
+  const toStr = (v) => (typeof v === 'string' ? v : JSON.stringify(v, null, 2))
+  const needExpand = (v) => toStr(v).length > LIMIT
+  const fmt = (v, full) => {
+    const s = toStr(v)
+    return full || s.length <= LIMIT ? s : s.slice(0, LIMIT) + '\n…（已截断）'
   }
   return (
     <div className={`tool-card ${st}`}>
@@ -4288,13 +4308,23 @@ const ToolCard = memo(function ToolCard({ part }) {
           {input && (
             <div className="tool-field">
               <div className="field-label">输入</div>
-              <pre>{fmt(input)}</pre>
+              <pre>{fmt(input, expIn)}</pre>
+              {needExpand(input) && (
+                <button className="tool-expand" onClick={() => setExpIn(!expIn)}>
+                  {expIn ? '收起' : '展开全文'}
+                </button>
+              )}
             </div>
           )}
           {output ? (
             <div className="tool-field">
               <div className="field-label">输出</div>
-              <pre>{fmt(output)}</pre>
+              <pre>{fmt(output, expOut)}</pre>
+              {needExpand(output) && (
+                <button className="tool-expand" onClick={() => setExpOut(!expOut)}>
+                  {expOut ? '收起' : '展开全文'}
+                </button>
+              )}
             </div>
           ) : (
             st === 'running' && <div className="tool-field"><div className="field-label">输出</div><div className="running-dots">执行中…</div></div>

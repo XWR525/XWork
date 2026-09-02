@@ -14,7 +14,7 @@ const root = (electron && electron.app && electron.app.getAppPath()) || process.
 const DEFAULTS = {
   skillApiBase: 'http://localhost:4321',
   enginePort: 4096,
-  window: { width: 1180, height: 780, minWidth: 900, minHeight: 600, backgroundColor: '#0f1115' },
+  window: { width: 1180, height: 780, minWidth: 900, minHeight: 600, backgroundColor: '#f2f4f8' },
   hideDirs: ['node_modules', '.git', '.svn', '.next', 'dist', 'build', 'out', '.venv', 'venv', '__pycache__', '.idea', '.vscode'],
   hideFiles: ['.DS_Store', 'Thumbs.db', 'desktop.ini'],
   timings: {
