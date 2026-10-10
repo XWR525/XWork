@@ -2,21 +2,34 @@
 
 将 XWork 打包为 Windows 安装程序（NSIS 向导式安装器），发给他人安装后即可直接使用（纯新系统也无需安装 Node.js / opencode）。
 
+> **引擎版本要求（V1 → V2 迁移后）**：XWork 现依赖 opencode **V2**（npm 包 `opencode2`）。
+> V1 引擎（`opencode-ai`，如 1.18.x）**不再兼容**：缺少 `/api/info`、无强制 Basic Auth、prompt 为同步语义，
+> 随包分发会导致应用无法工作。`build-dist.mjs` 会在复制后校验版本号，非 V2 直接中止打包。
+
 ## 产出物
 
 | 产物 | 说明 |
 | --- | --- |
-| `app/release/XWork-Installer-0.1.0.exe` | NSIS 向导式安装器（约 123 MB），安装后带桌面/开始菜单快捷方式，可自定义安装目录 |
+| `app/release/XWork-Installer-<版本>.exe` | NSIS 向导式安装器（含 V2 引擎，**实测 205 MB**），安装后带桌面/开始菜单快捷方式，可自定义安装目录 |
 | `app/release/win-unpacked/` | 免安装版（绿色版），`XWork.exe` 可直接运行 |
 
 安装包内含：
 - Electron 33 运行时 + XWork 渲染层/主进程
-- opencode 引擎（`resources/engine/opencode.exe`，随包分发，无需目标机器预装）
+- opencode **V2** 引擎（`resources/engine/opencode.exe`，实际为 opencode2.exe 重命名；196 MB，随包分发，无需目标机器预装）
+- 内置 MinGit（`resources/git`，引擎快照/回退依赖）
+
+> 体积说明：V2 引擎单文件 196 MB（V1 约 171 MB）。安装包由 V1 时代的约 123 MB 增至 **约 205 MB**（+82 MB），
+> 发版说明与更新提示中应向用户告知（差分更新 blockmap 仍可用，老用户实际下载量小于全量）。
 
 ## 前置环境
 
 - Windows x64（当前仅打包 win x64）
 - Node.js 18+ 与 npm（本机已验证）
+- **opencode V2 引擎来源**（三选一，脚本按下述顺序探测）：
+  1. 环境变量 `XWORK_OPENCODE_PATH` 指向 `opencode2.exe`
+  2. npm 全局 `opencode2`（`%APPDATA%\npm\node_modules\opencode2\...`）
+  3. npm 全局平台包 `opencode2-windows-x64`
+  国内网络安装：`npm i -g opencode2 --registry=https://registry.npmmirror.com`
 - 网络：脚本内已固化国内镜像，默认不依赖 GitHub；若个别二进制仍需联网，可开代理
 
 ## 关键文件
@@ -24,10 +37,10 @@
 | 文件 | 作用 |
 | --- | --- |
 | `app/package.json` | electron-builder 配置源（`build` 字段：产物名、图标、NSIS 选项、`electronDist` 指向本地 zip） |
-| `app/scripts/build-dist.mjs` | 一键打包脚本：构建 → 图标 → 复制引擎 → 打包，并在开头固化镜像环境变量 |
+| `app/scripts/build-dist.mjs` | 一键打包脚本：构建 → 图标 → 探测并校验 V2 引擎 → 复制 → 打包，并在开头固化镜像环境变量 |
 | `app/build/electron-dist.zip` | 本地 Electron zip（打包时从它解包，完全绕开 Electron 网络下载） |
 | `app/build/icon.ico` | 应用图标（缺失时脚本自动生成） |
-| `app/src/main/engine.js` | 打包版引擎查找：优先 `process.resourcesPath/engine/opencode.exe` |
+| `app/src/main/engine.js` | 打包版引擎查找：优先 `process.resourcesPath/engine/opencode.exe`；负责 Basic Auth 密码派生与 `OPENCODE_SERVER_PASSWORD` 注入 |
 
 ## 首次准备（一次性）
 
@@ -69,7 +82,9 @@ npm run build:dist
 脚本自动完成：
 1. `electron-vite build` 构建渲染层/主进程/预加载到 `out/`
 2. 图标 `build/icon.ico` 存在则跳过生成
-3. 从 npm 全局 `opencode-ai` 安装目录探测 `opencode.exe` 并复制到 `resources/engine/`（环境变量 `XWORK_OPENCODE_PATH` 可显式指定来源）
+3. 探测 opencode **V2** 引擎（`XWORK_OPENCODE_PATH` → npm 全局 `opencode2` → 平台包 `opencode2-windows-x64`），
+   **校验版本号为 v2.x**（非 V2 直接中止），复制为 `resources/engine/opencode.exe`
+3.5 内置 MinGit（`resources/git`）缺失时从 npmmirror 下载并解压（引擎快照/回退依赖 git）
 4. `electron-builder --win nsis`（默认 `--publish never`，仅本地产出，不上传）生成安装包到 `release/`
 
 任一步失败脚本立即中止（非零退出码）。
@@ -124,13 +139,20 @@ npm run build:dist
 ## 验证
 
 1. 运行 `app/release/win-unpacked/XWork.exe`，确认窗口出现、进程存活（Electron 会有多个 XWork 进程属正常）
-2. 确认 `app/release/win-unpacked/resources/engine/opencode.exe` 存在
-3. 有干净机器时，安装 `XWork-Installer-0.1.0.exe` 后直接使用
+2. 确认 `app/release/win-unpacked/resources/engine/opencode.exe` 存在且为 V2：
+   `.\release\win-unpacked\resources\engine\opencode.exe --version` → 应输出 `opencode v2.x.x`
+3. 应用启动后确认引擎就绪（左下角状态「就绪」），V2 引擎数据落在 `<userData>\opencode\data\opencode2\`（含 `opencode.db`）
+4. 有干净机器时，安装 `XWork-Installer-<版本>.exe` 后直接使用
+
+> V2 引擎强制 HTTP Basic Auth（用户名 `opencode`，密码由 XWork 按数据目录派生并注入 `OPENCODE_SERVER_PASSWORD`）。
+> 手动用 curl/浏览器访问引擎接口时必须带 `Authorization: Basic base64(opencode:<密码>)`，否则一律 401。
 
 ## 版本号 / 引擎更新
 
 - 版本号：修改 `app/package.json` 的 `version` 字段，安装器文件名随之变为 `XWork-Installer-<版本>.exe`
-- 引擎更新：`npm install -g opencode-ai` 更新到新版本后重新打包（脚本自动复制最新 `opencode.exe`）
+- 引擎更新：`npm i -g opencode2 --registry=https://registry.npmmirror.com` 更新到新版本后重新打包（脚本自动复制并校验 V2 版本号）
+- 引擎数据目录：V2 使用 `opencode2` 子目录（`config/opencode2`、`data/opencode2`），与 V1 的 `opencode` 目录并存互不干扰 ——
+  升级后 V1 时代的会话历史不会出现在 V2 中（引擎不支持自动迁移），降级回 V1 亦不受影响
 
 ## 常见问题
 
@@ -138,7 +160,10 @@ npm run build:dist
 | --- | --- |
 | 打包卡在 "unpacking default Electron distribution" | `npm install -D app-builder-bin` 补充二进制依赖 |
 | 下载超时（got 600s / 网络停滞） | 确认 `app/build/electron-dist.zip` 存在（已指向本地 zip）；或开代理后重跑 |
-| 提示找不到 opencode.exe | 设置环境变量 `XWORK_OPENCODE_PATH` 指向 opencode.exe 后重跑 |
+| 提示找不到 opencode V2 引擎 | `npm i -g opencode2`（国内加 `--registry=https://registry.npmmirror.com`）或设置 `XWORK_OPENCODE_PATH` 指向 `opencode2.exe` |
+| 提示「引擎版本非 V2」 | 本机全局装的是 V1（`opencode-ai`）；改指 V2 的 `opencode2.exe`，不要用 V1 打包 |
+| 应用启动后引擎一直未就绪 | 检查日志中是否 401（密码/鉴权）或 `EADDRINUSE`；V2 会用派生密码接管端口，若端口被其他程序占用会自动结束占用者 |
+| 模型调用报 `DEPTH_ZERO_SELF_SIGNED_CERT` | 企业零信任客户端（如 aTrust）拦截了引擎的 HTTPS 请求：导出企业根证书并让引擎加载（`NODE_EXTRA_CA_CERTS`），或将引擎进程与模型域名加入放行清单 |
 | 打包报 `GitHub Personal Access Token is not set` | 本地产包误设了 `XWORK_PUBLISH=always`（默认 never 不需要 token）；若确要发布，按上文配置 `GH_TOKEN` |
 | 发布报 422（release 已存在） | 该版本已发布过；需提升 `version` 或删除旧 Release 对应 tag 后重试 |
 | `npm prefix -w` exited code=1 | 无碍，可忽略 |

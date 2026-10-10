@@ -56,29 +56,50 @@ if (!fs.existsSync(ico)) {
   console.log('==> 图标已存在，跳过生成:', ico)
 }
 
-// 3. 探测并复制 opencode.exe 到 resources/engine（随安装包分发）
+// 3. 探测并复制 opencode V2 引擎（opencode2.exe）到 resources/engine/opencode.exe（随安装包分发）
+// 说明：V2 分发渠道为 npm 包 opencode2（平台包 opencode2-windows-x64）；V1（opencode-ai）不兼容
+// 迁移后的代码（V2 专属 API/认证），故这里只接受 V2，并在复制后校验版本号
 function findOpencodeExe() {
   const cands = []
   if (process.env.XWORK_OPENCODE_PATH) cands.push(process.env.XWORK_OPENCODE_PATH)
   const npmRoot = path.join(process.env.APPDATA || '', 'npm', 'node_modules')
   cands.push(
-    path.join(npmRoot, 'opencode-ai', 'node_modules', 'opencode-windows-x64', 'bin', 'opencode.exe'),
-    path.join(npmRoot, 'opencode-ai', 'bin', 'opencode.exe'),
-    path.join(npmRoot, 'opencode-ai', 'opencode.exe')
+    path.join(npmRoot, 'opencode2', 'node_modules', 'opencode2-windows-x64', 'bin', 'opencode2.exe'),
+    path.join(npmRoot, 'opencode2-windows-x64', 'bin', 'opencode2.exe'),
+    path.join(npmRoot, 'opencode2', 'bin', 'opencode2.exe')
   )
   for (const c of cands) if (c && fs.existsSync(c)) return c
   return null
 }
 const srcExe = findOpencodeExe()
 if (!srcExe) {
-  console.error('!! 未找到 opencode.exe，请设置环境变量 XWORK_OPENCODE_PATH 指向 opencode.exe')
+  console.error('!! 未找到 opencode V2 引擎（opencode2.exe）')
+  console.error('   安装：npm i -g opencode2 --registry=https://registry.npmmirror.com')
+  console.error('   或设置环境变量 XWORK_OPENCODE_PATH 指向 opencode2.exe')
+  process.exit(1)
+}
+// 版本校验：必须是 V2（V1 引擎缺少 /api/info、强制认证与异步 prompt 语义，随包分发会导致应用不可用）
+function engineVersion(exe) {
+  const r = spawnSync(exe, ['--version'], { encoding: 'utf8', windowsHide: true, timeout: 60000 })
+  return String(r.stdout || r.stderr || '').trim().split(/\s+/).pop() || ''
+}
+const ver = engineVersion(srcExe)
+if (!/^v?2\./.test(ver)) {
+  console.error(`!! 引擎版本非 V2（检测到 "${ver || '未知'}"）：${srcExe}`)
+  console.error('   请安装 opencode2（V2）后重试：npm i -g opencode2 --registry=https://registry.npmmirror.com')
   process.exit(1)
 }
 const dstDir = path.join(appDir, 'resources', 'engine')
 fs.mkdirSync(dstDir, { recursive: true })
 const dstExe = path.join(dstDir, 'opencode.exe')
 fs.copyFileSync(srcExe, dstExe)
-console.log('==> opencode.exe 已复制: ' + srcExe + ' → ' + dstExe + ' (' + Math.round(fs.statSync(dstExe).size / 1024 / 1024) + ' MB)')
+const sizeMB = Math.round(fs.statSync(dstExe).size / 1024 / 1024)
+console.log(`==> opencode V2 引擎已复制（${ver.startsWith('v') ? ver : 'v' + ver}，${sizeMB} MB）: ${srcExe} → ${dstExe}`)
+console.log('    注意：V2 引擎体积明显大于 V1（196 MB vs 约 100 MB），安装包会相应增大，发版说明需告知')
+if (ver !== engineVersion(dstExe)) {
+  console.error('!! 复制后引擎版本校验不一致，打包中止')
+  process.exit(1)
+}
 
 // 3.5 内置 MinGit（resources/git）：引擎的快照/撤销依赖 git 命令（实测 PATH 无 git 时 revert 静默失败），
 // 随包内置后 undo 功能开箱即用、不依赖用户机器安装 git。固定版本避免漂移。

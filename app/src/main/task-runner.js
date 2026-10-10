@@ -132,10 +132,10 @@ class TaskRunner {
       onExit: (code) => this.onEngineExit(code)
     })
     await engine.start({ force: true })
-    // 每次执行前重写配置：provider 最新 + 全部 allow（无人值守）
-    applyToOpencode(path.join(xdgHome, 'config', 'opencode', 'opencode.json'), this.settings, { allPermissions: true })
+    // 每次执行前重写配置：provider 最新 + 全部 allow（无人值守，V2 通配规则）
+    applyToOpencode(path.join(xdgHome, 'config', 'opencode2', 'opencode.json'), this.settings, { allPermissions: true })
     this.taskEngine = engine
-    this.taskBridge = new Bridge(port)
+    this.taskBridge = new Bridge(port, { password: engine.password }) // 与引擎共用派生密码（Basic Auth）
     this.enginePort = port
     this.engineWorkspace = workspace
     // 订阅任务引擎全局事件流（执行完成/失败/question 应答）；SSE 断开（引擎停止/退出）时静默收尾
@@ -186,6 +186,9 @@ class TaskRunner {
   }
 
   // ---- 事件处理 ----
+  // 事件来源为 bridge.watchGlobal 的 V1 形状归一化输出（V2 事件已在桥内翻译，此处无需感知 V2 差异）
+  // 重试职责划分：session.retry 为 V2 引擎的单次请求级自动重试（透明，仅记录日志）；
+  //   任务级失败重试由本文件 runTask 的外层退避重试负责（整任务重跑）
 
   handleEvent(evt) {
     const run = this.current
@@ -199,6 +202,11 @@ class TaskRunner {
       this.onSessionError(run, (err && err.message) || err || '执行失败')
     } else if (evt.type === 'question.asked') {
       this.answerQuestions(run, evt.properties)
+    } else if (evt.type === 'session.retry') {
+      // 引擎内重试：不改变任务状态，仅留痕（便于排查「看起来卡住」实为限流重试的场景）
+      const p = evt.properties || {}
+      console.log('[task-engine] engine retry attempt=' + p.attempt, (p.error && p.error.message) || '')
+      run.engineRetries = (run.engineRetries || 0) + 1
     }
   }
 
@@ -234,9 +242,13 @@ class TaskRunner {
 
   // question 自动应答：选第一项作为默认回答；独立 60s 短超时，失败按失败处理并 abort
   async answerQuestions(run, props) {
-    const reqId = props.requestID
+    const reqId = props.requestID || props.id // V2 归一化事件携带 id（即 formID）
     const questions = props.questions || []
-    const answers = questions.map((q) => (q.options && q.options.length ? q.options[0] : ''))
+    const answers = questions.map((q) => {
+      const o = q.options && q.options[0]
+      if (!o) return ''
+      return typeof o === 'string' ? o : o.value ?? o.label ?? ''
+    })
     if (!reqId) {
       this.onSessionError(run, '提问应答失败（缺少 requestID）')
       return

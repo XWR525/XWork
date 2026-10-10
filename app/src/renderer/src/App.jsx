@@ -1,8 +1,193 @@
 import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { marked } from 'marked'
+import hljs from 'highlight.js/lib/common'
+import markedKatex from 'marked-katex-extension'
 import ABOUT_LOGO from './assets/logo.svg'
 marked.setOptions({ gfm: true, breaks: true })
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+}
+
+// LaTeX 公式渲染（$..$ 行内 / $$..$$ 块级）；代码块 highlight.js 语法高亮，未识别语言降级纯文本
+marked.use(markedKatex({ throwOnError: false }))
+marked.use({
+  renderer: {
+    code({ text, lang }) {
+      const language = (lang || '').trim().split(/\s+/)[0]
+      if (language === 'mermaid') {
+        // Mermaid 图表：先输出占位容器（源码以 <pre> 展示，样式同普通代码块），
+        // SVG 由全局后处理异步渲染（见下方 mermaid 设施与 App 内的 MutationObserver）
+        return `<div class="md-mermaid"><pre><code class="hljs language-plaintext">${escapeHtml(text)}</code></pre></div>`
+      }
+      const name = language && hljs.getLanguage(language) ? language : 'plaintext'
+      return `<pre><code class="hljs language-${name}">${hljs.highlight(text, { language: name }).value}</code></pre>`
+    }
+  }
+})
+
+// 上标 X^2^ / 下标 H~2~O（Pandoc 风格，GFM 原生不支持）；单波浪线优先注册为下标，
+// 不再落入内置删除线规则（GFM 单 ~ 也算删除线导致 H~2~O 误显示删除线），删除线仍用 ~~..~~
+marked.use({
+  extensions: [
+    {
+      name: 'superscript',
+      level: 'inline',
+      start(src) { return src.indexOf('^') },
+      tokenizer(src) {
+        const m = /^\^([^\s^]+)\^/.exec(src)
+        if (m) return { type: 'superscript', raw: m[0], tokens: this.lexer.inlineTokens(m[1]) }
+      },
+      renderer(token) { return '<sup>' + this.parser.parseInline(token.tokens) + '</sup>' }
+    },
+    {
+      name: 'subscript',
+      level: 'inline',
+      start(src) { return src.indexOf('~') },
+      tokenizer(src) {
+        const m = /^~([^\s~]+)~/.exec(src)
+        if (m) return { type: 'subscript', raw: m[0], tokens: this.lexer.inlineTokens(m[1]) }
+      },
+      renderer(token) { return '<sub>' + this.parser.parseInline(token.tokens) + '</sub>' }
+    },
+    {
+      // 高亮 ==文本==（Markdown It / Typora 风格，渲染为 <mark>）；内容不能以空白或 = 开头结尾，
+      // 避免 x == y == z 这类普通文本误判，=== 也不会误匹配
+      name: 'mark',
+      level: 'inline',
+      start(src) { return src.indexOf('==') },
+      tokenizer(src) {
+        const m = /^==([^\s=](?:[^=\n]*[^\s=])?)==/.exec(src)
+        if (m) return { type: 'mark', raw: m[0], tokens: this.lexer.inlineTokens(m[1]) }
+      },
+      renderer(token) { return '<mark>' + this.parser.parseInline(token.tokens) + '</mark>' }
+    }
+  ]
+})
+
+// 定义列表（PHP Markdown Extra 风格：术语行 + 行首冒号定义行，GFM 原生不支持）。
+// 术语行不能是标题/列表/引用/围栏/HTML/缩进代码等其他块级语法，避免劫持内置规则
+marked.use({
+  extensions: [
+    {
+      name: 'definitionList',
+      level: 'block',
+      start(src) {
+        const m = /^ {0,3}:[ \t]/m.exec(src)
+        if (!m) return
+        const nl = src.lastIndexOf('\n', m.index)
+        if (nl === -1) return
+        const prev = src.lastIndexOf('\n', nl - 1)
+        return prev === -1 ? 0 : prev + 1
+      },
+      tokenizer(src) {
+        if (!/^ {0,3}:[ \t]/m.test(src)) return
+        const lines = src.split('\n')
+        const groups = []
+        let i = 0
+        while (i < lines.length) {
+          const term = lines[i]
+          if (!term.trim() || /^ {0,3}:/.test(term) ||
+              /^(?: {0,3}(?:#{1,6}[ \t]|>|```|~~~|[-*+][ \t]|\d{1,9}[.)][ \t]|<[A-Za-z])|\t| {4}\S)/.test(term)) break
+          if (i + 1 >= lines.length || !/^ {0,3}:[ \t]/.test(lines[i + 1])) break
+          const defs = []
+          i++
+          while (i < lines.length && /^ {0,3}:[ \t]/.test(lines[i])) {
+            defs.push(lines[i].replace(/^ {0,3}:[ \t]/, ''))
+            i++
+          }
+          groups.push({ term, defs })
+        }
+        if (!groups.length) return
+        return {
+          type: 'definitionList',
+          raw: lines.slice(0, i).join('\n') + (i < lines.length ? '\n' : ''),
+          groups: groups.map(g => ({
+            term: this.lexer.inlineTokens(g.term),
+            defs: g.defs.map(d => this.lexer.inlineTokens(d))
+          }))
+        }
+      },
+      renderer(token) {
+        let html = '<dl>'
+        for (const g of token.groups) {
+          html += '<dt>' + this.parser.parseInline(g.term) + '</dt>'
+          for (const d of g.defs) html += '<dd>' + this.parser.parseInline(d) + '</dd>'
+        }
+        return html + '</dl>\n'
+      }
+    }
+  ]
+})
+
+// ===== Mermaid 图表（```mermaid 代码块 → SVG 图）=====
+// code renderer 只输出占位容器（源码先以 <pre> 展示），SVG 渲染由全局后处理完成：
+// 首次使用时才动态 import mermaid 包（体积大，避免拖慢启动）；渲染结果按 主题+源码 缓存；
+// 流式打字中（.md-body.streaming）跳过，打字结束后 class 变化自动触发补渲染；
+// 语法错误降级为错误提示 + 保留源码，不影响其余内容。
+const MERMAID_THEME_EVENT = 'xwork-mermaid-theme'
+let mermaidLibPromise = null
+const mermaidSvgCache = new Map() // `主题\u0000源码` → svg 字符串
+let mermaidSeq = 0
+
+function currentMermaidTheme() {
+  return document.documentElement.dataset.theme === 'light' ? 'default' : 'dark'
+}
+
+function loadMermaid() {
+  if (!mermaidLibPromise) mermaidLibPromise = import('mermaid').then((m) => m.default)
+  return mermaidLibPromise
+}
+
+// 渲染单个占位容器：data-state 防重入；data-src 记录源码供主题切换时重渲染
+async function renderMermaidNode(node) {
+  if (!node.dataset.src) node.dataset.src = node.textContent
+  const code = node.dataset.src
+  const key = currentMermaidTheme() + '\u0000' + code
+  try {
+    let svg = mermaidSvgCache.get(key)
+    if (svg === undefined) {
+      const mermaid = await loadMermaid()
+      mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', suppressErrorRendering: true, theme: currentMermaidTheme() })
+      await mermaid.parse(code) // 语法预检：错误直接抛出、不注入 DOM
+      svg = (await mermaid.render('mmd-' + mermaidSeq++, code)).svg
+      mermaidSvgCache.set(key, svg)
+    }
+    node.innerHTML = svg
+    node.classList.add('md-mermaid-ok')
+    node.dataset.state = 'done'
+  } catch (err) {
+    node.classList.add('md-mermaid-err')
+    const msg = document.createElement('div')
+    msg.className = 'md-mermaid-err-msg'
+    msg.textContent = 'Mermaid 图表渲染失败：' + String((err && err.message) || err).slice(0, 200)
+    node.prepend(msg)
+    node.dataset.state = 'error'
+  }
+}
+
+// 扫描占位容器并渲染；流式打字中的跳过（打字结束后 class 变化会再次触发扫描）
+function scanMermaid(root) {
+  const nodes = root.querySelectorAll('.md-mermaid:not([data-state])')
+  for (const node of nodes) {
+    if (node.closest('.md-body.streaming')) continue
+    node.dataset.state = 'pending'
+    renderMermaidNode(node)
+  }
+}
+
+// 主题切换：让已渲染/渲染中的图表按新主题重画（缓存按主题键控，旧图原样保留直到新图就绪）
+function rerenderMermaidTheme() {
+  document.querySelectorAll('.md-mermaid[data-src]').forEach((node) => {
+    delete node.dataset.state
+    node.classList.remove('md-mermaid-ok', 'md-mermaid-err')
+    const msg = node.querySelector('.md-mermaid-err-msg')
+    if (msg) msg.remove()
+    node.dataset.state = 'pending'
+    renderMermaidNode(node)
+  })
+}
 
 // 空会话问候语：按时间段分组，随机取一条（localStorage 记录上次索引避免连续重复）
 const GREETINGS = [
@@ -35,13 +220,13 @@ function pickGreeting() {
 }
 
 // 权限设置：AI 各操作类型清单（设置面板展示，用户可配 允许/询问/禁止）
+// 注：V2 已取消「目录列举」（list）动作，此处不再展示该项
 const PERMISSION_ITEMS = [
   { key: 'read', label: '读取文件', desc: '读取工作区内文件内容' },
   { key: 'edit', label: '修改文件', desc: '编辑 / 新建 / 覆写文件（edit/write/patch）' },
   { key: 'bash', label: '执行命令', desc: '在终端执行命令（含删除、移动等，PowerShell）' },
   { key: 'glob', label: '文件查找', desc: '按模式查找文件（glob）' },
   { key: 'grep', label: '内容搜索', desc: '在文件中搜索文本（grep）' },
-  { key: 'list', label: '目录列举', desc: '列出目录内容（list）' },
   { key: 'webfetch', label: '网页抓取', desc: '抓取指定网页内容' },
   { key: 'websearch', label: '联网搜索', desc: '搜索互联网获取信息' },
   { key: 'task', label: '子任务', desc: 'AI 启动子 Agent 并行处理' },
@@ -51,14 +236,13 @@ const PERMISSION_ITEMS = [
 
 // 预设档位：严格（全确认） / 标准（只读放行，改动确认） / 宽松（全部放行）
 const PERMISSION_PRESETS = {
-  严格: { read: 'ask', edit: 'ask', bash: 'ask', glob: 'ask', grep: 'ask', list: 'ask', webfetch: 'ask', websearch: 'ask', task: 'ask', external_directory: 'ask', question: 'ask' },
-  标准: { read: 'allow', edit: 'ask', bash: 'ask', glob: 'allow', grep: 'allow', list: 'allow', webfetch: 'allow', websearch: 'allow', task: 'allow', external_directory: 'ask', question: 'ask' },
-  宽松: { read: 'allow', edit: 'allow', bash: 'allow', glob: 'allow', grep: 'allow', list: 'allow', webfetch: 'allow', websearch: 'allow', task: 'allow', external_directory: 'allow', question: 'allow' }
+  严格: { read: 'ask', edit: 'ask', bash: 'ask', glob: 'ask', grep: 'ask', webfetch: 'ask', websearch: 'ask', task: 'ask', external_directory: 'ask', question: 'ask' },
+  标准: { read: 'allow', edit: 'ask', bash: 'ask', glob: 'allow', grep: 'allow', webfetch: 'allow', websearch: 'allow', task: 'allow', external_directory: 'ask', question: 'ask' },
+  宽松: { read: 'allow', edit: 'allow', bash: 'allow', glob: 'allow', grep: 'allow', webfetch: 'allow', websearch: 'allow', task: 'allow', external_directory: 'allow', question: 'allow' }
 }
 
-// 设置页不展示的内部类型：低风险固定放行；doom_loop 保留防死循环询问
-// （与主进程 settings.js 的 INTERNAL_ALLOW_PERMS 保持一致，需同步修改）
-const INTERNAL_ALLOW_PERMS = ['todowrite', 'todoread', 'skill', 'lsp', 'codesearch']
+// 设置页不展示的内部类型：低风险固定放行（与主进程 settings.js 的 INTERNAL_ALLOW_PERMS 保持一致，需同步修改）
+const INTERNAL_ALLOW_PERMS = ['skill']
 
 // 权限类型 → 当前全局设置的动作（自动应答兜底与全局规则共用同一规则源）
 // 内部低风险固定 allow；doom_loop 固定 ask；其余按已保存设置，缺失回退 ask
@@ -530,12 +714,13 @@ export default function App() {
     return () => clearInterval(timer)
   }, [sideTab, workspace, timings])
 
-  // 切换到指定工作区（引擎重启，新 cwd）；「打开文件夹」与「所有工作区」共用
+  // 切换到指定工作区（V2 单进程多目录：不重启引擎，仅切换会话作用域并热加载新目录配置）
+  // 「打开文件夹」与「所有工作区」共用
   const switchTo = async (dir) => {
     if (!dir || dir === workspace) return
     try {
       if (wsTimer.current) clearTimeout(wsTimer.current)
-      setWsSwitching({ dir, done: false }) // 遮罩淡入，覆盖引擎重启的等待期
+      setWsSwitching({ dir, done: false })
       const r = await api.workspaceSwitch(dir)
       if (!r.ok) {
         setWsSwitching(null)
@@ -549,8 +734,8 @@ export default function App() {
       setCtxTokens(null) // 切换工作区后无当前会话，清空 token 统计
       setBusy(false)
       setStopping(false)
-      busySessionRef.current = null // 引擎随工作区重启，任务必然中断，撤销后台恢复标记
-      streamCacheRef.current = {} // 引擎随工作区重启：所有会话流式缓存失效
+      // 引擎不再随工作区重启：其它工作区正在执行的任务会继续跑，
+      // 故 busySessionRef / 流式缓存**保留**（切回该会话时仍能正确显示执行中状态）
       // 切换工作区同样重置对话区贴底状态与「↓ 新消息」气泡
       listStickRef.current = true
       setShowNewHint(false)
@@ -780,7 +965,8 @@ export default function App() {
           break
         }
         case 'question.asked': {
-          // AI 主动提问（ask 工具）：展示问题/选项弹窗，回答经 /question/{id}/reply 提交
+          // AI 主动提问（ask 工具）：展示问题/选项弹窗；回答经 bridge 提交（V2 为 form 应答，
+          // 事件已由桥归一化为 question.asked，载荷形状与 V1 一致，此处无需感知引擎差异）
           console.log('[question.asked]', p.sessionID, JSON.stringify(p.questions || []).slice(0, 200))
           const qs = p.questions || []
           setQuestion({ id: p.id, sessionID: p.sessionID, questions: qs })
@@ -1115,10 +1301,33 @@ export default function App() {
       .catch(() => {})
   }, [])
 
-  // 主题应用到根元素（CSS 变量随 data-theme 切换）
+  // 主题应用到根元素（CSS 变量随 data-theme 切换）；通知 Mermaid 图表按新主题重渲染
   useEffect(() => {
     document.documentElement.dataset.theme = theme
+    window.dispatchEvent(new CustomEvent(MERMAID_THEME_EVENT))
   }, [theme])
+
+  // Mermaid 图表全局后处理：DOM 中出现 .md-mermaid 占位符即调度渲染
+  // （子树 childList 覆盖消息/详情新增，class 变化覆盖流式打字结束的时刻；rAF 合帧节流）
+  useEffect(() => {
+    let scheduled = false
+    const schedule = () => {
+      if (scheduled) return
+      scheduled = true
+      requestAnimationFrame(() => {
+        scheduled = false
+        scanMermaid(document.body)
+      })
+    }
+    const observer = new MutationObserver(schedule)
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] })
+    schedule()
+    window.addEventListener(MERMAID_THEME_EVENT, rerenderMermaidTheme)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener(MERMAID_THEME_EVENT, rerenderMermaidTheme)
+    }
+  }, [])
 
   // 切换界面主题：即时生效并持久化（不重启引擎）
   const applyTheme = (t) => {
@@ -1359,7 +1568,7 @@ export default function App() {
     try {
       const r = await api.skillInstall(s.id)
       if (r.ok) {
-        setToast(`「${s.name}」已安装，重启引擎后生效`)
+        setToast(`「${s.name}」已安装，引擎会在数秒内自动识别（无需重启）`)
         refreshInstalled()
       } else {
         setToast(r.error || '安装失败')
@@ -1394,11 +1603,11 @@ export default function App() {
     })
   }
 
-  // 重启引擎：安装新技能后需重启才能识别，经主进程 stop → 强制新进程
+  // 重启引擎：保留为显式手动操作（V2 下技能会被自动热发现，通常无需重启），经主进程 stop → 强制新进程
   const restartEngine = async () => {
     try {
       const r = await api.engineRestart()
-      setToast(r.ok ? '引擎已重启，技能已生效' : '引擎重启失败: ' + (r.error || '未知错误'))
+      setToast(r.ok ? '引擎已重启' : '引擎重启失败: ' + (r.error || '未知错误'))
     } catch (e) {
       setToast('引擎重启失败: ' + e.message)
     }
@@ -1453,12 +1662,18 @@ export default function App() {
     document.body.classList.add('resizing', 'resizing-v')
   }
 
-  // 保存设置（主进程加密存储 + 写配置；restart=true 时重启引擎生效；note 可覆盖提示文案）
+  // 保存设置（主进程加密存储 + 写配置；restart=true 时优先热重载生效、失败自动回退重启引擎；note 可覆盖提示文案）
   const saveSettings = async (form, restart = true, note = '') => {
     try {
-      await api.saveSettings(form, restart)
+      const r = await api.saveSettings(form, restart)
+      if (r && r.ok === false) {
+        setToast(r.error || '保存失败')
+        return
+      }
       setSettingsOpen(false)
-      setToast(note || (restart ? '设置已保存，引擎已重启生效' : '设置已保存，重启引擎后生效'))
+      const applied = r && r.applied
+      const fallback = note || (restart ? (applied === 'hot' ? '设置已保存，已热更新生效（无需重启）' : '设置已保存，引擎已重启生效') : '设置已保存，重启引擎后生效')
+      setToast(fallback)
       loadModels() // 立即刷新聊天框模型下拉与设置面板数据
     } catch (e) {
       setToast('保存失败: ' + e.message)
@@ -2286,19 +2501,28 @@ export default function App() {
               <div className="perm-cmd">
                 <code>{perm.metadata.command}</code>
               </div>
-            ) : (
-              perm.patterns && perm.patterns.length > 0 && (
-                <div className="perm-cmd">
-                  {[...new Set(perm.patterns)].map((s, i) => (
-                    <code key={i}>{s}</code>
-                  ))}
-                </div>
-              )
-            )}
+            ) : perm.patterns && perm.patterns.length > 0 ? (
+              <div className="perm-cmd">
+                {[...new Set(perm.patterns)].map((s, i) => (
+                  <code key={i}>{s}</code>
+                ))}
+              </div>
+            ) : perm.resources && perm.resources.length > 0 ? (
+              // V2：引擎在 permission.asked 中给出 resources（如待执行的命令、待写入的路径）
+              <div className="perm-cmd">
+                {[...new Set(perm.resources)].map((s, i) => (
+                  <code key={i}>{s}</code>
+                ))}
+              </div>
+            ) : null}
             <div className="perm-btns">
               <button onClick={() => respondPerm('reject')}>拒绝</button>
               <button onClick={() => respondPerm('once')}>允许一次</button>
-              <button className="primary" onClick={() => respondPerm('always')}>
+              <button
+                className="primary"
+                onClick={() => respondPerm('always')}
+                title={perm.save && perm.save.length ? '将保存规则：' + perm.save.join('、') : undefined}
+              >
                 总是允许
               </button>
             </div>
@@ -3366,6 +3590,15 @@ function GroupCard({
       el.style.height = target + 'px'
       prevH.current = target
     })
+    // 编辑态下表单内容高度变化（拖拽模型 ID 输入框右下角抓手拉高）时同步容器高度，
+    // 否则容器 overflow:hidden 会把拉高后超出部分裁掉导致内容不可见
+    if (!editing) return
+    const ro = new ResizeObserver(() => {
+      el.style.height = form.offsetHeight + 'px'
+      prevH.current = form.offsetHeight
+    })
+    ro.observe(form)
+    return () => ro.disconnect()
   }, [editing])
   return (
     <div className={`mg-anim ${editing ? 'editing' : ''}`} ref={boxRef}>
@@ -3576,8 +3809,10 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, appConfig, o
 
   // 「保存」：模型/权限/配置仅写设置不关闭（可见保存提示）；界面设置主题已即时保存；关于页无表单
   const handleSave = () => {
-    if (tab === 'model') onSave(form, false)
-    else if (tab === 'permission') onSave(form, false, '权限设置已保存，将应用于之后新建的会话')
+    // 模型页「保存」仅持久化（应用走右侧「保存并生效」）；权限页「保存」即时热更新生效（无需重启）
+    // 不传 note：由主进程返回的 applied（hot/restart/none）决定准确提示，避免"声称热更新、实际重启"
+    if (tab === 'model') onSave(form, false, '模型设置已保存（点「保存并生效」即时应用）')
+    else if (tab === 'permission') onSave(form, true)
     else if (tab === 'config') {
       if (!configForm) return
       // 多行字段按行拆分还原为数组；数值字段原样传递（主进程 sanitize 做类型/范围校验）
@@ -3668,7 +3903,7 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, appConfig, o
                 )}
               </div>
 
-              <div className="set-hint">模型设置保存并重启引擎后生效；任务执行中不可保存。</div>
+              <div className="set-hint">模型设置保存后即时热更新生效（个别情况自动回退为重启引擎）；任务执行中不可保存。</div>
             </>
           ) : tab === 'config' ? (
             <>
@@ -3798,7 +4033,7 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, appConfig, o
               </div>
 
               <div className="set-hint">
-                权限配置保存并重启引擎后全局生效：新会话按全局规则执行；
+                权限配置保存后即时热更新生效（无需重启引擎）：新会话按全局规则执行，进行中的任务不受影响；
                 <br />
                 注意：历史会话中曾被设为「禁止」的操作类型仍会直接拒绝，需新建会话才彻底放开。
               </div>
@@ -3991,13 +4226,13 @@ function SettingsPanel({ data, busy, theme, appInfo, engineVersion, appConfig, o
           )}
           </div>
 
-          {/* 面板级底部按钮：始终显示「取消」「保存」；模型设置另需「保存并重启」 */}
+          {/* 面板级底部按钮：始终显示「取消」「保存」；模型设置另需「保存并生效」 */}
           <div className="settings-footer">
             <button onClick={onClose}>取消</button>
             <button onClick={handleSave}>保存</button>
             {tab === 'model' && (
               <button className="primary" disabled={busy} onClick={() => onSave(form, true)}>
-                保存并重启引擎
+                保存并生效
               </button>
             )}
           </div>
@@ -4451,7 +4686,8 @@ function TextBlock({ text, streamed, revealTo }) {
 }
 
 // 打字机组件：每 25ms 揭示 2 个字符，把引擎的整块 delta 平滑为逐字输出。
-// 用 ref 记录已揭示长度，文本增长时持续追赶而不重置；揭示完成后渲染 Markdown。
+// 用 ref 记录已揭示长度，文本增长时持续追赶而不重置。
+// 全程对已揭示文本渲染 Markdown（单一渲染路径），避免流式中格式/纯文本来回切换闪烁。
 // startFrom：初始已揭示长度（0 = 从空开始；恢复会话传已累积文本长度避免重新打印）
 function TypewriterText({ text, startFrom }) {
   const textRef = useRef(text)
@@ -4467,13 +4703,9 @@ function TypewriterText({ text, startFrom }) {
     }, 25)
     return () => clearInterval(timer)
   }, [])
-  if (shown >= text.length) {
-    return <div className="md-body" dangerouslySetInnerHTML={{ __html: marked.parse(text) }} />
-  }
+  // 打字机落后时容器挂 .streaming，光标由 CSS 伪元素渲染在最后一个块级内容的行尾
+  const lagging = shown < text.length
   return (
-    <div className="streaming">
-      {text.slice(0, shown)}
-      <span className="cursor" />
-    </div>
+    <div className={'md-body' + (lagging ? ' streaming' : '')} dangerouslySetInnerHTML={{ __html: marked.parse(text.slice(0, shown)) }} />
   )
 }

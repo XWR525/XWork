@@ -1,10 +1,32 @@
-// opencode 引擎进程管理：检测/启动/健康检查/退出监听
+// opencode V2 引擎进程管理：检测/启动/健康检查/退出监听
 const { spawn, execSync } = require('node:child_process')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
 const { cfg } = require('./config')
 
 const DEFAULT_PORT = cfg.enginePort
+
+// V2 引擎强制 HTTP Basic Auth：用户名固定 opencode，密码用环境变量 OPENCODE_SERVER_PASSWORD 固定。
+// 密码由 XDG 数据目录路径确定性派生（非随机）：同机多实例 / 应用重启后重连同一数据目录的引擎都能算出同一密码，
+// 「端口已有健康服务则复用」逻辑得以保留；外部无关进程因密码不同而健康检查失败，仍走 killPortOwner 清理
+function serverPasswordFor(xdgHome) {
+  // 路径规范化后再派生：分隔符统一为 /、折叠重复分隔符、去尾斜杠、小写。
+  // 同一数据目录的不同书写形式（D:\a\b / d:/a/b / D:\\a\\b / 带尾斜杠）必须得到同一密码，
+  // 否则多实例复用与外部工具连接会 401（实测踩过）
+  const norm = String(xdgHome || '')
+    .replace(/\\/g, '/')
+    .replace(/\/{2,}/g, '/')
+    .replace(/\/+$/, '')
+    .toLowerCase()
+  const h = crypto.createHash('sha256').update('xwork-opencode-v2:' + norm).digest('base64url')
+  return 'xw-' + h.slice(0, 32)
+}
+
+// Basic Auth 请求头值
+function basicAuthHeader(password) {
+  return 'Basic ' + Buffer.from('opencode:' + (password || '')).toString('base64')
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -35,11 +57,11 @@ function killPortOwner(port) {
 }
 
 // 等待端口不再有健康服务（taskkill 后进程释放端口需要一点时间，避免紧随其后的 spawn 端口冲突）
-function waitPortFree(port, timeoutMs = cfg.timings.portFreeTimeoutMs) {
+function waitPortFree(port, timeoutMs = cfg.timings.portFreeTimeoutMs, password = '') {
   return new Promise((resolve) => {
     const start = Date.now()
     const poll = async () => {
-      const h = await healthCheck(port, 400).catch(() => null)
+      const h = await healthCheck(port, 400, password).catch(() => null)
       if (!h || !h.healthy) return resolve(true)
       if (Date.now() - start >= timeoutMs) return resolve(false)
       setTimeout(poll, 150)
@@ -48,17 +70,18 @@ function waitPortFree(port, timeoutMs = cfg.timings.portFreeTimeoutMs) {
   })
 }
 
-// 探测 opencode 可执行文件位置：打包版随应用分发 → 环境变量 → npm 全局安装目录
+// 探测 opencode V2 可执行文件位置：打包版随应用分发 → 环境变量 → npm 全局安装目录
+// V2 分发渠道为 npm 包 opencode2（平台二进制包 opencode2-windows-x64，bin/opencode2.exe）
 function findOpencodeExe() {
   const cands = []
-  // 打包版：opencode.exe 随安装包分发在应用 resources/engine 目录（extraResources）
+  // 打包版：引擎 exe 随安装包分发在应用 resources/engine 目录（extraResources，M8 换 V2 exe 后保持同名）
   if (process.resourcesPath) cands.push(path.join(process.resourcesPath, 'engine', 'opencode.exe'))
   if (process.env.XWORK_OPENCODE_PATH) cands.push(process.env.XWORK_OPENCODE_PATH)
   const npmRoot = path.join(process.env.APPDATA || '', 'npm', 'node_modules')
   cands.push(
-    path.join(npmRoot, 'opencode-ai', 'node_modules', 'opencode-windows-x64', 'bin', 'opencode.exe'),
-    path.join(npmRoot, 'opencode-ai', 'bin', 'opencode.exe'),
-    path.join(npmRoot, 'opencode-ai', 'opencode.exe')
+    path.join(npmRoot, 'opencode2', 'node_modules', 'opencode2-windows-x64', 'bin', 'opencode2.exe'),
+    path.join(npmRoot, 'opencode2-windows-x64', 'bin', 'opencode2.exe'),
+    path.join(npmRoot, 'opencode2', 'bin', 'opencode2.exe')
   )
   for (const c of cands) {
     if (c && fs.existsSync(c)) return c
@@ -67,12 +90,15 @@ function findOpencodeExe() {
 }
 
 // 重定向 XDG 目录到应用数据目录（规避安全软件对用户目录写入的拦截）
+// 注意 V2 目录布局：config/data/state 随 XDG 重定向（引擎在其下建 opencode2 子目录）；
+// cache 不随 DATA/STATE 重定向，需显式设 XDG_CACHE_HOME，否则落在用户全局 ~/.cache
 function xdgEnv(xdgHome) {
   const env = {
     ...process.env,
     XDG_CONFIG_HOME: path.join(xdgHome, 'config'),
     XDG_STATE_HOME: path.join(xdgHome, 'state'),
-    XDG_DATA_HOME: path.join(xdgHome, 'data')
+    XDG_DATA_HOME: path.join(xdgHome, 'data'),
+    XDG_CACHE_HOME: path.join(xdgHome, 'cache')
   }
   // 内置 git（MinGit，随包分发在 resources/git）：存在则注入 PATH 最前。
   // 引擎的快照/撤销依赖 git 命令（实测：PATH 无 git 时 revert 静默失败），
@@ -107,13 +133,22 @@ function findGit() {
   }
 }
 
-async function healthCheck(port, timeoutMs = cfg.timings.engineHealthTimeoutMs) {
+// 健康检查：V2 为 GET /api/info（需 Basic Auth），须校验响应体确为 V2 info JSON。
+// 关键：老引擎（如 1.18.x）虽无 /api/info 路由，但未匹配路由会回退成 Web UI 的 HTML 且 HTTP 200，
+// 若不校验载荷会把「别的引擎」误判为健康而直接复用（实测踩坑：dev 复用了安装版 V1 引擎）
+async function healthCheck(port, timeoutMs = cfg.timings.engineHealthTimeoutMs, password = '') {
   const ctrl = new AbortController()
   const t = setTimeout(() => ctrl.abort(), timeoutMs)
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/global/health`, { signal: ctrl.signal })
+    const headers = {}
+    if (password) headers.Authorization = basicAuthHeader(password)
+    const res = await fetch(`http://127.0.0.1:${port}/api/info`, { signal: ctrl.signal, headers })
     if (!res.ok) return null
-    return await res.json()
+    const ct = String(res.headers.get('content-type') || '')
+    if (!ct.includes('json')) return null // HTML 回退页 = 该服务不是 V2 引擎
+    const body = await res.json()
+    if (!body || typeof body !== 'object' || typeof body.version !== 'string') return null
+    return { healthy: true, version: body.version }
   } catch {
     return null
   } finally {
@@ -128,23 +163,26 @@ class Engine {
     this.exe = opts.exePath || findOpencodeExe()
     this.extraEnv = opts.extraEnv || null // 额外环境变量（模型 API Key 等）
     this.cwd = opts.cwd || null // 工作区目录（null = 继承主进程启动目录）
+    this.password = opts.serverPassword || serverPasswordFor(opts.xdgHome || '') // Basic Auth 密码（确定性派生，见 serverPasswordFor）
     this.child = null
     this.owned = false
     this.onExit = opts.onExit || null
   }
 
-  // 切换工作区目录（配合 stop + start 生效）
+  // 记录「当前工作区」：V2 下引擎进程的启动目录（cwd）只是默认 location，
+  // 会话创建时会显式带上 location.directory（见 bridge.createSession），因此切换工作区不再需要换进程。
+  // 仅在引擎未运行时（崩溃/首次启动）由 doStart 使用该 cwd 作为新进程的启动目录。
   setCwd(dir) {
     this.cwd = dir || null
   }
 
-  // 当前工作区：显式目录或默认启动目录
+  // 当前工作区（会话归属目录；可能不等于引擎进程的启动目录）
   workspace() {
     return this.cwd || process.cwd()
   }
 
   async status() {
-    const h = await healthCheck(this.port)
+    const h = await healthCheck(this.port, cfg.timings.engineHealthTimeoutMs, this.password)
     if (h && h.healthy) {
       return { running: true, version: h.version, port: this.port, owned: this.owned, workspace: this.workspace() }
     }
@@ -152,7 +190,9 @@ class Engine {
   }
 
   // 若端口已有健康服务则复用；否则拉起新进程
-  // force=true：跳过「端口已有健康服务则复用」，强制拉起新进程（切换工作区必须换进程，cwd 是进程级属性）
+  // force=true：跳过「端口已有健康服务则复用」，强制拉起新进程。
+  // 现主要用于「保存设置需要新环境变量（模型 Key）」「引擎端口变更」「显式重启」等场景；
+  // 切换工作区已不再依赖换进程（V2 location + 配置热重载，见 index.js workspace:switch）
   // 启动互斥：app 初始化与渲染进程 engine:start 可能并发调用，避免重复 spawn 两个进程争抢同一端口
   start({ force = false } = {}) {
     if (this._starting) return this._starting
@@ -168,7 +208,7 @@ class Engine {
   async doStart(force) {
     console.log('[engine] start() force=', force, 'cwd=', this.cwd, 'child=', this.child?.pid || null)
     if (!force) {
-      const existing = await healthCheck(this.port, 2000)
+      const existing = await healthCheck(this.port, 2000, this.password)
       if (existing && existing.healthy) {
         console.log('[engine] start(): reusing healthy engine (no restart)')
         this.owned = false
@@ -176,14 +216,18 @@ class Engine {
       }
     }
     if (!this.exe) {
-      throw new Error('opencode executable not found, set env XWORK_OPENCODE_PATH to opencode.exe')
+      throw new Error(
+        '未找到 opencode V2 引擎（opencode2.exe）\n' +
+          '请安装：npm i -g opencode2（国内源：npm i -g opencode2 --registry=https://registry.npmmirror.com）\n' +
+          '或设置环境变量 XWORK_OPENCODE_PATH 指向 opencode2.exe'
+      )
     }
     // 回收残留 child（并发启动冲突进程等），避免多个 opencode 争抢端口
     if (this.child) {
       console.log('[engine] start(): cleaning stale child pid=', this.child.pid)
       await this.stop()
     }
-    for (const d of ['config', 'state', 'data']) {
+    for (const d of ['config', 'state', 'data', 'cache']) {
       fs.mkdirSync(path.join(this.xdgHome, d), { recursive: true })
     }
     // cwd 不存在时 Windows 上 spawn 抛 ENOENT（错误对象指向 exe 路径，极易误导为引擎缺失）：
@@ -191,12 +235,31 @@ class Engine {
     if (this.cwd && !fs.existsSync(this.cwd)) {
       throw new Error('工作区目录不存在: ' + this.cwd)
     }
+    // 端口预清理：走到这里说明端口健康检查（含密码）未通过，占用者必非本应用可用引擎
+    // （残留 V1 引擎 / 异密码 V2 引擎 / 无关进程）。V2 强制认证后无法像 V1 那样直接复用外部引擎，
+    // 不清理则新进程 EADDRINUSE 退出 → 白白等满启动超时
+    if (killPortOwner(this.port)) {
+      console.log('[engine] start(): killed foreign/stale port owner before spawn')
+      await waitPortFree(this.port, cfg.timings.portFreeTimeoutMs, this.password)
+    }
+    // 额外环境变量（模型 API Key 等）只在 spawn 时生效：记录「本次注入的变量名 + 值指纹」，
+    // 供配置热重载判定「该改动能否热生效」——新增/更换 Key 必须重启进程才能生效（见 index.js tryHotReload）
+    const extraEnvVars = this.extraEnv ? this.extraEnv() : {}
+    this.envFingerprint = {}
+    for (const [k, v] of Object.entries(extraEnvVars)) {
+      this.envFingerprint[k] = crypto.createHash('sha1').update(String(v)).digest('hex').slice(0, 16)
+    }
     const child = spawn(
       this.exe,
       ['serve', '--port', String(this.port), '--hostname', '127.0.0.1'],
       {
         cwd: this.cwd || undefined, // 工作区 = 引擎启动目录（opencode 项目根）
-        env: { ...xdgEnv(this.xdgHome), ...(this.extraEnv ? this.extraEnv() : {}) },
+        env: {
+          ...xdgEnv(this.xdgHome),
+          // V2 强制 Basic Auth：固定密码（与 bridge 共用，见 serverPasswordFor）
+          OPENCODE_SERVER_PASSWORD: this.password,
+          ...extraEnvVars
+        },
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
         // detached：引擎脱离本实例进程树/job（Windows 上 libuv 同时带 CREATE_BREAKAWAY_FROM_JOB）。
@@ -224,10 +287,10 @@ class Engine {
     const startDeadline = Date.now() + cfg.timings.engineStartTimeoutMs
     while (Date.now() < startDeadline) {
       await sleep(500)
-      const h = await healthCheck(this.port, 1000)
+      const h = await healthCheck(this.port, 1000, this.password)
       if (h && h.healthy) return await this.status()
     }
-    throw new Error('opencode 启动超时\n' + outBuf.slice(-1500))
+    throw new Error('opencode2 启动超时\n' + outBuf.slice(-1500))
   }
 
   // 停止引擎并等待进程真正退出。Windows 上 kill() 是异步终止，必须等 'exit' 事件，
@@ -240,7 +303,7 @@ class Engine {
       // 否则后续 force 重启 / 退出后旧进程仍以旧环境变量（旧 key）占着端口，新配置无法生效
       const killed = killPortOwner(this.port)
       console.log('[engine] stop(): no own child, killed port owner=', killed)
-      if (killed) await waitPortFree(this.port)
+      if (killed) await waitPortFree(this.port, cfg.timings.portFreeTimeoutMs, this.password)
       return
     }
     this.child = null
@@ -264,4 +327,4 @@ class Engine {
   }
 }
 
-module.exports = { Engine, findOpencodeExe, healthCheck, DEFAULT_PORT, findGit }
+module.exports = { Engine, findOpencodeExe, healthCheck, serverPasswordFor, basicAuthHeader, DEFAULT_PORT, findGit }

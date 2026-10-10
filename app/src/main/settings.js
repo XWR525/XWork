@@ -1,6 +1,6 @@
 // 设置持久化：模型配置（自定义模型组）
 // - apiKey 用 Electron safeStorage 加密存储（Windows DPAPI）
-// - 应用时写入 opencode.json 的 provider 段（apiKey 用 {env:VAR} 引用，规避明文落盘）
+// - 应用时写入 opencode.json（V2）的 providers 段（apiKey 用 {env:VAR} 引用，规避明文落盘）
 // - 引擎启动时注入对应环境变量
 const fs = require('node:fs')
 const path = require('node:path')
@@ -22,15 +22,15 @@ const DEFAULT_SETTINGS = {
   theme: 'light', // 界面主题：dark | light（仅影响渲染层，不参与引擎配置）
   closeAction: 'quit', // 点击关闭按钮时的动作：quit = 关闭程序（默认）| tray = 最小化到托盘
   notifyTask: true, // 任务通知：AI 完成回复 / 向你提问时弹系统通知（仅窗口不在前台时）
-  // 权限策略：AI 各操作类型的三档配置（创建会话时转为 opencode 规则数组）
+  // 权限策略：AI 各操作类型的三档配置（生成 V2 permissions 规则数组）
   // 默认严格档：全部操作需询问；用户可在设置面板「权限」页切换为 标准/宽松 档
+  // 注：V2 已取消 list 动作，此处不再保留该键（历史设置中的该键会被 sanitize 丢弃）
   permission: {
     read: 'ask',
     edit: 'ask',
     bash: 'ask',
     glob: 'ask',
     grep: 'ask',
-    list: 'ask',
     webfetch: 'ask',
     websearch: 'ask',
     task: 'ask',
@@ -45,7 +45,8 @@ const DEFAULT_SETTINGS = {
 // 权限类型白名单：仅接受这些 key 的用户配置；其余类型由渲染层固定处理（内部低风险 allow / doom_loop ask）
 const PERMISSION_KEYS = Object.keys(DEFAULT_SETTINGS.permission)
 // 内部低风险权限类型固定放行（与渲染层 App.jsx 的 INTERNAL_ALLOW_PERMS 保持一致，需同步修改）
-const INTERNAL_ALLOW_PERMS = ['todowrite', 'todoread', 'skill', 'lsp', 'codesearch']
+// V2 动作集中仅 skill 仍属内部低风险（todowrite/todoread/lsp/codesearch 已无对应动作）
+const INTERNAL_ALLOW_PERMS = ['skill']
 const PERMISSION_ACTIONS = ['allow', 'ask', 'deny']
 
 // 校验并归一化权限配置：只保留合法 key 与合法取值，缺失项回退默认
@@ -220,8 +221,8 @@ const XWORK_IDENTITY = `# XWork 身份声明
 回复用户时始终使用中文（这是固定要求）：所有叙述、解释、总结、提问、反馈一律用中文输出；代码、命令、文件名、API 名称、专有名词等可保留原文，但围绕它们的说明文字必须是中文。除非用户在本条会话中明确要求使用其它语言，否则不要切换为英文或其它语言。
 `
 
-// 将设置应用到 opencode.json（保留既有字段，按模型组写入/移除自定义 provider）
-// opts.allPermissions=true：任务引擎配置（无人值守，全部操作类型 allow，不弹确认框；question 由事件流自动应答）
+// 将设置应用到 opencode.json（V2 原生格式：providers 映射 + permissions 有序规则数组）
+// opts.allPermissions=true：任务引擎配置（无人值守，一条通配 allow 规则，不弹确认框；question 由事件流自动应答）
 function applyToOpencode(configFile, settings, opts = {}) {
   const s = settings.load()
   let cfg = { $schema: 'https://opencode.ai/config.json' }
@@ -230,27 +231,29 @@ function applyToOpencode(configFile, settings, opts = {}) {
   } catch {
     /* 配置不存在或损坏则用默认 */
   }
-  // 先移除旧版本遗留 provider（内置 deepseek / 旧 xwork-custom）与当前所有模型组 provider
-  // （整体重写，保证删除的组被清除；deepseek 已改由模型组配置）
-  if (cfg.provider) {
-    for (const key of Object.keys(cfg.provider)) {
-      if (key === 'deepseek' || key === 'xwork-custom' || key.startsWith(GROUP_PREFIX)) {
-        delete cfg.provider[key]
-      }
+  // 清理 V1 遗留段（V2 虽可自动归一化，但原生格式 diff 可控，不依赖归一化层）
+  delete cfg.provider
+  delete cfg.permission
+  // 模型组整体重写：**先移除全部旧的 xgroup-* provider**，再按当前设置写入。
+  // 只增不删会导致「设置里删掉的模型组仍留在引擎里」（可被选到），且其 {env:} 引用在引擎进程中不存在，
+  // 会让配置热重载的环境守卫永远判定「必须重启」（实测踩坑）
+  const groups = (s.modelGroups || []).filter((g) => g.baseURL && g.models.length)
+  if (cfg.providers && typeof cfg.providers === 'object') {
+    for (const key of Object.keys(cfg.providers)) {
+      if (key.startsWith(GROUP_PREFIX)) delete cfg.providers[key]
     }
-    if (!Object.keys(cfg.provider).length) delete cfg.provider
+    if (!Object.keys(cfg.providers).length) delete cfg.providers
   }
   // 写入每个模型组：一组 = 一个 OpenAI 兼容 provider，models 为该组全部模型 ID
-  const groups = (s.modelGroups || []).filter((g) => g.baseURL && g.models.length)
   if (groups.length) {
-    cfg.provider = cfg.provider || {}
+    cfg.providers = cfg.providers || {}
     for (const g of groups) {
       const models = {}
       for (const m of g.models) models[m] = { name: m }
-      cfg.provider[g.id] = {
-        npm: '@ai-sdk/openai-compatible',
+      cfg.providers[g.id] = {
+        package: 'aisdk:@ai-sdk/openai-compatible',
         name: g.name,
-        options: {
+        settings: {
           baseURL: g.baseURL,
           apiKey: '{env:' + envVarOf(g.id) + '}'
         },
@@ -258,27 +261,45 @@ function applyToOpencode(configFile, settings, opts = {}) {
       }
     }
   }
-  // 权限规则：任务引擎全 allow；普通引擎按设置档（11 项 + 内部固定项 + doom_loop）
-  const permission = {}
-  if (opts.allPermissions) {
-    // 覆盖 opencode 已知操作类型，全部放行（无人值守不弹确认框）
-    const ALL_KEYS = new Set([
-      ...PERMISSION_KEYS,
-      ...INTERNAL_ALLOW_PERMS,
-      'doom_loop', 'write', 'tool', 'agent', 'exact', 'ask',
-      'image', 'timeout', 'output', 'scope', 'permission', 'mcp', 'schema', 'env', 'notification', 'admin'
-    ])
-    for (const k of ALL_KEYS) permission[k] = 'allow'
-  } else {
-    for (const k of PERMISSION_KEYS) permission[k] = s.permission?.[k] || 'ask'
-    for (const k of INTERNAL_ALLOW_PERMS) permission[k] = 'allow'
-    permission.doom_loop = 'ask'
-  }
-  cfg.permission = permission
+  cfg.permissions = buildPermissionRules(s, opts)
   fs.mkdirSync(path.dirname(configFile), { recursive: true })
   fs.writeFileSync(configFile, JSON.stringify(cfg, null, 2))
-  // 注入 AI 身份指令：写入同目录的全局 AGENTS.md，opencode 自动加载，无需改动 opencode.json
+  // 注入 AI 身份指令：写入同目录的全局 AGENTS.md，opencode 启动时自动加载，无需改动 opencode.json
   fs.writeFileSync(path.join(path.dirname(configFile), 'AGENTS.md'), XWORK_IDENTITY)
+}
+
+// XWork 设置存储键（V1 命名）→ V2 权限 action 的映射（存储层不动，仅生成引擎配置时转换）
+const V2_ACTION_MAP = {
+  read: 'read',
+  edit: 'edit',
+  bash: 'shell', // V2 改名：bash → shell
+  glob: 'glob',
+  grep: 'grep',
+  // list：V2 已取消该动作类型，跳过
+  webfetch: 'webfetch',
+  websearch: 'websearch',
+  task: 'subagent', // V2 改名：task → subagent
+  external_directory: 'external_directory',
+  question: 'question'
+}
+
+// 生成 V2 permissions 规则数组（有序，最后匹配胜出）
+// 任务引擎全放行 = 一条通配规则；普通引擎 = 各操作类型三档 + 内部低风险（skill）放行
+function buildPermissionRules(s, opts = {}) {
+  if (opts.allPermissions) {
+    return [{ action: '*', resource: '*', effect: 'allow' }]
+  }
+  const rules = []
+  for (const k of PERMISSION_KEYS) {
+    const action = V2_ACTION_MAP[k]
+    if (!action) continue
+    rules.push({ action, resource: '*', effect: s.permission?.[k] || 'ask' })
+  }
+  // 内部固定放行：V2 仅保留 skill 动作（todowrite/todoread/lsp/codesearch 已无对应动作）
+  if (INTERNAL_ALLOW_PERMS.includes('skill')) {
+    rules.push({ action: 'skill', resource: '*', effect: 'allow' })
+  }
+  return rules
 }
 
 module.exports = { Settings, applyToOpencode, MASK }

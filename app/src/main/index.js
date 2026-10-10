@@ -17,11 +17,12 @@ if (process.platform === 'win32') {
 }
 const path = require('node:path')
 const fs = require('node:fs')
+const crypto = require('node:crypto')
 const { execSync } = require('node:child_process')
 const { Engine, findGit } = require('./engine')
 const { Bridge } = require('./bridge')
 const { Settings, applyToOpencode, MASK } = require('./settings')
-const { restoreMissingFiles, collectUndoImpact } = require('./undo')
+const { restoreMissingFiles, restoreWorkspaceToSnapshot, collectUndoImpact } = require('./undo')
 const { TaskStore, Scheduler, isValidCron, nextRunAfter, normalizeTask, describeCron } = require('./tasks')
 const { TaskRunner } = require('./task-runner')
 const logger = require('./logger')
@@ -115,7 +116,8 @@ const xdgHome =
 
 // 设置存储与 opencode 配置文件
 const settings = new Settings(path.join(xdgHome, 'xwork-settings.json'))
-const opencodeConfig = path.join(xdgHome, 'config', 'opencode', 'opencode.json')
+// V2 引擎配置文件路径：config 目录名改为 opencode2（V1 为 config/opencode），由 applyToOpencode 写入
+const opencodeConfig = path.join(xdgHome, 'config', 'opencode2', 'opencode.json')
 
 // 定时任务：任务存储 / 执行器 / 调度器
 // 调度器启动/停止随应用生命周期（仅应用运行时任务执行）；任务引擎惰性拉起，空闲 5 分钟回收
@@ -295,7 +297,7 @@ app.whenReady().then(async () => {
       }
     }
   })
-  bridge = new Bridge(effectiveConfig().enginePort)
+  bridge = new Bridge(effectiveConfig().enginePort, { password: engine.password }) // 与引擎共用派生密码（Basic Auth）
   createWindow()
   createTray()
   try {
@@ -492,7 +494,10 @@ ipcMain.handle('workspace:register', async (_e, dir) => {
   return { ok: true }
 })
 
-// 切换工作区：持久化路径 → 重启引擎（新 cwd）→ 返回新状态
+// 切换工作区：持久化路径 + 静默 git init + 触发配置热重载（**不重启引擎进程**）
+// V2 的 location 机制允许单个引擎进程服务多个目录：会话自带 location.directory，
+// 因此切换工作区只需（a）记录当前工作区（新会话按它带 location）（b）让引擎加载新目录的配置。
+// 兜底：引擎未运行（如崩溃后）时按常规启动一次，新进程的启动目录即新工作区。
 ipcMain.handle('workspace:switch', async (_e, dir) => {
   if (!dir || typeof dir !== 'string') return { ok: false, error: '无效的目录路径' }
   let stat
@@ -506,12 +511,25 @@ ipcMain.handle('workspace:switch', async (_e, dir) => {
   settings.save({ workspace: dir })
   // 工作区建立时静默 git init（引擎快照依赖：每轮对话前写入，事后 init 无法追溯此前轮次）
   ensureWorkdirGit(dir, { init: true })
-  engine.setCwd(dir)
-  await engine.stop()
-  console.log('[ws] stop done, forcing restart')
-  const st = await engine.start({ force: true }) // 强制新进程：cwd 是进程级属性，必须换进程才生效
-  console.log('[ws] restart done, running=', st.running, 'workspace=', st.workspace)
-  return { ok: true, status: st }
+  engine.setCwd(dir) // 记录当前工作区：新会话以此为 location（引擎进程的启动目录不变）
+  const st0 = await engine.status().catch(() => ({ running: false }))
+  let mode = 'none'
+  if (!st0.running) {
+    // 引擎不在运行：常规启动（新进程启动目录 = 新工作区，天然一致）
+    const st = await engine.start()
+    console.log('[ws] engine was down, started with new workspace; running=', st.running)
+    return { ok: true, status: st, mode: 'started' }
+  }
+  try {
+    await bridge.locationReload() // 让引擎重新读取（新目录的）配置；实测不打断进行中的任务
+    mode = 'hot'
+  } catch (e) {
+    console.warn('[ws] location reload failed, keep current process:', e.message)
+    mode = 'noop'
+  }
+  const st = await engine.status()
+  console.log('[ws] switch done (no restart), mode=', mode, 'workspace=', dir)
+  return { ok: true, status: { ...st, workspace: dir }, mode }
 })
 
 // 懒加载读取目录（文件树用，单层）
@@ -611,90 +629,95 @@ ipcMain.handle('file:show-in-folder', (_e, abs) => {
 ipcMain.handle('session:list', () => bridge.listSessions())
 
 ipcMain.handle('session:create', (_e, { title, permission }) =>
-  bridge.createSession(title, permission)
+  // 显式带上当前工作区作为 location：V2 单进程可服务多目录，会话按 location 归属（切换工作区不再换进程）
+  bridge.createSession(title, permission, engine.workspace())
 )
 
 ipcMain.handle('session:delete', (_e, sessionID) => bridge.deleteSession(sessionID))
 
 ipcMain.handle('session:rename', (_e, sessionID, title) => bridge.renameSession(sessionID, title))
 
-// 目标轮次前快照 T_before：消息 part 的 step-start/step-finish 携带引擎 track() 的 write-tree 结果（实测确认），
-// 即每轮「操作完成后」的快照。回退到目标 user 消息之前 → 工作区应回到「目标轮次开始前」的状态：
-//   取目标消息之前最后一条带 snapshot 的 part；
-//   若目标消息之前无任何快照（目标消息是会话首条），取目标轮首个 step-start 的快照（同为轮次开始前状态）
-async function snapshotBeforeMessage(bridge, sessionID, messageID) {
+// 目标轮次前快照 T_before（V2 版）：V2 把快照挂在 assistant 条目上（snapshot{start,end,files}，
+// start = 本轮编辑前 tree，end = 本轮编辑后 tree —— 实测确认，见迁移文档 §14）。
+// 回退到目标 user 消息之前 → 取目标轮次首个 assistant 的 snapshot.start；
+// 若目标轮无 assistant（异常）→ 退化为目标之前最后一条 assistant 的 snapshot.end
+// 返回 { tBefore, touched: [本轮及之后被触碰的文件] }
+async function undoSnapshotInfo(bridge, sessionID, messageID) {
   try {
     const msgs = await bridge.getMessages(sessionID)
-    let lastBefore = null
-    for (const m of msgs || []) {
-      if (m.info && m.info.id === messageID) break
-      for (const p of m.parts || []) {
-        if (typeof p.snapshot === 'string' && p.snapshot) lastBefore = p.snapshot
+    const ti = (msgs || []).findIndex((m) => m.info && m.info.id === messageID)
+    if (ti < 0) return { tBefore: null, touched: [] }
+    let tBefore = null
+    for (let i = ti + 1; i < msgs.length && !tBefore; i++) {
+      const sn = msgs[i].info?.snapshot
+      if (msgs[i].info?.role === 'assistant' && sn?.start) tBefore = sn.start
+    }
+    if (!tBefore) {
+      for (let i = ti - 1; i >= 0 && !tBefore; i--) {
+        const sn = msgs[i].info?.snapshot
+        if (msgs[i].info?.role === 'assistant' && sn?.end) tBefore = sn.end
       }
     }
-    if (lastBefore) return lastBefore
-    let sawTarget = false
-    for (const m of msgs || []) {
-      if (m.info && m.info.id === messageID) {
-        sawTarget = true
-        continue
-      }
-      if (!sawTarget) continue
-      for (const p of m.parts || []) {
-        if (typeof p.snapshot === 'string' && p.snapshot) return p.snapshot
-      }
+    // 被回退轮次（目标轮及之后）触碰过的文件：用于精确还原/删除
+    const touched = new Set()
+    for (let i = ti; i < msgs.length; i++) {
+      const sn = msgs[i].info?.snapshot
+      if (sn && Array.isArray(sn.files)) for (const f of sn.files) if (f) touched.add(f)
     }
-    return null
+    return { tBefore, touched: [...touched] }
   } catch {
-    return null
+    return { tBefore: null, touched: [] }
   }
 }
 
-// 撤销到指定 user 消息之前（「回退至此」）：回退该消息及之后的全部文件变更与会话状态
-// bridge.revertMessage 已兜底「引擎返回 200 但无快照」的静默失败（非 git 工作区等），不会误报成功
-// 引擎 revert 存在缺陷：被改名/删除的旧文件不恢复（旧名不在任何 patch 的 files 列表，见 undo功能设计.md §7.4），
-// 兜底参照采用「目标轮次前快照 T_before」而非 revert 返回的「操作后快照」：
-// 回退后工作区应等于 T_before 状态，T_before 有、工作区缺的文件即漏恢复的旧文件，按路径恢复
+// 撤销到指定 user 消息之前（「回退至此」）：回退该消息及之后的会话状态与文件变更。
+// V2 实现要点（实测，见迁移文档 §14）：
+//   - 引擎 revert 为三段式：stage（暂存）→ commit（生效）/ clear（取消）
+//   - 引擎只裁剪会话，完全不恢复文件 → 文件补偿由 XWork 完成（restoreWorkspaceToSnapshot）
+//   - stage 返回的 snapshot = 「回退前工作区状态」，作为影响清单的对比基准（与 V1 语义一致）
 ipcMain.handle('session:undo-to', async (_e, sessionID, messageID) => {
   if (!sessionID || typeof sessionID !== 'string') return { ok: false, reason: 'bad_args' }
   if (!messageID || typeof messageID !== 'string') return { ok: false, reason: 'bad_args' }
   try {
-    const tBefore = await snapshotBeforeMessage(bridge, sessionID, messageID)
-    console.log('[session:undo-to] tBefore=', tBefore || '(none)')
-    const r = await bridge.revertMessage(sessionID, messageID)
-    console.log('[session:undo-to] ok=', r.ok, r.reason || '')
-    if (r.ok && r.revert && r.revert.snapshot) {
-      const ws = engine.status().workspace || settings.load().workspace
-      const git = findGit()
-      const fb = tBefore
-        ? restoreMissingFiles({
-            git,
-            snapshotDir: path.join(xdgHome, 'data', 'opencode', 'snapshot'),
-            workspace: ws,
-            snapshot: tBefore
-          })
-        : { ok: true, restored: [], skipped: [] }
-      console.log(
-        '[session:undo-to] snapshot-compensate:',
-        fb.ok ? `restored=${fb.restored.length} skipped=${fb.skipped.length}` : `skip (${fb.reason})`
-      )
-      // 兜底恢复完成后（工作区为最终状态）再收集实际影响
-      const imp = collectUndoImpact({
-        git,
-        snapshotDir: path.join(xdgHome, 'data', 'opencode', 'snapshot'),
-        workspace: ws,
-        snapshot: r.revert.snapshot
-      })
-      console.log(
-        '[session:undo-to] impact:',
-        imp.ok ? imp.impact.map((i) => `${i.type}:${i.path}`).join(' | ') || '(none)' : `skip (${imp.reason})`
-      )
-      return { ...r, restored: fb.ok ? fb.restored : [], impact: imp.ok ? imp.impact : [] }
+    const { tBefore, touched } = await undoSnapshotInfo(bridge, sessionID, messageID)
+    console.log('[session:undo-to] tBefore=', tBefore || '(none)', 'touched=', touched.join('|') || '(none)')
+    if (!tBefore) {
+      // 无快照（工作区非 git / git 不可用）：无法回滚文件，明确失败而不误报成功
+      return { ok: false, reason: 'no_git_snapshot' }
     }
-    return r
+    const st = await bridge.revertStage(sessionID, messageID)
+    console.log('[session:undo-to] staged:', st?.messageID, String(st?.snapshot).slice(0, 10))
+    const ws = (await engine.status()).workspace || settings.load().workspace
+    const git = findGit()
+    const snapshotDir = path.join(xdgHome, 'data', 'opencode2', 'snapshot')
+    // 1) 文件补偿：把工作区还原到 T_before（V2 引擎不做这件事）
+    const fb = restoreWorkspaceToSnapshot({ git, snapshotDir, workspace: ws, snapshot: tBefore, touchedFiles: touched })
+    console.log(
+      '[session:undo-to] restore:',
+      fb.ok ? `restored=${fb.restored.length} removed=${fb.removed.length} skipped=${fb.skipped.length}` : `skip (${fb.reason})`
+    )
+    if (!fb.ok && fb.reason === 'bad_snapshot') {
+      await bridge.revertClear(sessionID).catch(() => {})
+      return { ok: false, reason: 'no_git_snapshot' }
+    }
+    // 2) 提交回退（裁剪会话）
+    await bridge.revertCommit(sessionID)
+    // 3) 影响清单：stage.snapshot（回退前）vs 当前工作区（回退后）
+    const imp = st?.snapshot
+      ? collectUndoImpact({ git, snapshotDir, workspace: ws, snapshot: st.snapshot })
+      : { ok: false, reason: 'no_snapshot' }
+    console.log(
+      '[session:undo-to] impact:',
+      imp.ok ? imp.impact.map((i) => `${i.type}:${i.path}`).join(' | ') || '(none)' : `skip (${imp.reason})`
+    )
+    return {
+      ok: true,
+      restored: fb.ok ? [...fb.restored, ...fb.removed.map((p) => p + ' (删除)')] : [],
+      impact: imp.ok ? imp.impact : []
+    }
   } catch (e) {
     console.error('[session:undo-to] failed:', e.message)
-    return { ok: false, reason: 'error', message: e.message }
+    return { ok: false, reason: 'engine_error', message: e.message }
   }
 })
 
@@ -815,8 +838,56 @@ ipcMain.handle('settings:apply-notify-task', (_e, on) => {
   return { ok: true }
 })
 
-// 保存设置：写入存储 + 应用 opencode.json；restart=true（「保存并重启引擎」）时无条件重启引擎，
-// 不以配置是否变化为条件——按钮语义即「显式重启」，即使未改动配置也应真正重启
+// 热重载校验：调用引擎 reload 后，比对「引擎实际读到的配置」与「我们刚写入的文件」是否一致。
+// 校验通过才认为热重载成功；任一步不符则调用方回退为重启引擎（保底，行为与迁移前一致）
+async function tryHotReload() {
+  const st = await engine.status().catch(() => ({ running: false }))
+  if (!st.running) return { ok: false, reason: 'engine_not_running' }
+  try {
+    await bridge.locationReload()
+  } catch (e) {
+    return { ok: false, reason: 'reload_failed: ' + (e.message || e) }
+  }
+  try {
+    const expect = JSON.parse(fs.readFileSync(opencodeConfig, 'utf8'))
+    const entries = await bridge.configEntries()
+    const norm = (p) => String(p || '').replace(/\\/g, '/').toLowerCase()
+    const hit = (entries || []).find((e) => norm(e.path) === norm(opencodeConfig))
+    if (!hit || !hit.info) return { ok: false, reason: 'config_not_loaded' }
+    const got = hit.info
+    // provider 集合：期望的 xgroup-* 必须全部在，且不得残留已删除的 xgroup-*
+    const expGroups = Object.keys(expect.providers || {}).filter((k) => k.startsWith('xgroup-')).sort()
+    const gotGroups = Object.keys(got.providers || {}).filter((k) => k.startsWith('xgroup-')).sort()
+    if (expGroups.join(',') !== gotGroups.join(',')) return { ok: false, reason: `providers_mismatch(expect=${expGroups.join('|')} got=${gotGroups.join('|')})` }
+    // 权限规则：期望的每条规则都必须出现在引擎读到的数组里（引擎可能补充默认项，故用包含判断）
+    const gotPerms = JSON.stringify(got.permissions || [])
+    const missing = (expect.permissions || []).filter((r) => !gotPerms.includes(JSON.stringify(r)))
+    if (missing.length) return { ok: false, reason: `permissions_missing(${missing.length})` }
+    // 环境变量（模型 API Key）：{env:VAR} 引用必须在引擎进程里存在且值与当前设置一致，
+    // 否则热重载只能改「配置文本」，实际 Key 仍是旧进程里的旧值 → 必须重启进程才能生效
+    const refs = []
+    for (const p of Object.values(expect.providers || {})) {
+      const m = /\{env:([A-Za-z0-9_]+)\}/.exec((p && p.settings && p.settings.apiKey) || '')
+      if (m) refs.push(m[1])
+    }
+    const current = settings.env() || {}
+    const fp = engine.envFingerprint || {}
+    for (const k of refs) {
+      if (!(k in fp)) return { ok: false, reason: `env_missing(${k})` }
+      const now = crypto.createHash('sha1').update(String(current[k] ?? '')).digest('hex').slice(0, 16)
+      if (now !== fp[k]) return { ok: false, reason: `env_changed(${k})` }
+    }
+    return { ok: true, detail: `providers=${gotGroups.length} permissions=${(expect.permissions || []).length} envRefs=${refs.length}` }
+  } catch (e) {
+    return { ok: false, reason: 'verify_failed: ' + (e.message || e) }
+  }
+}
+
+// 保存设置：写入存储 + 应用 opencode.json。
+// restart=true 时**优先热重载**（V2 的 POST /api/location/reload：实测可热生效 provider/模型目录与权限规则，
+// 且不打断正在运行的任务），并用「引擎读回的配置 == 刚写入的文件」做校验；校验不过再回退为重启引擎。
+// 注：模型组的新 API Key 通过环境变量注入引擎进程，热重载能刷新「读配置」的部分；
+//     若某个改动依赖进程环境（如新增模型组后 key 尚未注入），校验失败会自动落到重启分支，语义仍然正确。
 ipcMain.handle('settings:save', async (_e, raw, restart = true) => {
   // 记录本次提交的 key 状态（排查「保存后仍提示旧 key」问题）
   const keyStatus = {
@@ -825,14 +896,41 @@ ipcMain.handle('settings:save', async (_e, raw, restart = true) => {
       : []
   }
   console.log('[settings] save: restart=', restart, 'keyStatus=', JSON.stringify(keyStatus))
+  const portBefore = effectiveConfig().enginePort
   settings.save(raw)
   applyToOpencode(opencodeConfig, settings)
-  if (restart) {
-    await engine.stop()
-    // 强制新进程：stop 已结束旧进程（含复用的端口占用者），必须换进程才能注入新环境变量（新 key）
-    await engine.start({ force: true })
+  if (!restart) return { ok: true, applied: 'none' }
+  // 进程级配置（引擎端口）无法热重载，必须重启进程：命中则直接走重启分支
+  const portAfter = effectiveConfig().enginePort
+  if (portAfter !== portBefore) {
+    console.log(`[settings] 引擎端口变更 ${portBefore} → ${portAfter}，需重启进程`)
+    try {
+      engine.port = portAfter
+      bridge.port = portAfter
+      bridge.base = `http://127.0.0.1:${portAfter}`
+      await engine.stop()
+      await engine.start({ force: true })
+    } catch (e) {
+      console.error('[settings] 端口变更重启失败:', e.message)
+      return { ok: false, error: '配置已保存，但引擎重启失败：' + (e.message || e) }
+    }
+    return { ok: true, applied: 'restart', reason: 'engine_port_changed' }
   }
-  return { ok: true }
+  const hot = await tryHotReload()
+  if (hot.ok) {
+    console.log('[settings] 热重载生效:', hot.detail)
+    return { ok: true, applied: 'hot', detail: hot.detail }
+  }
+  console.log('[settings] 热重载未通过（' + hot.reason + '）→ 回退重启引擎')
+  try {
+    await engine.stop()
+    // 强制新进程：stop 已结束旧进程（含复用的端口占用者），新进程会以最新环境变量（新 key）启动
+    await engine.start({ force: true })
+  } catch (e) {
+    console.error('[settings] 回退重启失败:', e.message)
+    return { ok: false, error: '配置已保存，但引擎重启失败：' + (e.message || e) }
+  }
+  return { ok: true, applied: 'restart', reason: hot.reason }
 })
 
 // 发送消息：模型必须由渲染层显式指定（会话级模型，来自模型组下拉）；无有效模型时拒绝
@@ -891,14 +989,14 @@ ipcMain.handle('message:abort', async (_e, sessionID) => {
   }
 })
 
-// 压缩会话：委托引擎原生 summarize（等效 TUI /compact，需指定总结所用模型，异步执行，进度经全局事件流推送）
+// 压缩会话：委托引擎原生 compact（等效 TUI /compact；V2 无需指定总结模型，异步执行，进度经全局事件流推送）
 ipcMain.handle('session:compact', async (_e, sessionID, model) => {
   if (!sessionID || typeof sessionID !== 'string') return { ok: false, error: '无效的会话 ID' }
   if (!model || typeof model.providerID !== 'string' || typeof model.modelID !== 'string') {
     return { ok: false, error: '缺少总结所用模型' }
   }
   try {
-    await bridge.compactSession(sessionID, model)
+    await bridge.compactSession(sessionID) // V2 compact 无需指定总结模型（引擎配置决定）
     return { ok: true }
   } catch (e) {
     console.error('[session:compact] failed:', e.message)

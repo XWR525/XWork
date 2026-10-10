@@ -1057,7 +1057,9 @@ body.resizing-task .task-side {
   border: 1px solid var(--border);
 }
 
-.streaming .cursor {
+/* 流式打字机光标：挂在最后一个块级内容的行尾（内联跟随文字），避免另起一行 */
+.streaming > :last-child::after {
+  content: '';
   display: inline-block;
   width: 7px;
   height: 14px;
@@ -2034,6 +2036,177 @@ body.resizing-task .task-side {
   border: none;
   border-top: 1px solid var(--border);
   margin: 14px 0;
+}
+
+/* ---------- 代码块语法高亮（highlight.js）：暗色基线（底 #12151b） ---------- */
+.md-body pre code.hljs {
+  color: #c9d1d9;
+}
+.md-body pre .hljs-comment,
+.md-body pre .hljs-quote,
+.md-body pre .hljs-meta {
+  color: #8b949e;
+}
+.md-body pre .hljs-keyword,
+.md-body pre .hljs-selector-tag,
+.md-body pre .hljs-subst {
+  color: #ff7b72;
+}
+.md-body pre .hljs-string,
+.md-body pre .hljs-doctag,
+.md-body pre .hljs-regexp {
+  color: #a5d6ff;
+}
+.md-body pre .hljs-number,
+.md-body pre .hljs-literal,
+.md-body pre .hljs-variable,
+.md-body pre .hljs-template-variable,
+.md-body pre .hljs-attr,
+.md-body pre .hljs-attribute,
+.md-body pre .hljs-property {
+  color: #79c0ff;
+}
+.md-body pre .hljs-title,
+.md-body pre .hljs-title.function_,
+.md-body pre .hljs-section {
+  color: #d2a8ff;
+}
+.md-body pre .hljs-title.class_,
+.md-body pre .hljs-type,
+.md-body pre .hljs-built_in,
+.md-body pre .hljs-symbol,
+.md-body pre .hljs-bullet,
+.md-body pre .hljs-link {
+  color: #ffa657;
+}
+.md-body pre .hljs-tag,
+.md-body pre .hljs-name {
+  color: #7ee787;
+}
+.md-body pre .hljs-addition {
+  color: #aff5b4;
+  background: rgba(46, 160, 67, 0.15);
+}
+.md-body pre .hljs-deletion {
+  color: #ffdcd7;
+  background: rgba(248, 81, 73, 0.15);
+}
+.md-body pre .hljs-emphasis {
+  font-style: italic;
+}
+.md-body pre .hljs-strong {
+  font-weight: bold;
+}
+
+/* 亮色主题覆盖（底 #f6f8fb，GitHub Light 配色） */
+:root[data-theme='light'] .md-body pre code.hljs {
+  color: #24292f;
+}
+:root[data-theme='light'] .md-body pre .hljs-comment,
+:root[data-theme='light'] .md-body pre .hljs-quote,
+:root[data-theme='light'] .md-body pre .hljs-meta {
+  color: #6e7781;
+}
+:root[data-theme='light'] .md-body pre .hljs-keyword,
+:root[data-theme='light'] .md-body pre .hljs-selector-tag,
+:root[data-theme='light'] .md-body pre .hljs-subst {
+  color: #cf222e;
+}
+:root[data-theme='light'] .md-body pre .hljs-string,
+:root[data-theme='light'] .md-body pre .hljs-doctag,
+:root[data-theme='light'] .md-body pre .hljs-regexp {
+  color: #0a3069;
+}
+:root[data-theme='light'] .md-body pre .hljs-number,
+:root[data-theme='light'] .md-body pre .hljs-literal,
+:root[data-theme='light'] .md-body pre .hljs-variable,
+:root[data-theme='light'] .md-body pre .hljs-template-variable,
+:root[data-theme='light'] .md-body pre .hljs-attr,
+:root[data-theme='light'] .md-body pre .hljs-attribute,
+:root[data-theme='light'] .md-body pre .hljs-property {
+  color: #0550ae;
+}
+:root[data-theme='light'] .md-body pre .hljs-title,
+:root[data-theme='light'] .md-body pre .hljs-title.function_,
+:root[data-theme='light'] .md-body pre .hljs-section {
+  color: #8250df;
+}
+:root[data-theme='light'] .md-body pre .hljs-title.class_,
+:root[data-theme='light'] .md-body pre .hljs-type,
+:root[data-theme='light'] .md-body pre .hljs-built_in,
+:root[data-theme='light'] .md-body pre .hljs-symbol,
+:root[data-theme='light'] .md-body pre .hljs-bullet,
+:root[data-theme='light'] .md-body pre .hljs-link {
+  color: #953800;
+}
+:root[data-theme='light'] .md-body pre .hljs-tag,
+:root[data-theme='light'] .md-body pre .hljs-name {
+  color: #116329;
+}
+:root[data-theme='light'] .md-body pre .hljs-addition {
+  color: #116329;
+  background: rgba(35, 134, 54, 0.1);
+}
+:root[data-theme='light'] .md-body pre .hljs-deletion {
+  color: #82071e;
+  background: rgba(207, 34, 46, 0.1);
+}
+
+/* 长公式横向滚动，不撑破气泡 */
+.md-body .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 2px 0;
+}
+
+/* 上标/下标：行高归零防止撑大所在行 */
+.md-body sup,
+.md-body sub {
+  line-height: 0;
+}
+
+/* 定义列表：术语加粗，定义缩进（收紧浏览器默认 40px 缩进） */
+.md-body dl {
+  margin: 0.4em 0;
+}
+.md-body dt {
+  font-weight: 600;
+}
+.md-body dd {
+  margin: 0 0 0.3em 1.6em;
+}
+
+/* 高亮标记 ==文本==：半透明琥珀底色，暗/亮色主题通用，文字保持各自主题前景色 */
+.md-body mark {
+  background: rgba(255, 193, 7, 0.35);
+  color: inherit;
+  padding: 0 0.2em;
+  border-radius: 3px;
+}
+
+/* Mermaid 图表容器：占位期源码块沿用 .md-body pre 样式，渲染后 SVG 居中自适应宽度 */
+.md-body .md-mermaid {
+  margin: 0.6em 0;
+  overflow-x: auto;
+}
+.md-body .md-mermaid-ok {
+  text-align: center;
+}
+.md-body .md-mermaid svg {
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+}
+/* 语法错误降级：虚线框提示 + 保留源码查看 */
+.md-body .md-mermaid-err {
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  padding: 0.5em 0.8em;
+}
+.md-body .md-mermaid-err-msg {
+  font-size: 0.85em;
+  opacity: 0.7;
+  margin-bottom: 0.4em;
 }
 
 /* ---------- 权限弹框 ---------- */

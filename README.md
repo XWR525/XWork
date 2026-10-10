@@ -65,18 +65,18 @@
 │    │ window.xwork.*（preload contextBridge）                             │
 │    │ ←── engine:event（IPC，全局事件流转发）                              │
 │ 主进程 (index / engine / bridge / settings / undo / tasks / task-runner / config / logger)        │
-│    │ HTTP REST + 全局 SSE (GET /global/event)                            │
+│    │ HTTP REST + 全局 SSE (GET /api/event)                                │
 └────┼─────────────────────────────────────────────────────────────────────┘
      ▼
-opencode serve（127.0.0.1:4096，本地无头引擎）
+opencode V2 serve（127.0.0.1:4096，本地无头引擎，强制 Basic Auth）
 ```
 
 - **任务引擎**：定时任务使用独立的 opencode 进程（端口自 4096 顺延动态探测，独立数据目录），随任务工作区 / 设置变化重启。
 - **主进程**：管理 opencode 子进程生命周期（探测 / 启动 / 健康检查 / 崩溃重启 / 工作区切换换进程）、IPC 桥、设置与 Key 存储、文件日志；定时任务由 `tasks`（cron 解析 / 存储 / 调度器）与 `task-runner`（任务引擎生命周期 / 全局串行执行 / 等待队列 / 重试 / 结果持久化）承载。
 - **preload**：通过 `contextBridge` 向渲染层暴露受控的 `window.xwork.*` API，渲染层 `console` 转发至主进程日志。
 - **渲染层**：React 单页应用（对话流 + 消息内联任务展示 + 文件树 + 设置面板 + 定时任务管理页）。
-- **桥接层**（`bridge.js`）：直接以 `fetch` 调用 opencode REST API；实时事件走**全局事件流** `GET /global/event`（per-session 事件端点不可用，故不用）。
-- **消息发送**：同步 `POST /session/{id}/message` 等待完整回复；流式增量（`message.part.delta` / `message.part.updated`）、思考、工具状态由全局事件流驱动实时渲染。
+- **桥接层**（`bridge.js`）：调用 opencode V2 REST API（`/api/*`，Basic Auth）；实时事件走**全局事件流** `GET /api/event`（per-session 事件端点不可用，故不用），并在桥内把 V2 事件**归一化**为渲染层沿用的 V1 事件名与消息结构（`{info, parts}`），使渲染层与任务引擎无需感知 V2 差异。
+- **消息发送**：V2 为异步收件箱模型 —— `POST /api/session/{id}/prompt` 立即返回受理回执，首个 step 完成由事件等待（`message.updated` / `session.idle`，归一化自 `session.execution.*`）确定；流式增量（`session.text.delta` 等）经归一化后驱动实时渲染。
 
 ## 技术栈
 
@@ -86,13 +86,13 @@ opencode serve（127.0.0.1:4096，本地无头引擎）
 | 前端 | React 18 + Vite 5（electron-vite 构建） |
 | Markdown | marked（GFM + breaks） |
 | 打包 / 更新 | electron-builder 26（NSIS 安装器）、electron-updater 6 |
-| 执行引擎 | opencode（`serve` 模式，HTTP + SSE） |
+| 执行引擎 | opencode **V2**（npm `opencode2`，`serve` 模式，HTTP + SSE + Basic Auth） |
 
 ## 环境要求
 
 - Windows x64
 - Node.js 18+ 与 npm（开发 / 打包）
-- opencode 引擎：打包版随安装包分发；开发模式需本机可探测（见下）
+- opencode **V2** 引擎：打包版随安装包分发；开发模式需本机可探测（见下）
 - Git：内置 MinGit 随打包版分发（undo / 任务工作区快照开箱即用）；开发模式无内置 MinGit 时需本机安装 Git
 
 ## 快速开始（开发）
@@ -109,12 +109,19 @@ npm run dev
 
 `npm run dev`（`scripts/dev.mjs`）会把引擎数据目录固化到项目根 `.opencode-home`，并开放 9222 调试端口供验收脚本使用。
 
-## opencode 引擎
+## opencode V2 引擎
 
-- **探测顺序**：打包版 `resources/engine/opencode.exe` → 环境变量 `XWORK_OPENCODE_PATH` → npm 全局安装目录（`opencode-ai`）。开发模式推荐 `npm install -g opencode-ai`。
-- **启动**：`opencode serve --port 4096 --hostname 127.0.0.1`，启动前将 `XDG_*` 环境变量重定向到引擎数据目录（规避安全软件对用户目录写入的拦截）。
-- **复用**：端口上已有健康服务时直接复用（`owned=false`）；切换工作区 / 保存并重启引擎时强制拉起新进程。
-- **工作区**：引擎以工作区目录为启动目录（opencode 无 `--cwd` 参数，会话按项目隔离），因此切换工作区需重启引擎（数秒）。
+- **探测顺序**：打包版 `resources/engine/opencode.exe`（V2 二进制，实际文件名为 opencode2.exe）→ 环境变量 `XWORK_OPENCODE_PATH` → npm 全局安装目录（`opencode2` / `opencode2-windows-x64`）。
+  开发模式安装：`npm i -g opencode2 --registry=https://registry.npmmirror.com`。
+  ⚠️ V1 引擎（`opencode-ai`，如 1.18.x）**不兼容**：无 `/api/info`、无强制认证、prompt 为同步语义。
+- **启动**：`opencode2 serve --port 4096 --hostname 127.0.0.1`，启动前将 `XDG_*` 环境变量（含 `XDG_CACHE_HOME`）重定向到引擎数据目录（规避安全软件对用户目录写入的拦截）。
+- **认证**：V2 强制 HTTP Basic Auth（用户名固定 `opencode`）。XWork 按引擎数据目录**确定性派生**密码并注入 `OPENCODE_SERVER_PASSWORD`：同机多实例 / 应用重启后可复用同一引擎；外部进程因密码不同而健康检查失败，会被端口预清理接管。
+- **健康检查**：`GET /api/info`（校验响应为 JSON 且含 `version`；老引擎回退 HTML 的 200 不再被误判为健康）。
+- **复用**：端口上已有本应用的健康引擎时直接复用（`owned=false`）；切换工作区 / 保存并重启引擎时强制拉起新进程。
+- **工作区**：引擎以工作区目录为启动目录（会话按项目隔离），因此切换工作区需重启引擎（数秒）。
+- **数据目录（V2 布局）**：`<引擎数据目录>/config/opencode2`、`data/opencode2`（SQLite `opencode.db`、`snapshot/` 快照库）、`state`、`cache`。
+  与 V1 的 `opencode` 目录并存互不干扰；**引擎不支持 V1 会话迁移**（升级后旧会话不出现在列表中，降级不受影响）。
+- **回退（undo）**：V2 的 staged revert 只裁剪会话、**不恢复文件**，XWork 按被回退轮次的 `snapshot.files` 做完整补偿（还原/删除）并生成影响清单（详见 `功能设计文档/迁移文档.md`）。
 
 ## 配置与数据
 

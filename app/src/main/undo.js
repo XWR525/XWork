@@ -250,4 +250,100 @@ function collectUndoImpact({ git, snapshotDir, workspace, snapshot }) {
   return { ok: true, impact }
 }
 
-module.exports = { restoreMissingFiles, collectUndoImpact }
+// V2 快照补偿恢复：把工作区还原到 T_before（目标轮次前）状态
+// V1 与 V2 的关键差异（实测确认，见迁移文档 §14）：
+//   - V1：引擎 revert 能删除新增文件、还原被修改文件，仅「被改名/移动的旧文件」漏恢复 → 只需补缺失
+//   - V2：引擎 revert 只裁剪会话，完全不触碰文件（阶段 stage/commit 后工作区不变）→ 必须由 XWork 完整补偿
+// 策略（精确优先，避免误删用户文件）：
+//   1) 被回退轮次触碰过的文件（union of assistant.snapshot.files）→ 存在 T_before 则还原内容，否则删除（该轮新建）
+//   2) 兜底：T_before 中有、当前工作区缺失的文件（引擎未归因的漏网文件，如 shell 副作用）→ 还原
+// 参数：git、snapshotDir、workspace、snapshot（T_before tree）、touchedFiles（相对路径数组）
+// 返回：{ ok, restored:[], removed:[], skipped:[], reason? }
+function restoreWorkspaceToSnapshot({ git, snapshotDir, workspace, snapshot, touchedFiles }) {
+  if (!git || !workspace || !snapshot) return { ok: false, reason: 'no_git_or_args' }
+  const repo = findSnapshotRepo(snapshotDir, workspace)
+  if (!repo) return { ok: false, reason: 'no_snapshot_repo' }
+  try {
+    const t = execFileSync(git, ['--git-dir', repo, 'cat-file', '-t', snapshot], {
+      encoding: 'utf8',
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'ignore']
+    }).trim()
+    if (t !== 'tree') return { ok: false, reason: 'bad_snapshot' }
+  } catch {
+    return { ok: false, reason: 'bad_snapshot' }
+  }
+  let S
+  try {
+    S = listTree(git, repo, snapshot) // 相对路径 → blob hash
+  } catch {
+    return { ok: false, reason: 'list_failed' }
+  }
+  const byNorm = new Map(Object.entries(S).map(([p, b]) => [norm(p), { p, b }]))
+  const restored = []
+  const removed = []
+  const skipped = []
+  const writeBlob = (rel, blob) => {
+    const abs = path.join(workspace, rel)
+    try {
+      const content = execFileSync(git, ['--git-dir', repo, 'cat-file', 'blob', blob], {
+        encoding: 'buffer',
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'ignore']
+      })
+      fs.mkdirSync(path.dirname(abs), { recursive: true })
+      fs.writeFileSync(abs, content)
+      return true
+    } catch {
+      return false
+    }
+  }
+  // 触碰文件统一为「相对工作区」的归一化键（引擎可能给绝对路径，兼容两种）
+  const wsNorm = norm(workspace)
+  const want = new Map() // 归一化键 → 展示用相对路径
+  for (const f of touchedFiles || []) {
+    const s = String(f || '').replace(/\\/g, '/')
+    const rel = norm(s).startsWith(wsNorm + '/') ? s.replace(/\\/g, '/').slice(wsNorm.length + 1) : s
+    if (rel) want.set(norm(rel), rel.replace(/^\/+/, ''))
+  }
+  // 1) 被回退轮次触碰过的文件：还原或删除
+  for (const [n, rel] of want) {
+    if (isSkippedPath(n)) continue
+    const hit = byNorm.get(n)
+    const abs = path.join(workspace, rel)
+    const exists = fs.existsSync(abs)
+    if (hit) {
+      if (!exists) {
+        writeBlob(hit.p, hit.b) ? restored.push(hit.p) : skipped.push(hit.p)
+      } else {
+        try {
+          const buf = fs.readFileSync(abs)
+          if (gitBlobHash(buf) !== hit.b) {
+            writeBlob(hit.p, hit.b) ? restored.push(hit.p) : skipped.push(hit.p)
+          }
+        } catch {
+          skipped.push(hit.p)
+        }
+      }
+    } else if (exists) {
+      // T_before 无此文件 → 该轮新建，删除以回到回退前状态
+      try {
+        fs.rmSync(abs, { force: true })
+        removed.push(rel)
+      } catch {
+        skipped.push(rel)
+      }
+    }
+  }
+  // 2) 兜底：T_before 有、当前缺失（引擎未归因的漏网文件）
+  for (const [p, blob] of Object.entries(S)) {
+    if (isSkippedPath(p)) continue
+    if (want.has(norm(p))) continue
+    if (!fs.existsSync(path.join(workspace, p))) {
+      writeBlob(p, blob) ? restored.push(p) : skipped.push(p)
+    }
+  }
+  return { ok: true, restored, removed, skipped }
+}
+
+module.exports = { restoreMissingFiles, restoreWorkspaceToSnapshot, collectUndoImpact }
