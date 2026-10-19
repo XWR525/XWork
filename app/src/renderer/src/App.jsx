@@ -2606,7 +2606,7 @@ export default function App() {
                       <span title="最新回复时间">{fmtDateTime(s.time?.updated || s.time?.created)}</span>
                       {(() => {
                         // 父会话行的子智能体计数徽标（I2：子会话不占列表条目，但可下钻）
-                        // v1 决策 D3：不可点击，仅 title 提示；下钻走 L1 卡片的「展开子智能体过程」
+                        // v1 决策 D3：不可点击，仅 title 提示；下钻走 L1 卡片的「展开」按钮（tooltip 写全称「展开子智能体过程」）
                         const n = childBadgeCount(childIndex, s.id)
                         return n > 0 ? (
                           <span className="subagent-badge" title={`${n} 个子智能体会话`}>
@@ -5533,7 +5533,7 @@ const SubagentChildView = memo(function SubagentChildView({ childSid, agent, onS
 
 // ── 子智能体卡片（对话列表 L1 / 右侧执行面板 L2 共用同一实现）────────────────
 // 为什么面板也复用这一个组件（2026-10-19 用户要求）：面板里的子智能体条目必须与对话列表里
-// 完全一致 —— 同样的摘要、同样的「展开子智能体过程 / 收起」按钮与动画。此前面板用的是另一份
+// 完全一致 —— 同样的摘要、同样的「展开 / 收起」按钮与动画。此前面板用的是另一份
 // `SubagentToolCard`（任务说明 + 报告 + 原始区常显），两处实现会各自漂移。
 // `variant="panel"` 只多一个**默认折叠**的「原始输入/输出」入口，不改变摘要区。
 // props 刻意只有【稳定的 part 引用】+ 一个稳定回调：摘要经 store 自订阅进入，否则 memo 化的
@@ -5633,9 +5633,10 @@ const SubagentCard = memo(function SubagentCard({ part, onShowPanel, variant, pa
         <button
           className={`tool-expand subagent-toggle${open ? ' open' : ''}`}
           onClick={() => setOpen((o) => !o)}
+          title={open ? '收起子智能体过程' : '展开子智能体过程'}
         >
           <span className="subagent-caret">▶</span>
-          {open ? '收起' : '展开子智能体过程'}
+          {open ? '收起' : '展开'}
           {counts ? `（${counts}）` : ''}
         </button>
         {canTerminate(phase) && childSid ? (
