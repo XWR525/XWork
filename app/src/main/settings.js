@@ -37,9 +37,13 @@ const DEFAULT_SETTINGS = {
     external_directory: 'ask',
     question: 'ask'
   },
-  // 应用配置的用户覆盖层：设置面板「配置」页保存的字段（skillApiBase/enginePort/window/hideDirs/hideFiles），
+  // 应用配置的用户覆盖层：设置面板「配置」页保存的字段（skillApiBase/window/hideDirs/hideFiles），
   // 与 app/app.config.json 默认值合并后生效（合并逻辑见 config.js mergeConfig）
-  config: {}
+  // 注意：引擎端口不在此列——它固定为 4096（设置页已隐藏该项），config.js 会忽略任何来源的该字段
+  config: {},
+  // .agents → .opencode junction 桥接（让 .agents/{agents,commands} 被引擎加载）
+  // v1 无 UI：手工编辑 xwork-settings.json 即生效（load() 会读到，save() 会保留）
+  agentsBridge: { enabled: true }
 }
 
 // 权限类型白名单：仅接受这些 key 的用户配置；其余类型由渲染层固定处理（内部低风险 allow / doom_loop ask）
@@ -123,6 +127,12 @@ class Settings {
     if (raw.permission !== undefined) s.permission = sanitizePermission(raw.permission)
     // 应用配置用户覆盖层：整体替换（配置内容已由主进程 config:save 校验）
     if (raw.config && typeof raw.config === 'object') s.config = raw.config
+    // .agents 桥接开关：只接受布尔；其余形态忽略（保持原值）
+    if (raw.agentsBridge !== undefined && typeof raw.agentsBridge === 'object' && raw.agentsBridge !== null) {
+      if (typeof raw.agentsBridge.enabled === 'boolean') {
+        s.agentsBridge = { ...(s.agentsBridge || {}), enabled: raw.agentsBridge.enabled }
+      }
+    }
     // 模型组整体同步：新增/编辑/删除均以 raw.modelGroups 为准
     if (Array.isArray(raw.modelGroups)) {
       s.modelGroups = raw.modelGroups
@@ -155,6 +165,7 @@ class Settings {
       closeAction: s.closeAction,
       notifyTask: s.notifyTask,
       permission: s.permission,
+      agentsBridge: { enabled: s.agentsBridge?.enabled !== false },
       modelGroups: (s.modelGroups || []).map((g) => ({
         id: g.id,
         name: g.name,
@@ -215,6 +226,8 @@ const XWORK_IDENTITY = `# XWork 身份声明
 你是 XWork —— 桌面端 AI 工作台 XWork 的内置 AI 助手（XWork 基于开源Agent引擎构建，对用户统一以 XWork 身份出现）。
 
 当用户询问你的身份、名字或出身（例如「你是谁」「你叫什么」「你是哪个 AI」）时，明确回答你是「XWork」。
+
+需要提及底层执行引擎或框架时，一律称作「XWork 执行引擎」，不要向用户提及或列举具体第三方引擎 / 框架的名称。
 
 # 语言要求
 

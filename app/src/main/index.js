@@ -25,6 +25,8 @@ const { Settings, applyToOpencode, MASK } = require('./settings')
 const { restoreMissingFiles, restoreWorkspaceToSnapshot, collectUndoImpact } = require('./undo')
 const { TaskStore, Scheduler, isValidCron, nextRunAfter, normalizeTask, describeCron } = require('./tasks')
 const { TaskRunner } = require('./task-runner')
+const { ensureAgentsBridge, removeAgentsBridge } = require('./agents-bridge')
+const { statusWithGeneration } = require('./engine-status')
 const logger = require('./logger')
 const JSZip = require('jszip')
 
@@ -41,6 +43,35 @@ let isQuitting = false
 let trayNotified = false
 // 手动停止的会话：跳过该会话下一次 session.idle 的「已完成」通知（停止 ≠ 完成，避免误导）
 const skipIdleNotif = new Map()
+
+// ── 引擎世代号（设计 §5.7 / 评审 v3-B-1）──────────────────────────────────────
+// 为什么需要：渲染层要判断"这张子智能体卡属于上一代引擎进程吗"才能把未终态卡片降级为「状态未知」，
+// 而它拿不到进程身份 —— bridge.info() 是主进程方法（渲染层不可达）、engine.status() 不含 pid、
+// server.connected 事件原本是空 properties。故世代号由主进程维护，并随事件与 engine:status 透出。
+// 为什么不在每次 start 都自增：engine.start() 可能【复用】已存在的健康引擎（多实例场景），
+// 那种情况下 pid 不变 ⇒ 不得自增，否则会把正在跑的卡片误判成"上一代"。
+let engineGeneration = 0
+let lastEnginePid = null
+
+function bumpEngineGeneration(reason) {
+  engineGeneration++
+  console.log(`[engine] generation -> ${engineGeneration} (${reason})`)
+  return engineGeneration
+}
+
+/** 启动/复用引擎后同步世代号：只在真的换了进程（pid 变化）时自增 */
+async function syncEngineGeneration(reason) {
+  try {
+    const info = await bridge.info()
+    const pid = info && info.pid != null ? String(info.pid) : null
+    if (pid && pid !== lastEnginePid) {
+      lastEnginePid = pid
+      bumpEngineGeneration(reason)
+    }
+  } catch (e) {
+    console.warn('[engine] 世代号同步失败（已忽略）:', e.message)
+  }
+}
 
 // 托盘图标：内嵌 16x16 PNG（由用户应用图标生成，scripts/gen-icons.mjs），不依赖外部文件，开发/打包均可靠
 const TRAY_ICON = nativeImage.createFromDataURL(
@@ -207,6 +238,19 @@ function createWindow() {
   win.webContents.on('did-finish-load', () => {
     win.webContents.send('engine:event', { type: 'app.ready', properties: {} })
   })
+  // 开发者工具：主进程没有注册任何加速键（autoHideMenuBar + 无自定义菜单），
+  // 默认的 F12 / Ctrl+Shift+I 在打包版里不生效 → 这里显式接上，便于排查渲染问题。
+  // 排查完可随时删掉（不影响功能）。
+  win.webContents.on('before-input-event', (e, input) => {
+    if (input.type !== 'keyDown') return
+    const key = String(input.key || '').toLowerCase()
+    const isF12 = key === 'f12'
+    const isInspect = input.control && input.shift && key === 'i'
+    if (isF12 || isInspect) {
+      win.webContents.toggleDevTools()
+      e.preventDefault()
+    }
+  })
   // 外部链接拦截：对话内容中点击 http(s) 链接改用系统默认浏览器打开，主窗口不导航。
   // file:// 与 dev server origin 属内部导航，放行（Vite 整页刷新依赖同源导航）
   const devOrigin = process.env.ELECTRON_RENDERER_URL ? new URL(process.env.ELECTRON_RENDERER_URL).origin : null
@@ -247,6 +291,165 @@ function createWindow() {
   })
 }
 
+/** 桥接是否启用（默认启用；手工编辑 xwork-settings.json 或在设置里关掉都走这里） */
+function agentsBridgeEnabled() {
+  return settings.load().agentsBridge?.enabled !== false
+}
+
+/**
+ * 开关 true→false 时：遍历【工作区注册表】逐个摘链（不止当前工作区）。
+ * 设计依据 §5.5（评审 M-1）：只处理当前工作区会留下其它工作区的 `.opencode` 空壳；
+ * 而 `workspace:delete` 只处理"路径已不存在的条目"，那里摘链是死代码。
+ */
+function removeAgentsBridgeEverywhere(reason) {
+  let dirs = []
+  try {
+    dirs = (wsLoad() || []).map((w) => w.dir).filter(Boolean)
+  } catch (e) {
+    console.warn('[agents-bridge] 读取工作区注册表失败:', e.message)
+  }
+  // 当前工作区也必须包含（可能尚未登记到注册表）
+  const cwdFallback = process.cwd()
+  const fromEngine = (engine && engine.workspace && engine.workspace()) || null
+  const cur =
+    settings.load().workspace ||
+    (fromEngine && path.resolve(fromEngine) !== path.resolve(cwdFallback) ? fromEngine : null)
+  if (cur && !dirs.includes(cur)) dirs.push(cur)
+  const done = []
+  const failed = []
+  for (const dir of dirs) {
+    try {
+      if (!fs.existsSync(dir)) continue
+      const r = removeAgentsBridge(dir)
+      const touched = r.removed.length > 0 || r.shellRemoved
+      if (touched) done.push(dir)
+      for (const b of r.blocked || []) failed.push({ dir, reason: b.reason })
+    } catch (e) {
+      failed.push({ dir, reason: e.message })
+    }
+  }
+  console.log(`[agents-bridge] 关闭桥接（${reason}）：已处理 ${done.length} 个工作区${failed.length ? `，${failed.length} 个失败` : ''}`)
+  for (const f of failed) console.warn(`[agents-bridge] 摘链失败 ${f.dir}: ${f.reason}`)
+  return { done, failed }
+}
+
+// ── 引擎启动的唯一封装：建链 → 启动 → 异步自检 ────────────────────────────────
+// 设计依据：功能设计文档/agents目录junction桥接设计.md v2.1 §5.1/§5.5
+// 为什么必须收敛到一处：engine.start() 有 6 个入口（本文件 5 处 + task-runner），
+// 逐个插桩必然漏掉某条路径（例如引擎崩溃后由 settings:save 回退重启），
+// 表现为"某些情况下 .agents 不生效"这类难以复现的问题。
+//
+// 顺序是硬约束：ensureAgentsBridge 必须在 engine.start() 【之前】，
+// 因为引擎只在 Location 激活时扫描 .opencode —— 先起引擎再建链会白跑一轮。
+async function startEngineWithBridge(opts) {
+  // 工作区以设置为准：engine.workspace() 在 cwd 未设置时会回退 process.cwd()（Electron 下是应用目录），
+  // 那样会在应用目录里建 .opencode —— 必须显式排除
+  const cwdFallback = process.cwd()
+  const fromEngine = engine && engine.workspace ? engine.workspace() : null
+  const ws =
+    settings.load().workspace ||
+    (fromEngine && path.resolve(fromEngine) !== path.resolve(cwdFallback) ? fromEngine : null)
+  if (ws && agentsBridgeEnabled()) {
+    try {
+      const r = ensureAgentsBridge(ws)
+      if (r.linked.length) console.log('[agents-bridge] 已建立联接:', r.linked.join(', '))
+      if (r.repaired.length) console.log('[agents-bridge] 已修复联接:', r.repaired.join(', '))
+      for (const b of r.blocked) {
+        console.warn(`[agents-bridge] 阻断(${b.blockedBy}) rel=${b.rel}`, b.tracked || b.error || '')
+        // 用户可见提示（§5.6 M-11）：不能只写日志，否则用户以为 .agents 生效了
+        sendEngineEvent('engine.bridge.warning', {
+          code: b.blockedBy,
+          rel: b.rel,
+          tracked: b.tracked || [],
+          repair: b.repair || null,
+          text: describeBridgeBlock(b)
+        })
+      }
+    } catch (e) {
+      // 桥接失败绝不阻塞引擎启动
+      console.warn('[agents-bridge] ensure 失败（已忽略）:', e.message)
+    }
+  }
+  const st = await engine.start(opts)
+  await syncEngineGeneration('engine.start') // 世代号：仅当进程真的换了才自增（复用不增）
+  scheduleAgentsSelfCheck(ws) // 阶段 5 接入：异步、可取消、不阻塞 start 返回
+  return st
+}
+
+function sendEngineEvent(type, properties) {
+  if (win && !win.isDestroyed()) win.webContents.send('engine:event', { type, properties })
+}
+
+/** 把结构化阻断原因翻译成给用户看的一句话（§5.6） */
+function describeBridgeBlock(b) {
+  switch (b.blockedBy) {
+    case 'git-tracked':
+      return '.agents 未生效：.opencode/ 下已有被 git 跟踪的内容，请按提示处置后再重新打开工作区'
+    case 'real-dir-nonempty':
+      return `.agents 未生效：${b.rel} 是真实目录（可能来自 git clone），请确认后删除它并重新打开工作区`
+    case 'gitignore-user-owned':
+      return '.agents 未生效：.opencode/.gitignore 是你自己写的，且未忽略联接；本功能不会改动它'
+    case 'git-ignore-ineffective':
+      return '.agents 未生效：写入 .opencode/.gitignore 后仍未生效，请检查仓库的忽略规则'
+    case 'cross-volume':
+      return `.agents 未生效：无法在 ${b.rel} 创建目录联接（跨卷或文件系统不支持）`
+    default:
+      return `.agents 未生效（${b.blockedBy}）`
+  }
+}
+
+// ── agents 桥接自检的调度（判据本身在 agents-selfcheck.js，便于单测）────────────
+const SELF_CHECK_DEADLINE_MS = 15_000
+const selfCheckState = { timer: null, signal: null }
+
+/** 调度一次自检：异步、可取消、不阻塞 engine.start 返回（评审 S-13） */
+function scheduleAgentsSelfCheck(ws) {
+  if (!ws) return
+  // 同一时刻只跑一个：新调度取消旧的（切换工作区/反复重启时避免堆积）
+  if (selfCheckState.signal) selfCheckState.signal.cancelled = true
+  if (selfCheckState.timer) clearTimeout(selfCheckState.timer)
+  const signal = { cancelled: false }
+  selfCheckState.signal = signal
+  selfCheckState.timer = setTimeout(async () => {
+    try {
+      const agentBridge = require('./agents-bridge')
+      const { runSelfCheck, describeSelfCheck } = require('./agents-selfcheck')
+      const result = await runSelfCheck({
+        bridge,
+        agentsBridge: agentBridge,
+        workspace: ws,
+        signal,
+        opts: { deadlineMs: SELF_CHECK_DEADLINE_MS }
+      })
+      if (signal.cancelled) return
+      if (result.status === 'links-bad') {
+        console.log(`[agents-bridge] 自检跳过（联接状态 ${result.linkState}）：${result.rel}`)
+        return
+      }
+      const text = describeSelfCheck(result)
+      if (!text) return
+      if (result.status === 'ok') {
+        console.log('[agents-bridge] ' + text)
+        sendEngineEvent('engine.bridge.loaded', {
+          agents: result.agents,
+          commands: result.commands,
+          workspace: ws,
+          elapsedMs: result.elapsedMs
+        })
+      } else {
+        console.warn('[agents-bridge] ' + text)
+        sendEngineEvent('engine.bridge.warning', {
+          code: 'self-check-not-converged',
+          workspace: ws,
+          text
+        })
+      }
+    } catch (e) {
+      console.warn('[agents-bridge] 自检异常（已忽略）:', e.message)
+    }
+  }, 1000)
+}
+
 // 全局事件流转发到渲染进程（异常后自动重连）
 function startGlobalWatch() {
   if (sseActive) return
@@ -257,8 +460,14 @@ function startGlobalWatch() {
         console.log('[sse] connecting...')
         await bridge.watchGlobal((evt) => {
           console.log('[sse] event:', evt.type)
-          if (win && !win.isDestroyed()) win.webContents.send('engine:event', evt)
-          maybeNotify(evt)
+          // 世代号透出（设计 §5.7 / v3-B-1）：server.connected 是渲染层判断"是否换了进程"的
+          // 唯一实时入口（同进程断流重连时世代号不变 ⇒ 不得把卡片误标为状态未知）
+          const payload =
+            evt && evt.type === 'server.connected'
+              ? { ...evt, properties: { ...(evt.properties || {}), generation: engineGeneration } }
+              : evt
+          if (win && !win.isDestroyed()) win.webContents.send('engine:event', payload)
+          maybeNotify(payload)
         })
         console.log('[sse] stream closed')
       } catch (e) {
@@ -286,13 +495,17 @@ app.whenReady().then(async () => {
   engine = new Engine({
     xdgHome,
     cwd: ws, // 工作区（上次打开的目录；已校验存在）
-    port: effectiveConfig().enginePort, // 引擎端口（用户可在设置面板「配置」页覆盖，重启应用后生效）
+    port: effectiveConfig().enginePort, // 引擎端口（固定 4096，设置页已隐藏该项）
     extraEnv: () => settings.env(), // 注入模型 API Key 环境变量
     onExit: (code) => {
+      // 引擎退出 ⇒ 立刻推进世代号：渲染层据此把该世代未终态的子智能体卡降级为「状态未知」
+      // （设计 §5.7 ①：不能靠"改写消息"实现 —— 随后的 loadSession 快照会把 part 写回 running）
+      lastEnginePid = null
+      bumpEngineGeneration('engine.exited')
       if (win && !win.isDestroyed()) {
         win.webContents.send('engine:event', {
           type: 'engine.exited',
-          properties: { code }
+          properties: { code, generation: engineGeneration }
         })
       }
     }
@@ -303,8 +516,9 @@ app.whenReady().then(async () => {
   try {
     applyToOpencode(opencodeConfig, settings) // 保证 provider 段与设置一致
     // 工作区建立时静默 git init：引擎快照每轮对话前写入，事后 init 无法追溯此前轮次（见 ensureWorkdirGit）
+    // 注意顺序：git init 必须在 startEngineWithBridge 之前 —— 桥接的 git 防污染需要仓库已存在
     ensureWorkdirGit(ws, { init: true })
-    await engine.start()
+    await startEngineWithBridge()
     startGlobalWatch()
   } catch (e) {
     console.error('engine start failed:', e.message)
@@ -322,18 +536,21 @@ app.whenReady().then(async () => {
 })
 
 ipcMain.handle('engine:start', async () => {
-  const st = await engine.start()
+  const st = await startEngineWithBridge()
   startGlobalWatch()
   return st
 })
 
-ipcMain.handle('engine:status', () => engine.status())
+// 引擎状态 + 世代号（渲染层首帧即可对齐世代，见设计 §10.2 O2=A）
+// ⚠ engine.status() 是 async：必须 await 后再合并（曾经漏掉 await ⇒ 返回体只剩 {generation}，
+//   顶栏永远"未连接"但发消息正常；详见 engine-status.js 的注释与离线单测）
+ipcMain.handle('engine:status', () => statusWithGeneration(engine, engineGeneration))
 
 // 重启引擎：安装技能后需重启才能识别新技能（stop → 强制新进程，保留当前工作区）
 ipcMain.handle('engine:restart', async () => {
   try {
     await engine.stop()
-    const st = await engine.start({ force: true })
+    const st = await startEngineWithBridge({ force: true })
     console.log('[engine] restart done, running=', st.running)
     return { ok: true, status: st }
   } catch (e) {
@@ -362,8 +579,7 @@ function sanitizeConfigOverrides(raw) {
   if (typeof raw.skillApiBase === 'string' && raw.skillApiBase.trim()) {
     out.skillApiBase = raw.skillApiBase.trim()
   }
-  const port = Number(raw.enginePort)
-  if (Number.isInteger(port) && port >= 1 && port <= 65535) out.enginePort = port
+  // 引擎端口固定 4096（设置页已隐藏该项），不再接受用户覆盖：旧设置里若残留该项也会被忽略
   if (raw.window && typeof raw.window === 'object') {
     const w = {}
     for (const k of ['width', 'height', 'minWidth', 'minHeight']) {
@@ -381,7 +597,7 @@ function sanitizeConfigOverrides(raw) {
   return out
 }
 
-// 保存配置覆盖层：写入 settings（引擎端口/窗口尺寸需重启应用后生效）
+// 保存配置覆盖层：写入 settings（窗口尺寸需重启应用后生效）
 ipcMain.handle('config:save', (_e, raw) => {
   const overrides = sanitizeConfigOverrides(raw)
   settings.save({ config: overrides })
@@ -450,9 +666,30 @@ function sendUpdateEvent(evt, data) {
   win.webContents.send('engine:event', { type: `update.${evt}`, properties })
 }
 
+// 更新源：内网 Gitea 发布仓库。Gitea 不是 electron-updater 的内置 provider，
+// 且内置 github provider 在自定义 host 下走 /api/v3（Gitea 只有 /api/v1，实测 404），
+// 故先经 Gitea API v1 解析最新 release 的 tag，再把 generic feed 指向该 tag 的资产目录
+// （latest.yml + 安装包 + 差分块）。useMultipleRangeRequest:false —— Gitea 不保证支持多段 Range，
+// 强制单段差分下载；差分不可用时 electron-updater 会自动退化为整包下载。
+async function pointUpdaterAtInternalLatest() {
+  const src = effectiveConfig().updateSource || {}
+  const api = String(src.latestApi || '').trim()
+  const base = String(src.downloadBase || '').trim().replace(/\/+$/, '')
+  if (!api || !base) throw new Error('未配置内网更新源（updateSource.latestApi / updateSource.downloadBase）')
+  const res = await fetch(api, { headers: { Accept: 'application/json' } })
+  if (!res.ok) throw new Error(`内网更新源不可达（HTTP ${res.status}）：${api}`)
+  const rel = await res.json()
+  const tag = String(rel?.tag_name || '').trim()
+  if (!tag) throw new Error(`内网更新源未返回 tag_name：${api}`)
+  updater.setFeedURL({ provider: 'generic', url: `${base}/${tag}/`, useMultipleRangeRequest: false })
+  return tag
+}
+
 ipcMain.handle('update:check', async () => {
   if (!updater) return { ok: false, disabled: true }
   try {
+    const tag = await pointUpdaterAtInternalLatest()
+    console.log(`[update] 内网更新源已指向 ${tag}`)
     await updater.checkForUpdates()
     return { ok: true }
   } catch (e) {
@@ -510,13 +747,35 @@ ipcMain.handle('workspace:switch', async (_e, dir) => {
   console.log('[ws] switch start, dir=', dir)
   settings.save({ workspace: dir })
   // 工作区建立时静默 git init（引擎快照依赖：每轮对话前写入，事后 init 无法追溯此前轮次）
+  // 必须在 ensureAgentsBridge 之前：桥接的 git 防污染需要仓库已存在
   ensureWorkdirGit(dir, { init: true })
   engine.setCwd(dir) // 记录当前工作区：新会话以此为 location（引擎进程的启动目录不变）
+  // 新工作区建链：必须在 locationReload 之前 —— 引擎只在扫描 .opencode 时才发现 .agents
+  // 注意：这里【不】摘除旧工作区的联接（见设计 §5.5）——旧目录可能仍被进行中的任务/会话使用，
+  // 且用户切回去时不必重建；联接是幂等的，留着无害
+  if (agentsBridgeEnabled()) {
+    try {
+      const ab = ensureAgentsBridge(dir)
+      if (ab.linked.length) console.log('[agents-bridge] 新工作区已建立联接:', ab.linked.join(', '))
+      for (const b of ab.blocked) {
+        console.warn(`[agents-bridge] 阻断(${b.blockedBy}) rel=${b.rel}`)
+        sendEngineEvent('engine.bridge.warning', {
+          code: b.blockedBy,
+          rel: b.rel,
+          tracked: b.tracked || [],
+          repair: b.repair || null,
+          text: describeBridgeBlock(b)
+        })
+      }
+    } catch (e) {
+      console.warn('[agents-bridge] 切换工作区建链失败（已忽略）:', e.message)
+    }
+  }
   const st0 = await engine.status().catch(() => ({ running: false }))
   let mode = 'none'
   if (!st0.running) {
     // 引擎不在运行：常规启动（新进程启动目录 = 新工作区，天然一致）
-    const st = await engine.start()
+    const st = await startEngineWithBridge()
     console.log('[ws] engine was down, started with new workspace; running=', st.running)
     return { ok: true, status: st, mode: 'started' }
   }
@@ -549,10 +808,11 @@ ipcMain.handle('workspace:list', async () => {
   const list = wsLoad()
   // 尽力回填：引擎可用时按 /session 聚合目录与计数（作用域漂移/接口异常时静默降级为注册表）
   try {
-    const sessions = await bridge.listSessions()
+    const { rows: sessions, truncated } = await bridge.listSessionsWithMeta()
     const byKey = new Map(list.map((x) => [wsKey(x.dir), x]))
     const fresh = new Map() // key -> { n, last }
     for (const s of sessions) {
+      if (s.parentID) continue // 子会话不计入工作区计数与「最近使用」（设计 §5.4(a)）
       const dir = s.directory
       if (!dir || typeof dir !== 'string') continue
       const key = wsKey(dir)
@@ -568,7 +828,14 @@ ipcMain.handle('workspace:list', async () => {
     }
     for (const [key, f] of fresh) {
       const it = byKey.get(key)
-      it.count = Math.max(it.count, f.n) // 取较大值，避免作用域漂移导致计数缩水
+      // 计数策略（v2-B-2 + v2-B-6 + v3-M-3）：改为「按根会话重算覆盖」——
+      // 不能再用 Math.max，否则旧版本把子会话计入的膨胀值永远不会下降。
+      // 但**仅当本次列表未触达分页上限、且根会话数 > 0** 时才覆盖：
+      // 触达上限时 f.n 只是下界，覆盖会让计数"缩水"失真（引擎不可用/空列表同理）。
+      if (!truncated && f.n > 0) {
+        if (it.count !== f.n) console.log(`[ws] count recomputed ${it.dir}: ${it.count} -> ${f.n}`)
+        it.count = f.n
+      }
       if (f.last > it.last) it.last = f.last
     }
     wsSave(list)
@@ -768,6 +1035,150 @@ ipcMain.handle('provider:list', async () => {
 // 读取设置（apiKey 已脱敏）
 ipcMain.handle('settings:get', () => settings.public())
 
+// 智能体列表（供输入区选择器）：引擎注册表 + 标注哪些来自工作区 .agents
+// 为什么需要：`.agents/agents/*.md` 经桥接被引擎加载后，界面上原本没有任何入口能选到它们
+// （AgentPicker 曾写死 build/plan 两项）。本通道把注册表暴露给渲染层。
+// 必须带 location：不带参数的 /api/agent 永远返回「引擎进程启动目录」的注册表（实测），
+// 而 workspace:switch 是不换进程的热切换 → 会列错工作区的智能体。
+//
+// ⚠ 必须【等注册表收敛】：引擎启动后配置加载是异步的（实测：进程起来 ~1 s 时注册表为空，
+// 约 3 s 才全量）。0.6.4 首版在 server.connected 时立刻查一次 → 拿到空列表 → 选择器只剩
+// 内置两项，且不再刷新（用户可见现象："还是只能看见 build 和 plan"）。
+// 切换工作区同理：目标 location 需要被查询激活后才开始构建注册表。
+// ⚠ 两条实战教训（装了新版后再次只显示 build/plan，根因在此）：
+//   ① 不能"后到的请求作废先到的结果"：渲染层会并发发起多次查询（日志实测 3 次），
+//      旧实现用生成号把已完成的结果丢弃并返回空列表 → 选择器被刷成回退项。
+//      改为【同工作区的并发请求合并为一个】（in-flight 去重），且只在工作区真的变化时才丢弃。
+//   ② 收敛判据不能只看"连续两次样本相等"：实测 t≈2 s 时注册表已稳定但只有 4 项
+//      （.agents 还没注册完，约 3 s 才到全量）→ 过早判定"收敛"，拿到不完整的列表。
+//      改为【必须包含期望条目（工作区 .agents 推导出的 id）】才算收敛。
+const AGENTS_LIST_DEADLINE_MS = 12_000
+const AGENTS_LIST_INTERVAL_MS = 400
+
+// 轮询与整形逻辑在 agents-list.js（可单测；本文件依赖 electron 无法在 node 下测试）
+const { waitForAgentRegistry, shapeAgentList, createCoalescer } = require('./agents-list')
+
+/* 进行中的查询：同一工作区只跑一个，多个调用共享同一 Promise（并发不再互相作废） */
+const agentsListCoalescer = createCoalescer()
+
+/**
+ * 通过 DevTools 协议在【渲染进程真实 DOM】上取智能体下拉框的最终计算样式，写进主日志。
+ * 用途：真机出现"文字看不清/看不见"时，肉眼与截图都难以判定成因，
+ * 这里直接取浏览器实际生效的值（字体、颜色、不透明度、几何、文本内容），可一次性定位。
+ *
+ * 注意两件事（第一版踩过）：
+ *  ① 必须【延时】执行：agents:list 返回后 React 才重渲染，立即取样会拿到上一帧的 DOM
+ *     （第一版就误取了 ModelPicker：pop 仅 243x115、btn 是那个 91x22 的按钮）。
+ *  ② 必须精确选择器：用 .mp-opt-group 的存在与否确认这就是智能体下拉框，并报告元素数量。
+ * 任何失败都只记一行日志，绝不影响 agents:list 本身。
+ */
+async function diagnoseAgentPickerStyles(tag) {
+  if (!win || win.isDestroyed()) return
+  const wc = win.webContents
+  try {
+    if (!wc.debugger.isAttached()) wc.debugger.attach('1.3')
+  } catch {
+    return
+  }
+  const expr = `(() => {
+    const q = (s) => document.querySelector(s)
+    const pop = q('.model-pop')
+    const opts = [...document.querySelectorAll('.model-opt')]
+    const info = (el) => {
+      if (!el) return null
+      const s = getComputedStyle(el)
+      const r = el.getBoundingClientRect()
+      return { cls: el.className, text: (el.innerText || '').replace(/\\n/g, ' | ').slice(0, 60),
+               ff: s.fontFamily, fs: s.fontSize, color: s.color, opacity: s.opacity,
+               visibility: s.visibility, display: s.display, overflow: s.overflow,
+               render: s.textRendering, clip: s.clipPath, transform: s.transform,
+               rect: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)] }
+    }
+    return {
+      pop: info(pop),
+      optCount: opts.length,
+      groupCount: document.querySelectorAll('.mp-opt-group').length,
+      titleCount: document.querySelectorAll('.mp-opt-title').length,
+      descCount: document.querySelectorAll('.mp-opt-desc').length,
+      pickerBtn: info(q('.model-pick-btn')),
+      opt0: info(opts[0]),
+      title0: info(opts[0] && opts[0].querySelector('.mp-opt-title')),
+      desc0: info(opts[0] && opts[0].querySelector('.mp-opt-desc')),
+      grp0: info(q('.mp-opt-group')),
+      // 该点上最顶层的元素是谁（判断是否被遮挡）
+      hitAtOpt0: (() => { const o = opts[0]; if (!o) return null; const r = o.getBoundingClientRect()
+        const el = document.elementFromPoint(r.x + 5, r.y + r.height / 2); return el ? el.className + '|' + el.tagName : null })()
+    }
+  })()`
+  try {
+    const r = await wc.debugger.sendCommand('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: false })
+    const v = r && r.result && r.result.value
+    if (!v) {
+      console.log(`[ui-diag${tag}] 未取到（下拉框可能未打开）`)
+      return
+    }
+    const line = (k, x) =>
+      x
+        ? `[ui-diag${tag}] ${k.padEnd(9)} rect=${JSON.stringify(x.rect)} font="${String(x.ff).slice(0, 34)}" size=${x.fs} color=${x.color} opacity=${x.opacity} vis=${x.visibility} disp=${x.display} render=${x.render} text=${JSON.stringify(x.text)}`
+        : `[ui-diag${tag}] ${k.padEnd(9)} (无)`
+    console.log(`[ui-diag${tag}] 元素计数 .model-pop=${v.pop ? 1 : 0} .model-opt=${v.optCount} .mp-opt-group=${v.groupCount} .mp-opt-title=${v.titleCount} .mp-opt-desc=${v.descCount}`)
+    console.log(`[ui-diag${tag}] opt0 命中元素=${v.hitAtOpt0}`)
+    line('pop', v.pop)
+    line('pickerBtn', v.pickerBtn)
+    line('grp0', v.grp0)
+    line('opt0', v.opt0)
+    line('title0', v.title0)
+    line('desc0', v.desc0)
+  } catch (e) {
+    console.log(`[ui-diag${tag}] 取样式失败:`, e.message)
+  }
+}
+
+async function queryAgentList(ws) {
+  const expectedSet = require('./agents-bridge').expectedEntries(ws).agents
+  const { list, converged, waited } = await waitForAgentRegistry({
+    bridge,
+    workspace: ws,
+    expectedIds: expectedSet,
+    opts: { deadlineMs: AGENTS_LIST_DEADLINE_MS, intervalMs: AGENTS_LIST_INTERVAL_MS }
+  })
+  // 仅当【本工作区已不是当前工作区】时才丢弃（工作区切换期间的旧结果）；
+  // 不再用"生成号"——那会让并发的正确结果互相作废（本次故障的直接原因）。
+  if ((settings.load().workspace || null) !== ws) {
+    console.log(`[agents] 丢弃非当前工作区的结果（发起=${ws}）`)
+    return { agents: [], source: 'superseded', workspace: ws }
+  }
+  const agents = shapeAgentList(list, expectedSet)
+  console.log(
+    `[agents] 列表 ${agents.length} 个（自定义 ${agents.filter((a) => a.source === 'custom').length}）` +
+      ` 收敛=${converged} 等待=${waited}ms${converged ? '' : '（超时，可能仍在加载）'}`
+  )
+  // 顺带把下拉框文字的真实计算样式写进日志（不阻塞、不影响结果）。
+  // 两次采样：+800ms（React 应已渲染）与 +3000ms（下拉框若已打开，能看到真实布局）
+  setTimeout(() => diagnoseAgentPickerStyles('-t800').catch(() => {}), 800)
+  setTimeout(() => diagnoseAgentPickerStyles('-t3000').catch(() => {}), 3000)
+  return { agents, source: 'ok', workspace: ws, converged, waitedMs: waited }
+}
+
+ipcMain.handle('agents:list', async () => {
+  const ws = settings.load().workspace || null
+  if (!ws) return { agents: [], source: 'no-workspace', workspace: null }
+  const st = await engine.status().catch(() => ({ running: false }))
+  if (!st.running) return { agents: [], source: 'engine-down', workspace: ws }
+  try {
+    // 并发合并：同一工作区的多个调用共享同一次轮询（渲染层日志实测会并发 3 次）
+    return await agentsListCoalescer.run(ws, () =>
+      queryAgentList(ws).catch((e) => {
+        console.warn('[agents] 列表读取失败:', e.message)
+        return { agents: [], source: 'error', workspace: ws, error: e.message }
+      })
+    )
+  } catch (e) {
+    console.warn('[agents] 列表读取失败:', e.message)
+    return { agents: [], source: 'error', workspace: ws, error: e.message }
+  }
+})
+
 // 最常用模型（新对话默认模型）：无使用记录返回 null
 ipcMain.handle('settings:frequent-model', () => settings.frequentModel())
 
@@ -896,8 +1307,20 @@ ipcMain.handle('settings:save', async (_e, raw, restart = true) => {
       : []
   }
   console.log('[settings] save: restart=', restart, 'keyStatus=', JSON.stringify(keyStatus))
+  // .agents 桥接开关的 true→false 跃迁：必须在 settings.save() 之前取"旧值"
+  // （save 之后 load() 读到的已是新值，无法判断方向）
+  const bridgeWasEnabled = settings.load().agentsBridge?.enabled !== false
   const portBefore = effectiveConfig().enginePort
   settings.save(raw)
+  const bridgeNowEnabled = settings.load().agentsBridge?.enabled !== false
+  if (bridgeWasEnabled && !bridgeNowEnabled) {
+    // 遍历注册表摘链（设计 §5.5，评审 M-1）：只处理当前工作区会留下其它工作区的空壳
+    try {
+      removeAgentsBridgeEverywhere('settings:save 关闭开关')
+    } catch (e) {
+      console.warn('[agents-bridge] 关闭开关摘链失败（已忽略）:', e.message)
+    }
+  }
   applyToOpencode(opencodeConfig, settings)
   if (!restart) return { ok: true, applied: 'none' }
   // 进程级配置（引擎端口）无法热重载，必须重启进程：命中则直接走重启分支
@@ -909,7 +1332,7 @@ ipcMain.handle('settings:save', async (_e, raw, restart = true) => {
       bridge.port = portAfter
       bridge.base = `http://127.0.0.1:${portAfter}`
       await engine.stop()
-      await engine.start({ force: true })
+      await startEngineWithBridge({ force: true })
     } catch (e) {
       console.error('[settings] 端口变更重启失败:', e.message)
       return { ok: false, error: '配置已保存，但引擎重启失败：' + (e.message || e) }
@@ -925,7 +1348,7 @@ ipcMain.handle('settings:save', async (_e, raw, restart = true) => {
   try {
     await engine.stop()
     // 强制新进程：stop 已结束旧进程（含复用的端口占用者），新进程会以最新环境变量（新 key）启动
-    await engine.start({ force: true })
+    await startEngineWithBridge({ force: true })
   } catch (e) {
     console.error('[settings] 回退重启失败:', e.message)
     return { ok: false, error: '配置已保存，但引擎重启失败：' + (e.message || e) }

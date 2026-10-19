@@ -72,7 +72,8 @@ function waitPortFree(port, timeoutMs = cfg.timings.portFreeTimeoutMs, password 
 
 // 探测 opencode V2 可执行文件位置：打包版随应用分发 → 环境变量 → npm 全局安装目录
 // V2 分发渠道为 npm 包 opencode2（平台二进制包 opencode2-windows-x64，bin/opencode2.exe）
-function findOpencodeExe() {
+// 候选列表单独成函数：探测失败时由构造函数打印到日志（界面报错只保留品牌文案，技术细节落日志）
+function opencodeExeCandidates() {
   const cands = []
   // 打包版：引擎 exe 随安装包分发在应用 resources/engine 目录（extraResources，M8 换 V2 exe 后保持同名）
   if (process.resourcesPath) cands.push(path.join(process.resourcesPath, 'engine', 'opencode.exe'))
@@ -83,8 +84,12 @@ function findOpencodeExe() {
     path.join(npmRoot, 'opencode2-windows-x64', 'bin', 'opencode2.exe'),
     path.join(npmRoot, 'opencode2', 'bin', 'opencode2.exe')
   )
-  for (const c of cands) {
-    if (c && fs.existsSync(c)) return c
+  return cands.filter(Boolean)
+}
+
+function findOpencodeExe() {
+  for (const c of opencodeExeCandidates()) {
+    if (fs.existsSync(c)) return c
   }
   return null
 }
@@ -216,11 +221,12 @@ class Engine {
       }
     }
     if (!this.exe) {
-      throw new Error(
-        '未找到 opencode V2 引擎（opencode2.exe）\n' +
-          '请安装：npm i -g opencode2（国内源：npm i -g opencode2 --registry=https://registry.npmmirror.com）\n' +
-          '或设置环境变量 XWORK_OPENCODE_PATH 指向 opencode2.exe'
-      )
+      // 界面只给品牌文案（「XWork 执行引擎」），不含第三方引擎名称；
+      // 排障所需的技术细节（逐个查找过的路径、环境变量名）落到 main.log
+      console.error('[engine] 执行引擎可执行文件未找到，已查找以下路径：')
+      for (const c of opencodeExeCandidates()) console.error('[engine]   - ' + c)
+      console.error('[engine] 提示：可安装 opencode2（npm i -g opencode2），或用环境变量 XWORK_OPENCODE_PATH 指定可执行文件')
+      throw new Error('XWork 执行引擎未找到\n请检查安装是否完整，或查看日志目录获取详细信息')
     }
     // 回收残留 child（并发启动冲突进程等），避免多个 opencode 争抢端口
     if (this.child) {
@@ -290,7 +296,9 @@ class Engine {
       const h = await healthCheck(this.port, 1000, this.password)
       if (h && h.healthy) return await this.status()
     }
-    throw new Error('opencode2 启动超时\n' + outBuf.slice(-1500))
+    // 界面只给品牌文案；启动期 stdout/stderr 全文（含第三方引擎名称与错误）落日志，便于排障
+    console.error('[engine] 执行引擎启动超时，进程输出如下：\n' + outBuf.slice(-4000))
+    throw new Error('XWork 执行引擎启动超时\n请检查引擎是否被安全软件拦截，或查看日志目录获取详细信息')
   }
 
   // 停止引擎并等待进程真正退出。Windows 上 kill() 是异步终止，必须等 'exit' 事件，

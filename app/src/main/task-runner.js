@@ -5,6 +5,7 @@ const path = require('node:path')
 const { Engine, healthCheck } = require('./engine')
 const { Bridge } = require('./bridge')
 const { applyToOpencode } = require('./settings')
+const { ensureAgentsBridge } = require('./agents-bridge')
 const { HISTORY_LIMIT } = require('./tasks')
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -131,6 +132,15 @@ class TaskRunner {
       extraEnv: () => this.settings.env(), // 模型 API Key 环境变量
       onExit: (code) => this.onEngineExit(code)
     })
+    // .agents 桥接：任务工作区可能不同于主工作区，必须在 engine.start 之前建链
+    // （设计 §5.5 第 3 点：引擎只在 Location 激活时扫描 .opencode，先起引擎再建链会白跑一轮）
+    try {
+      const ab = ensureAgentsBridge(workspace)
+      if (ab.linked.length) console.log('[task-engine] agents-bridge 已建立联接:', ab.linked.join(', '))
+      for (const b of ab.blocked) console.warn(`[task-engine] agents-bridge 阻断(${b.blockedBy}) rel=${b.rel}`)
+    } catch (e) {
+      console.warn('[task-engine] agents-bridge ensure 失败（已忽略）:', e.message)
+    }
     await engine.start({ force: true })
     // 每次执行前重写配置：provider 最新 + 全部 allow（无人值守，V2 通配规则）
     applyToOpencode(path.join(xdgHome, 'config', 'opencode2', 'opencode.json'), this.settings, { allPermissions: true })

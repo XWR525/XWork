@@ -26,6 +26,26 @@ const ACTION_TO_KEY = {
 // 等待首个 step 完成的兜底上限（V1 同步 POST 无超时；此处防御 SSE 断连/事件丢失导致的永久挂起）
 const FIRST_STEP_TIMEOUT_MS = 600_000
 
+// 分页页数上限（仅防御 cursor 不前进导致的死循环；正常情况下由 cursor.next=null 自然结束）
+// 100 条/页：消息 100 页 = 10000 条，会话列表 20 页 = 2000 个
+const MAX_MESSAGE_PAGES = 100
+const MAX_SESSION_PAGES = 20
+
+// location 查询参数编码（openapi 声明为 style=deepObject + explode=true）。
+// 三个坑（实测，详见 功能设计文档/agents目录junction桥接设计.md §5.6 与 J11/J18）：
+//   ① 不带 location → 引擎解析「引擎进程启动目录」的注册表。XWork 的 workspace:switch 是【不换进程】热切换，
+//      所以工作区切换后不带参数的查询会拿到【上一个工作区】的数据（假告警，同名条目还会假通过）；
+//   ② 写成 `location.directory=`（点号）→ 引擎【静默忽略】并回落到启动目录，仍返回 200（最难发现的形态）；
+//   ③ `?location=` 单值 → 400。故必须保留中括号，值用 encodeURIComponent。
+function locationQuery(directory) {
+  return 'location[directory]=' + encodeURIComponent(directory)
+}
+
+// locationReload 的本地超时：_reqRaw 是【共用底座】（长耗时端点如 session.prompt 也在用），
+// 绝不能给它加全局 timeout，否则会截断正常对话。故超时只作用于这一次 reload 调用。
+// 实测冷态 reload 可达 72.4 s、热态 378–666 ms（设计 §5.5 第 2 点 / J8′）
+const RELOAD_TIMEOUT_MS = 90_000
+
 // 工具输出 content[]（[{type:'text', text}]）→ 纯文本
 function joinContent(content) {
   if (!Array.isArray(content)) return ''
@@ -33,6 +53,49 @@ function joinContent(content) {
     .filter((c) => c && c.type === 'text' && typeof c.text === 'string')
     .map((c) => c.text)
     .join('')
+}
+
+// 路径归一化（仅用于回显比对：大小写 + 分隔符 + 尾部分隔符差异）
+function normDir(p) {
+  return String(p || '')
+    .replace(/[\\/]+$/, '')
+    .replace(/\\/g, '/')
+    .toLowerCase()
+}
+
+// 工具错误载荷归一化（设计 §5.4(c)：引擎差异只在这一处收敛）
+// 实测（T0-② 尖刺，2026-10-16，本机会话库）：
+//   · 快照路径 state 的键恰为 status/input/error（【无 content、无 metadata】）
+//   · state.error 恒为对象 { type, message }，type ∈ permission.rejected / tool.execution / unknown / aborted
+//   · 取消/中断有结构化判据 error.type === 'aborted'（文案形如 "Tool execution interrupted: shell"）
+// 事件路径（session.tool.error）的 d.error 尚无样本 ⇒ 对象取 message、字符串原样、空回落。
+// 与渲染层 subagentModel.normalizeToolError 同源规则；两侧不互相 require，以保持 main/renderer 依赖边界。
+function normalizeToolErrorShape(err) {
+  if (err === undefined || err === null || err === '') return { text: '', type: '', raw: null }
+  if (typeof err === 'string') return { text: err, type: '', raw: null }
+  return { text: String(err.message || err.error || ''), type: String(err.type || ''), raw: err }
+}
+
+/**
+ * location 回显断言（设计 §5.6 / 评审 M-13）。
+ * 三个端点（/api/agent、/api/command、/api/config）的响应体自带 `location.directory`，
+ * 这是"本次查询确实针对目标工作区"的**唯一直接证据**。
+ * 为什么必须有它：参数写成点号形态时引擎【静默回落】到启动目录并返回 200 —— 只校验"URL 带了 location"
+ * 无法发现这种回归，自检会给出假通过。
+ */
+function ensureLocationEcho(json, expectDirectory, endpoint) {
+  const got = json && json.location && json.location.directory
+  if (!got) {
+    const err = new Error(`${endpoint}: 响应缺少 location.directory，无法确认查询目标`)
+    err.code = 'ELOCATIONNOECHO'
+    throw err
+  }
+  if (normDir(got) !== normDir(expectDirectory)) {
+    const err = new Error(`${endpoint}: location 回显不匹配（期望 ${expectDirectory}，实得 ${got}）—— 可能是 location 参数形态错误（点号会被静默忽略）`)
+    err.code = 'ELOCATIONMISMATCH'
+    throw err
+  }
+  return got
 }
 
 class Bridge {
@@ -56,13 +119,30 @@ class Bridge {
     return h
   }
 
-  // 统一请求：自动 Basic Auth + {data} 解包 + 204 → null；失败抛出带状态码与响应片段的错误
-  async _req(method, p, body) {
-    const res = await fetch(this.base + p, {
-      method,
-      headers: this._headers(body !== undefined),
-      body: body !== undefined ? JSON.stringify(body) : undefined
-    })
+  // 底层请求：自动 Basic Auth + 204 → null；失败抛出带状态码与响应片段的错误。
+  // 返回**完整响应信封**（不拆 {data}）——分页端点（/api/session、/api/session/{id}/message）
+  // 的形状是 {data, cursor}，cursor 是分页游标：一旦被拆掉，分页就永远只能取到第一页
+  // opts.timeoutMs：仅对本次调用生效的 AbortSignal 超时（默认不设，见 RELOAD_TIMEOUT_MS 的说明）
+  async _reqRaw(method, p, body, opts = {}) {
+    const { timeoutMs } = opts
+    let res
+    try {
+      res = await fetch(this.base + p, {
+        method,
+        headers: this._headers(body !== undefined),
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {})
+      })
+    } catch (e) {
+      // 超时必须与普通失败区分（调用方的降级策略不同：超时 = 结果未知，不能判定业务失败）
+      if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) {
+        const err = new Error(`${method} ${p} timeout after ${timeoutMs}ms`)
+        err.code = 'ETIMEDOUT'
+        err.timeout = true
+        throw err
+      }
+      throw e
+    }
     if (res.status === 204) return null
     if (!res.ok) {
       let detail = ''
@@ -73,26 +153,45 @@ class Bridge {
       }
       throw new Error(`${method} ${p} ${res.status}${detail ? ': ' + detail : ''}`)
     }
-    const json = await res.json()
+    return await res.json()
+  }
+
+  // 统一请求：自动 `{data}` 解包；非分页端点用这个，分页端点必须用 _reqRaw
+  // opts.timeoutMs 透传给 _reqRaw；opts.expectDirectory 用于 location 回显断言（见 ensureLocationEcho）
+  async _req(method, p, body, opts = {}) {
+    const json = await this._reqRaw(method, p, body, opts)
+    if (opts.expectDirectory !== undefined) ensureLocationEcho(json, opts.expectDirectory, p)
     return json && typeof json === 'object' && 'data' in json ? json.data : json
   }
 
   // ---- 会话 ----
 
   // 会话列表（V1 兼容：附带 directory 字段 = location.directory，供工作区登记/清理使用）
-  async listSessions() {
+  // 分页：SessionsResponse = { data, cursor }，必须用 _reqRaw 保留 cursor 才能翻页
+  // （旧实现用 _req 拆掉信封后读不到 cursor.next，超过 100 个会话时列表被静默截断）
+  // 会话列表 + 「是否触达分页上限」的**局部**元数据（设计 §5.4(a) ③ / 评审 v3-M-3）。
+  // 为什么返回对象而不是用实例字段承载 truncated：bridge 是单例，
+  // session:list（渲染层高频刷新）与 workspace:list 会并发调用同一方法，
+  // 实例级标志会被后完成的调用覆盖 ⇒ 可能用"下界"覆盖工作区计数（正是要修的那个 bug）。
+  async listSessionsWithMeta() {
     const out = []
     let cursor = ''
-    for (let page = 0; page < 10; page++) {
+    for (let page = 0; page < MAX_SESSION_PAGES; page++) {
       const p = '/api/session?limit=100' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : '')
-      const data = await this._req('GET', p)
-      const rows = Array.isArray(data) ? data : []
+      const env = await this._reqRaw('GET', p)
+      const rows = Array.isArray(env?.data) ? env.data : []
       for (const s of rows) out.push({ ...s, directory: s.location?.directory || s.directory })
-      const next = data && !Array.isArray(data) ? data.cursor?.next : null
-      if (!rows.length || !next) break
-      cursor = next
+      cursor = env?.cursor?.next || ''
+      if (!rows.length || !cursor) break
     }
-    return out
+    const truncated = !!cursor
+    if (truncated) console.warn(`[bridge] listSessions 达到分页上限（${MAX_SESSION_PAGES} 页），更早的会话未列出`)
+    return { rows: out, truncated }
+  }
+
+  // 兼容入口：返回形状不变（session:list IPC 直接把数组交给渲染层，改形状会波及所有调用点）
+  async listSessions() {
+    return (await this.listSessionsWithMeta()).rows
   }
 
   // 已加载的模型提供商列表（{location, data} 原样返回；渲染层模型下拉实际来自设置模型组，此接口为遗留保留）
@@ -135,6 +234,23 @@ class Bridge {
     return true
   }
 
+  /**
+   * 切换 agent 的**带信号**版本（设计 §5.5(b) / 评审 v2-B-4 的落点修正）。
+   * 为什么必须由主进程返回信号：渲染层只拿到 messageSend 的最终消息，看不到 switchAgent 的失败，
+   * 于是"用户显式选了一个不可用/无权限的智能体"会静默按引擎默认 agent 发送。
+   * @returns {null | {agent:string, message:string}} 失败时返回结构化信号，成功返回 null
+   */
+  async _switchAgentSafe(sessionID, agent) {
+    try {
+      await this.switchAgent(sessionID, agent)
+      return null
+    } catch (e) {
+      // 未知 agent 名不阻塞发送（V2 对 agent 校验更严），但必须把失败**带回去**给用户看
+      console.warn('[bridge] switchAgent failed (reported to renderer):', e.message)
+      return { agent, message: e.message }
+    }
+  }
+
   // 投递用户消息（立即返回收件箱回执，不等待模型回复）
   // 体形自适应：V2 各构建 prompt 体不同 —— opencode2 2.6+ 为扁平 {text}；
   // 1.18.x 的 V2 兼容层为嵌套 {prompt:{text}}（实测报错 Missing key at ["prompt"]）。
@@ -166,14 +282,7 @@ class Bridge {
   // 实时过程仍由全局事件流推送；多 turn 任务由 session.idle（归一化自 execution.succeeded）收尾
   async sendMessage(sessionID, text, model, agent) {
     if (model && model.providerID && model.modelID) await this.switchModel(sessionID, model)
-    if (agent) {
-      try {
-        await this.switchAgent(sessionID, agent)
-      } catch (e) {
-        // 未知 agent 名不阻塞发送（V2 对 agent 校验更严），记录后继续
-        console.warn('[bridge] switchAgent failed (ignored):', e.message)
-      }
-    }
+    const agentSwitchFailed = agent ? await this._switchAgentSafe(sessionID, agent) : null
     await this.prompt(sessionID, text)
     // 等待首个 step 完成：优先事件等待（SSE 存活时），否则轮询兜底
     let asstID = null
@@ -183,19 +292,21 @@ class Bridge {
       asstID = await this._pollFirstStep(sessionID)
     }
     // 拉取权威数据并返回目标 assistant 消息（V1 形状）
+    // agent 切换失败信号只在失败时附加（成功路径的返回形状保持完全不变）
+    const attach = (msg) => (agentSwitchFailed ? { ...msg, agentSwitchFailed } : msg)
     try {
       const msgs = await this.getMessages(sessionID)
       const assts = msgs.filter((m) => m.info.role === 'assistant')
       const hit = asstID ? assts.find((m) => m.info.id === asstID) : null
-      if (hit) return hit
-      if (assts.length) return assts[assts.length - 1]
+      if (hit) return attach(hit)
+      if (assts.length) return attach(assts[assts.length - 1])
     } catch {
       /* 拉取失败则返回最小占位，避免上层 undefined 崩溃 */
     }
-    return {
+    return attach({
       info: { id: asstID || 'unknown', role: 'assistant', finish: 'error', error: { name: 'EngineError', message: '未获取到模型回复' } },
       parts: []
-    }
+    })
   }
 
   // 事件等待：由 watchGlobal 的内部分发在首个「带 finish 的 message.updated / session.idle / session.error」时唤醒
@@ -246,6 +357,33 @@ class Bridge {
 
   // ---- 消息列表整形：V2 扁平条目 → V1 {info, parts} ----
 
+  // 工具 part 的 state 整形（设计 §5.4(c) P11 + v3-B-3/v3-M-7）
+  //   · 时间：引擎快照是 { created, ran, completed }（只有 created 必填），
+  //     而消费端（ToolCard）读 { start, end } —— 此前两边对不上，导致所有工具卡都不显示时间。
+  //     start 取 ran（执行开始；created 含模型生成工具参数的时间，长参数工具偏差可达秒级）
+  //     end 取 completed ?? ran
+  //   · 错误：按 normalizeToolErrorShape 归一化为字符串 error + errorType（取消判定）+ errorRaw
+  _mapToolState(c) {
+    const st = c.state || {}
+    const state = {
+      status: st.status || (c.executed ? 'completed' : 'pending'),
+      input: st.input,
+      output: joinContent(st.content),
+      metadata: st.metadata,
+      time: {
+        start: c.time?.ran ?? c.time?.created,
+        end: c.time?.completed ?? c.time?.ran
+      }
+    }
+    if (st.error !== undefined && st.error !== null) {
+      const e = normalizeToolErrorShape(st.error)
+      state.error = e.text || '工具执行失败'
+      state.errorType = e.type
+      state.errorRaw = e.raw
+    }
+    return state
+  }
+
   _mapMessageEntry(e) {
     if (!e || typeof e !== 'object') return null
     const created = e.time?.created
@@ -281,13 +419,7 @@ class Bridge {
             callID: c.id,
             type: 'tool',
             tool: c.name,
-            state: {
-              status: c.state?.status || (c.executed ? 'completed' : 'pending'),
-              input: c.state?.input,
-              output: joinContent(c.state?.content),
-              metadata: c.state?.metadata,
-              time: c.time
-            }
+            state: this._mapToolState(c)
           }
         }
         return { id: c.id || `${e.id}-c${i}`, type: c.type, text: c.text || '' }
@@ -303,23 +435,47 @@ class Bridge {
         parts: [{ id: e.id + '-compaction', type: 'compaction', text: e.summary || '' }]
       }
     }
-    return null // idle / model-switched / agent-switched 等非消息条目
+    // synthetic 消息（设计 §5.4(d) P12）：只映射 metadata.source === 'subagent' 的通知，
+    // 其余一律丢弃（引擎内部通知不得灌进 UI，见 §5.4(d) 与"原生 type='system' 不映射"的约定）。
+    // 实测（T0-③，2026-10-16）：synthetic 是 session_message 的一等条目（会出现在 GET /message 里），
+    //   形如 { metadata:{ source, state, … }, time:{created}, text, description } —— 【没有顶层 sessionID】，
+    //   故绑定目标只能取 metadata.childID；本次样本是 source='shell'（后台 shell 命令完成通知），
+    //   subagent 走同一机制、键为 childID/agent/state（V10）。
+    if (e.type === 'synthetic' && e.metadata && e.metadata.source === 'subagent') {
+      const notice = {
+        childID: e.metadata.childID || '',
+        agent: e.metadata.agent || '',
+        state: e.metadata.state || '', // completed | error | cancelled（V10；注意不是 failed）
+        description: e.description || ''
+      }
+      return {
+        info: { id: e.id, role: 'system', time: { created }, subagentNotice: notice },
+        parts: [{ id: e.id + '-synthetic', type: 'synthetic', text: e.text || '', subagentNotice: notice }]
+      }
+    }
+    return null // idle / model-switched / agent-switched / 其余 synthetic（含指令通知型 system）等非消息条目
   }
 
   async getMessages(sessionID) {
-    // 升序分页拉全量（V1 GET 返回全量数组；默认 limit=100 封顶 20 页 ≈ 2000 条，足够会话回看）
+    // 升序分页拉全量。V2 契约（openapi SessionMessagesResponse）：{ data: [...], cursor: { previous, next } }
+    // 两条必须遵守的规则（实测踩过，二者叠加会导致长会话只能回看到首页 100 条）：
+    // ① cursor 在整个信封里，用 _req 拆 {data} 会把它丢掉 → 循环第一页就 break；
+    // ② cursor 与 order 互斥，组合会 400 InvalidCursorError（"Cursor cannot be combined with order"），
+    //    故仅首页带 order=asc，后续页只带 cursor（cursor 自身已编码排序方向）
     const entries = []
     let cursor = ''
-    for (let page = 0; page < 20; page++) {
-      const p =
-        `/api/session/${sessionID}/message?limit=100&order=asc` +
-        (cursor ? '&cursor=' + encodeURIComponent(cursor) : '')
-      const data = await this._req('GET', p)
-      const rows = Array.isArray(data) ? data : []
+    for (let page = 0; page < MAX_MESSAGE_PAGES; page++) {
+      const p = cursor
+        ? `/api/session/${sessionID}/message?limit=100&cursor=${encodeURIComponent(cursor)}`
+        : `/api/session/${sessionID}/message?limit=100&order=asc`
+      const env = await this._reqRaw('GET', p)
+      const rows = Array.isArray(env?.data) ? env.data : []
       entries.push(...rows)
-      const next = data && !Array.isArray(data) ? data.cursor?.next : null
-      if (!rows.length || !next) break
-      cursor = next
+      cursor = env?.cursor?.next || ''
+      if (!rows.length || !cursor) break
+    }
+    if (cursor) {
+      console.warn(`[bridge] getMessages(${sessionID}) 达到分页上限（${MAX_MESSAGE_PAGES} 页），会话末尾仍有消息未加载`)
     }
     const out = []
     for (const e of entries) {
@@ -343,16 +499,39 @@ class Bridge {
 
   // ---- 配置热重载（V2 能力）----
   // POST /api/location/reload：让引擎重新读取配置（opencode.json / AGENTS.md 等），无需重启进程。
-  // 实测（迁移文档 Phase 4-A）：新增/删除 provider 与模型、权限规则均即时生效；且**不会打断正在运行的任务**
+  // 实测（迁移文档 Phase 4-A）：新增/删除 provider 与模型、权限规则均即时生效；且**不会打断正在运行的任务**。
+  //
+  // ⚠ 三点实测约束（设计 §5.5 第 2 点 / J12 / J8′）：
+  //   ① 它是**全局**动作：会清空并重建【所有已加载 location】的注册表（多实例会互相干扰）；
+  //   ② 冷态可耗时 **72.4 s**（热态 378–666 ms），故必须带超时，否则会长时间阻塞 workspace:switch；
+  //   ③ 客户端 abort **不能阻止**服务端清空：实测响应返回后约 2 s 注册表才被清空、约 4 s 恢复。
+  //      因此"超时"只意味着**结果未知**（调用方不得据此判定业务失败，见 index.js 的降级处理）。
   async locationReload() {
-    await this._req('POST', '/api/location/reload', {})
+    await this._req('POST', '/api/location/reload', {}, { timeoutMs: RELOAD_TIMEOUT_MS })
     return true
   }
 
-  // 引擎当前已加载的配置文档清单（[{type:'document', path, info:<解析后的配置>}]）——用于热重载后校验生效
-  async configEntries() {
-    const data = await this._req('GET', '/api/config')
+  // 引擎当前已加载的配置文档清单（[{type:'document', path, info:<解析后的配置>}]）——用于热重载后校验生效。
+  // directory 给定时按该 location 查询：热切换工作区后不带参数的查询会列出【上一个工作区】的配置根
+  // （评审 M-5）——既有调用点（tryHotReload 只匹配全局 opencode.json）因为全局目录与 location 无关而未暴露该问题。
+  async configEntries(directory) {
+    const p = '/api/config' + (directory ? '?' + locationQuery(directory) : '')
+    const data = await this._req('GET', p, undefined, directory ? { expectDirectory: directory } : {})
     return Array.isArray(data) ? data : []
+  }
+
+  // ---- 按 location 的只读查询（设计 §5.6；agents 桥接自检用）----
+  // 必须带 location：否则永远返回「引擎进程启动目录」的注册表（J11/J18）
+  async agents(directory) {
+    return await this._req('GET', '/api/agent?' + locationQuery(directory), undefined, {
+      expectDirectory: directory
+    })
+  }
+
+  async commands(directory) {
+    return await this._req('GET', '/api/command?' + locationQuery(directory), undefined, {
+      expectDirectory: directory
+    })
   }
 
   // 引擎信息（version/pid/urls）——pid 可用于确认引擎是否被重启过
@@ -586,7 +765,7 @@ class Bridge {
           properties: {
             sessionID: d.sessionID,
             messageID: d.assistantMessageID,
-            part: { id: d.id, callID: d.id, type: 'tool', tool: d.name, state: { status: 'pending', input: {}, time: {} } }
+            part: { id: d.id, callID: d.id, type: 'tool', tool: d.name, state: { status: 'pending', input: {}, time: { start: evt.created } } }
           }
         })
         break
@@ -601,7 +780,7 @@ class Bridge {
               callID: d.id,
               type: 'tool',
               tool: this._toolNames.get(`${d.sessionID}:${d.id}`) || d.name,
-              state: { status: 'running', input: d.input || {}, time: {} }
+              state: { status: 'running', input: d.input || {}, time: { start: evt.created } }
             }
           }
         })
@@ -617,7 +796,9 @@ class Bridge {
               callID: d.id,
               type: 'tool',
               tool: this._toolNames.get(`${d.sessionID}:${d.id}`),
-              state: { status: 'running', metadata: d.metadata, time: {} }
+              // progress 刻意【不带 time】（设计 §5.4(c)）：否则会把后到的 progress 当成
+              // 时间更新，覆盖掉 started/called 写入的 start
+              state: { status: 'running', metadata: d.metadata }
             }
           }
         })
@@ -633,7 +814,7 @@ class Bridge {
               callID: d.id,
               type: 'tool',
               tool: this._toolNames.get(`${d.sessionID}:${d.id}`),
-              state: { status: 'completed', output: joinContent(d.content), metadata: d.metadata, time: {} }
+              state: { status: 'completed', output: joinContent(d.content), metadata: d.metadata, time: { end: evt.created } }
             }
           }
         })
@@ -649,7 +830,18 @@ class Bridge {
               callID: d.id,
               type: 'tool',
               tool: this._toolNames.get(`${d.sessionID}:${d.id}`) || d.name,
-              state: { status: 'error', error: d.error || d.message || '工具执行失败', time: {} }
+              // 错误载荷归一化（T0-②）：error 统一为字符串，errorType 保留结构化类型
+              // （取消判定用 errorType==='aborted'，不再靠文案猜测），errorRaw 留原始对象排障
+              state: (() => {
+                const e = normalizeToolErrorShape(d.error !== undefined ? d.error : d.message)
+                return {
+                  status: 'error',
+                  error: e.text || '工具执行失败',
+                  errorType: e.type,
+                  errorRaw: e.raw,
+                  time: { end: evt.created }
+                }
+              })()
             }
           }
         })
@@ -753,4 +945,5 @@ class Bridge {
   }
 }
 
-module.exports = { Bridge }
+// 导出纯函数便于单测（locationQuery 的中括号形态与回显断言是最易回归的两处）
+module.exports = { Bridge, locationQuery, ensureLocationEcho, normDir, RELOAD_TIMEOUT_MS }

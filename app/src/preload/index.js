@@ -47,6 +47,8 @@ contextBridge.exposeInMainWorld('xwork', {
   sessionRename: (sessionID, title) => ipcRenderer.invoke('session:rename', sessionID, title),
   providerList: () => ipcRenderer.invoke('provider:list'),
   getSettings: () => ipcRenderer.invoke('settings:get'),
+  // 智能体列表（输入区选择器）：含 source 标注（custom=工作区 .agents 定义）
+  agentList: () => ipcRenderer.invoke('agents:list'),
   saveSettings: (settings, restart) => ipcRenderer.invoke('settings:save', settings, restart),
   getTheme: () => ipcRenderer.invoke('settings:get-theme'),
   applyTheme: (theme) => ipcRenderer.invoke('settings:apply-theme', theme),
