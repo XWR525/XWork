@@ -1266,7 +1266,10 @@ export default function App() {
     for (const m of messages) {
       const notice = m.subagentNotice || (m.parts || []).map((p) => p.subagentNotice).find(Boolean)
       if (!notice || !notice.childID || !notice.state) continue
-      subagentLive.digest(notice.childID, { noticeState: notice.state })
+      // noticeAt：后台任务的耗时要用**通知到达时间**收尾 —— 引擎在后台化那一刻就把 time.end 定住了，
+      // 直接用 part 的 time 会显示成"2.1s"，而实际跑了 45s（2026-10-19 截图发现）
+      const at = m.time && (m.time.created || m.time.completed)
+      subagentLive.digest(notice.childID, { noticeState: notice.state, noticeAt: at || Date.now() })
     }
   }, [messages])
   useEffect(() => {
@@ -5553,7 +5556,8 @@ const SubagentCard = memo(function SubagentCard({ part, onShowPanel, variant, pa
   const name = input.agent || (live && live.agent) || (level === 2 ? '未知子智能体' : '')
   const desc = input.description || (live && live.description) || ''
   const time = st.time || {}
-  const dur = fmtDur(time.start, time._tEnd || time.end)
+  // 后台任务的耗时以通知到达时间为终点（引擎在后台化时就定住了 time.end，会显示成 2s 而不是真实的 45s）
+  const dur = fmtDur(time.start, (live && live.noticeAt) || time._tEnd || time.end)
   const activity = (live && live.lastText) || (phase === PHASE.running ? '执行中…' : '')
   const conclusion = phase === PHASE.completed ? conclusionText({ partState: st, live }).text : ''
   const errText =
