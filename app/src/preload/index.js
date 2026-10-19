@@ -45,6 +45,7 @@ contextBridge.exposeInMainWorld('xwork', {
   sessionCreate: (title, permission) => ipcRenderer.invoke('session:create', { title, permission }),
   sessionDelete: (sessionID) => ipcRenderer.invoke('session:delete', sessionID),
   sessionRename: (sessionID, title) => ipcRenderer.invoke('session:rename', sessionID, title),
+  sessionBackground: (sessionID) => ipcRenderer.invoke('session:background', sessionID),
   providerList: () => ipcRenderer.invoke('provider:list'),
   getSettings: () => ipcRenderer.invoke('settings:get'),
   // 智能体列表（输入区选择器）：含 source 标注（custom=工作区 .agents 定义）

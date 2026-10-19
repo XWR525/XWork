@@ -235,6 +235,17 @@ class Bridge {
   }
 
   /**
+   * 把该会话正在**前台运行**的工具（子智能体/长命令）移到后台继续跑（T0-③ 实测机制，2026-10-19）。
+   * ⚠ 前置条件：该工具**已经开始执行**（子会话里已出现 tool call）；过早调用返回 204 但**无效果**。
+   * 调用成功后引擎把父侧 tool part 改成 `status='completed'` + `metadata.status='running'`；完成时
+   * 再往父会话写一条 `metadata.source='subagent'` 的 synthetic 通知。
+   */
+  async sessionBackground(sessionID) {
+    await this._req('POST', `/api/session/${sessionID}/background`)
+    return true
+  }
+
+  /**
    * 切换 agent 的**带信号**版本（设计 §5.5(b) / 评审 v2-B-4 的落点修正）。
    * 为什么必须由主进程返回信号：渲染层只拿到 messageSend 的最终消息，看不到 switchAgent 的失败，
    * 于是"用户显式选了一个不可用/无权限的智能体"会静默按引擎默认 agent 发送。

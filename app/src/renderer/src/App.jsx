@@ -1258,6 +1258,18 @@ export default function App() {
     if (timings && typeof timings.subagentLiveMs === 'number') subagentLive.setThrottleMs(timings.subagentLiveMs)
   }, [timings])
   useEffect(() => {
+    // 后台完成纠正（T0-③，2026-10-19 实测）：引擎**不会**把 part 的 metadata.status 从 running 改掉，
+    // 唯一的完成事实是父会话里那条 `metadata.source='subagent'` 的 synthetic
+    // （bridge 已映射成 role:'system' + subagentNotice → 渲染为通知条）。
+    // 这里把它写进摘要的 noticeState，judgePhase 据此把「后台运行中」收口成终态，
+    // 否则卡片会永远停在后台态。
+    for (const m of messages) {
+      const notice = m.subagentNotice || (m.parts || []).map((p) => p.subagentNotice).find(Boolean)
+      if (!notice || !notice.childID || !notice.state) continue
+      subagentLive.digest(notice.childID, { noticeState: notice.state })
+    }
+  }, [messages])
+  useEffect(() => {
     // 通知条去重（设计 §5.3 第 8 点）：本会话里存在 subagent tool part 的子会话 ⇒ 通知条折叠成一行。
     // 用 effect 同步而不是 props —— messages 高频变化，进 props 会让 memo 化的 MessageView 全部失效
     subagentLive.setKnownChildren(
@@ -2823,6 +2835,7 @@ export default function App() {
                   busy={busy}
                   readOnly={isChildView}
                   onShowSubagentInPanel={showSubagentInPanel}
+                  parentSid={isChildView ? childViewSid : currentID}
                 />
               ))}
               {!isChildView && busy && (
@@ -2971,14 +2984,14 @@ export default function App() {
                 <>
                   {/* 置顶区：运行中/后台/收尾中的子智能体卡常驻最上方（不参与下面的分页计数） */}
                   {pinnedSteps.map((s) => (
-                    <SubagentCard key={s.key} part={s.part} variant="panel" />
+                    <SubagentCard key={s.key} part={s.part} variant="panel" parentSid={isChildView ? childViewSid : currentID} />
                   ))}
                   {/* 分页：倒序展示（最新在上、更早在下），只渲染最近 toolVisible 条；
                       隐藏的是最早的记录，底部按钮向下逐批加载更早的。
                       计数只统计普通工具卡（otherSteps），置顶卡不计入（§5.3 第 7 点） */}
                   {otherSteps.slice(-toolVisible).reverse().map((s) =>
                     s.part.tool === 'subagent' ? (
-                      <SubagentCard key={s.key} part={s.part} variant="panel" />
+                      <SubagentCard key={s.key} part={s.part} variant="panel" parentSid={isChildView ? childViewSid : currentID} />
                     ) : (
                       <ToolCard key={s.key} part={s.part} />
                     )
@@ -5500,7 +5513,7 @@ const SubagentChildView = memo(function SubagentChildView({ childSid, agent, onS
 // `variant="panel"` 只多一个**默认折叠**的「原始输入/输出」入口，不改变摘要区。
 // props 刻意只有【稳定的 part 引用】+ 一个稳定回调：摘要经 store 自订阅进入，否则 memo 化的
 // MessageView 会因每次节流 setState 而全部失效（v2-B-4）。
-const SubagentCard = memo(function SubagentCard({ part, onShowPanel, variant }) {
+const SubagentCard = memo(function SubagentCard({ part, onShowPanel, variant, parentSid }) {
   const st = part.state || {}
   const childSid = childSessionId(st)
   const sub = useCallback((cb) => (childSid ? subagentLive.subscriber(childSid)(cb) : () => {}), [childSid])
@@ -5523,6 +5536,7 @@ const SubagentCard = memo(function SubagentCard({ part, onShowPanel, variant }) 
     return () => clearTimeout(timer)
   }, [open])
   const [abortErr, setAbortErr] = useState('')
+  const [bgBusy, setBgBusy] = useState(false)
   const t = subagentLive.timings() || {}
   const input = st.input || {}
   // phase 在渲染期重算（而不是只读 store 里的缓存值）：这样"心跳"带来的时间推进
@@ -5561,6 +5575,19 @@ const SubagentCard = memo(function SubagentCard({ part, onShowPanel, variant }) 
       setTimeout(() => setAbortErr(''), 4000)
     })
   }
+  // 移到后台（T0-③ 实测：前置条件是子智能体**已开始执行自己的工具**，否则引擎返回 204 但无效果）
+  const canBackground = phase === PHASE.running && ((live && live.toolCount) || 0) > 0 && !!parentSid
+  const onMoveToBackground = () => {
+    if (!parentSid || bgBusy) return
+    setBgBusy(true)
+    window.xwork
+      .sessionBackground(parentSid)
+      .catch((e) => {
+        setAbortErr('移到后台失败：' + ((e && e.message) || String(e)))
+        setTimeout(() => setAbortErr(''), 4000)
+      })
+      .finally(() => setBgBusy(false))
+  }
   return (
     <div className={`subagent-card ${phase}`}>
       <div className="subagent-head">
@@ -5588,6 +5615,16 @@ const SubagentCard = memo(function SubagentCard({ part, onShowPanel, variant }) 
         {canTerminate(phase) && childSid ? (
           <button className="tool-expand" onClick={onAbort}>
             终止
+          </button>
+        ) : null}
+        {canBackground ? (
+          <button
+            className="tool-expand"
+            onClick={onMoveToBackground}
+            disabled={bgBusy}
+            title="让子智能体继续在后台跑，父会话不再等待；完成后会收到通知"
+          >
+            {bgBusy ? '移到后台…' : '移到后台'}
           </button>
         ) : null}
         {abortErr ? <span className="subagent-error">{abortErr}</span> : null}
@@ -5670,7 +5707,7 @@ function isPinnedSubagentPart(part) {
   return ph === PHASE.running || ph === PHASE.background || ph === PHASE.finalizing
 }
 
-const MessageView = memo(function MessageView({ m, onCopy, onUndo, canUndo, gitAvailable, busy, readOnly, onShowSubagentInPanel }) {
+const MessageView = memo(function MessageView({ m, onCopy, onUndo, canUndo, gitAvailable, busy, readOnly, onShowSubagentInPanel, parentSid }) {
   const mdText = m.parts.filter((p) => p.type === 'text').map((p) => p.text || '').join('\n')
   // 子智能体通知条必须在 user/assistant 分支【之前】返回：否则 role='system' 会落进 assistant 分支，
   // 由于它没有 text part（mdText 为空）而渲染成一个空白气泡（设计 §5.4(d) 第 2 点 / v3-B-3）
@@ -5724,7 +5761,8 @@ const MessageView = memo(function MessageView({ m, onCopy, onUndo, canUndo, gitA
           }
           if (p.type === 'tool') {
             // 子智能体（L1）：改渲染 <SubagentCard>（取代 [工具] subagent · 完成 的灰 chip）
-            if (p.tool === 'subagent') return <SubagentCard key={i} part={p} onShowPanel={onShowSubagentInPanel} />
+            if (p.tool === 'subagent')
+              return <SubagentCard key={i} part={p} onShowPanel={onShowSubagentInPanel} parentSid={parentSid} />
             // 普通工具：`[工具] read · 完成` 芯片，点击展开输入/输出（与面板同一份 ToolIOView）
             return <ToolChip key={i} part={p} />
           }

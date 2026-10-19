@@ -904,6 +904,9 @@ ipcMain.handle('session:delete', (_e, sessionID) => bridge.deleteSession(session
 
 ipcMain.handle('session:rename', (_e, sessionID, title) => bridge.renameSession(sessionID, title))
 
+// 把正在前台运行的工具移到后台（T0-③ 实测机制；前置：工具已开始执行）
+ipcMain.handle('session:background', (_e, sessionID) => bridge.sessionBackground(sessionID))
+
 // 目标轮次前快照 T_before（V2 版）：V2 把快照挂在 assistant 条目上（snapshot{start,end,files}，
 // start = 本轮编辑前 tree，end = 本轮编辑后 tree —— 实测确认，见迁移文档 §14）。
 // 回退到目标 user 消息之前 → 取目标轮次首个 assistant 的 snapshot.start；

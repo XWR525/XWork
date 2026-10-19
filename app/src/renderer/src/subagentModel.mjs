@@ -159,7 +159,10 @@ export function judgePhase({
   now = Date.now(),
   graceMs = 5000,
   unknownAfterMs = 15000,
-  allowBackground = false
+  // T0-③ 已于 2026-10-19 闭环（载荷 + 完成通知均实测），故默认允许后台态。
+  // 注意：引擎**不会**更新 part 的 `metadata.status`（后台化后永远是 'running'），
+  // 所以后台态的终态纠正在下面的完成态分支里由 synthetic 通知或会话 outcome 收口。
+  allowBackground = true
 } = {}) {
   const st = partState || {}
   const status = st.status
@@ -186,7 +189,20 @@ export function judgePhase({
 
   // 3) / 4) / 5) 完成态
   if (status === 'completed') {
-    if (allowBackground && meta.status === 'running') return PHASE.background
+    if (allowBackground && meta.status === 'running') {
+      // 后台态的**终态纠正**（实测：引擎不会把 metadata.status 从 running 改掉）：
+      //  ① synthetic 完成通知：父会话里那条 `metadata.source='subagent'` 的消息带 `state`，
+      //     由 App 在 messages 变化时写入摘要的 `noticeState`；
+      //  ② 会话记录的 outcome（succeeded/failed/interrupted）作为第二来源。
+      const n = live && live.noticeState
+      if (n === 'completed') return PHASE.completed
+      if (n === 'error') return PHASE.failed
+      if (n === 'cancelled') return PHASE.cancelled
+      if (outcome === 'succeeded') return PHASE.completed
+      if (outcome === 'failed') return PHASE.failed
+      if (outcome === 'interrupted') return PHASE.cancelled
+      return PHASE.background
+    }
     const summaryReady = (live && live.finalText) || out.text || out.wrapped
     const withinGrace = landedAt != null && now - landedAt < graceMs
     if (!summaryReady && (withinGrace || meta.truncated === true)) return PHASE.finalizing
