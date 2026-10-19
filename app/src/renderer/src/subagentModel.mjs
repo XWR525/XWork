@@ -355,3 +355,62 @@ export function livePatchFromSubagentPart(part, { prev = null, generation = null
   return { childSid, patch }
 }
 
+
+// ── 执行中的一行提示（2026-10-19 优化）──────────────────────────────────────
+// 旧文案是 `AI 正在执行中… 正在${tool}`，直接拼英文工具名 ⇒ 出现「正在subagent」这种半截中文+英文。
+// 这里统一：工具名给中文短标签；子智能体额外显示"在等谁"（agent + 描述），让人知道卡在哪。
+export const TOOL_LABEL_ZH = {
+  read: '读取文件',
+  write: '写入文件',
+  edit: '修改文件',
+  patch: '修改文件',
+  glob: '查找文件',
+  grep: '搜索内容',
+  shell: '执行命令',
+  webfetch: '抓取网页',
+  websearch: '联网搜索',
+  todowrite: '更新待办',
+  todoread: '读取待办',
+  question: '向你提问',
+  subagent: '子智能体',
+  task: '子智能体'
+}
+
+/** 工具名 → 中文短标签（未知工具回落原名，不吞信息） */
+export function toolLabelZh(name) {
+  const raw = String(name || '')
+  const key = raw.toLowerCase()
+  return TOOL_LABEL_ZH[key] || raw || '工具'
+}
+
+const trimEllipsis = (s, n) => {
+  const t = String(s || '').replace(/\s+/g, ' ').trim()
+  return t.length > n ? t.slice(0, n - 1) + '…' : t
+}
+
+/**
+ * 执行中提示文案（busy hint）：
+ *  - stopping            → 「正在停止…」
+ *  - 子智能体            → 「AI 正在等待 子智能体 · general 完成：执行 PowerShell 等待」
+ *  - 其它工具            → 「AI 正在执行命令…」
+ *  - thinking / writing  → 各自短句
+ * @param {{kind?:string, tool?:string, input?:object}|null} step
+ * @param {boolean} stopping
+ */
+export function busyHintText(step, stopping = false) {
+  if (stopping) return '正在停止…'
+  if (!step || !step.kind) return 'AI 正在执行中…'
+  if (step.kind === 'tool') {
+    const tool = String(step.tool || '')
+    const input = step.input || {}
+    if (tool === 'subagent' || tool === 'task') {
+      const who = input.agent ? `子智能体 · ${String(input.agent)}` : '子智能体'
+      const desc = trimEllipsis(input.description, 24)
+      return desc ? `AI 正在等待 ${who} 完成：${desc}` : `AI 正在等待 ${who} 完成`
+    }
+    return `AI 正在${toolLabelZh(tool)}…`
+  }
+  if (step.kind === 'thinking') return 'AI 正在思考…'
+  if (step.kind === 'writing') return 'AI 正在生成回复…'
+  return 'AI 正在执行中…'
+}

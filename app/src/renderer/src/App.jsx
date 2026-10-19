@@ -21,6 +21,7 @@ import {
   livePatchFromSubagentPart,
   safeAgentColor,
   pollDecision,
+  busyHintText,
   PHASE
 } from './subagentModel.mjs'
 import {
@@ -2863,8 +2864,9 @@ export default function App() {
               ))}
               {!isChildView && busy && (
                 <div className="busy-hint">
-                  {stopping ? '正在停止…' : 'AI 正在执行中…'}
-                  {currentStep?.kind === 'tool' && ` 正在${currentStep.tool}`}
+                  {/* 统一由 busyHintText 生成：中文动作名；子智能体额外显示在等谁、在做什么
+                      （旧文案直接拼英文工具名，会出现「正在subagent」这种半截中文） */}
+                  {busyHintText(currentStep, stopping)}
                 </div>
               )}
             </div>
