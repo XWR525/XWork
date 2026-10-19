@@ -19,7 +19,7 @@
 - 一键停止正在运行的任务（引擎 abort 端点）
 
 ### 人机确认
-- 权限策略：读取 / 修改文件 / 执行命令 / 联网搜索 / 子任务等 11 类操作，按「允许 / 询问 / 禁止」三档配置（含严格 / 标准 / 宽松预设）
+- 权限策略：读取 / 修改文件 / 执行命令 / 联网搜索 / 子智能体等 11 类操作，按「允许 / 询问 / 禁止」三档配置（含严格 / 标准 / 宽松预设）
 - 敏感操作弹窗确认：允许一次 / 总是允许 / 拒绝
 - AI 主动提问（question 工具）：选项或自由输入作答，也可拒绝
 
@@ -54,8 +54,98 @@
 - **任务通知**：AI 完成回复或发起提问时，窗口不在前台则弹 Windows 系统通知（点击恢复窗口）
 - **关闭时最小化到托盘**：托盘图标 + 右键菜单（显示主窗口 / 退出），首次最小化有系统通知
 - **技能市场（Skill Hub）**：浏览 / 安装 / 卸载技能（`.agents/skills`），安装后引擎自动加载
-- 文件日志：主进程 + 渲染进程日志落盘，1MB 轮转保留 5 份
+- **`.agents` 自定义智能体与命令**：工作区 `.agents/agents/*.md`、`.agents/commands/*.md` 由引擎自动加载（无需放进 `.opencode`）——见下节- 文件日志：主进程 + 渲染进程日志落盘，1MB 轮转保留 5 份
 - 自动更新（打包版，基于 GitHub Releases 的 electron-updater，支持差分更新）
+
+## `.agents` 目录：自定义智能体与命令
+
+XWork 让工作区 `.agents/` 下的自定义智能体与命令模板**被引擎直接加载**，不必放进 `.opencode/`。`.agents/` 因此可以作为跨工具共享目录（技能放 `skills/`，智能体放 `agents/`，命令放 `commands/`）。
+
+### 文件约定
+
+**`.agents/agents/**/*.md`** —— 正文即系统提示词
+
+```markdown
+---
+description: 代码审查专家     # 可选
+mode: subagent                # 可选，primary | subagent，缺省 subagent
+model: xgroup-x/gpt-x         # 可选，provider/model
+---
+你是一个代码审查专家……
+```
+
+**`.agents/commands/**/*.md`** —— 正文为命令模板
+
+```markdown
+---
+description: 审查当前变更      # 可选
+agent: reviewer               # 可选，执行前切换智能体
+model: xgroup-x/gpt-x         # 可选，执行前切换模型
+---
+请审查以下内容：$ARGUMENTS
+```
+
+- **命名**：相对路径去掉 `.md`，`/` 保留 —— `commands/web/search.md` → `/web/search`；`agents/team/deep.md` → `team/deep`
+- **模板**：`$ARGUMENTS`、`$1/$2`、无占位符时自动追加参数、`` !`命令` `` 插值 —— **与直接写在 `.opencode` 下完全一致**（引擎原生实现，XWork 不做任何转译）
+- 只支持**复数**目录名 `agents` / `commands`（`skills` 亦为复数，由引擎原生加载，无需任何桥接）
+
+### 生效时机（重要）
+
+| 操作 | 何时生效 |
+| --- | --- |
+| 新增 `.agents/**/*.md` | **需重启引擎**（设置页「保存并重启引擎」，或重新打开工作区） |
+| 修改已有文件内容 | **需重启引擎** |
+| 删除文件 | 需重启引擎 |
+
+> 引擎的变更监听只识别 `.opencode` 路径下的变更，而 `.agents` 是通过目录联接（junction）暴露的，因此经 `.agents` 侧的增删改**不会**热生效。放在 `.opencode/` 下的文件则可以秒级热生效——这是两者唯一的体验差异。
+
+### XWork 做了什么（`.opencode` 从何而来）
+
+为了让引擎发现这些文件，XWork 在**每次打开工作区时**确保存在两个目录联接，把它们指向 `.agents`：
+
+```
+<工作区>/.opencode/agents    →  .agents/agents
+<工作区>/.opencode/commands  →  .agents/commands
+```
+
+因此工作区里会出现一个 `.opencode/` 目录（文件树中已隐藏）。请注意：
+
+- **不要手动删除** `.opencode/agents` 与 `.opencode/commands`（它们是联接；删掉后重新打开工作区会自动重建）；
+- 若你自己写了 `.opencode/.gitignore`，XWork **不会覆盖**它；
+- 你仍然可以像往常一样直接使用 `.opencode/agent/`、`.opencode/command/`（单数或复数都可），两种方式共存。
+
+### git 安全（重要）
+
+git 会**穿透**目录联接：若 `.opencode/` 未被忽略，`git add -A` 会把 `.agents` 里的内容当作普通文件提交到 `.opencode/**` 路径，别人 clone 后会得到一份**静态副本**、而 `.agents` 并不存在 —— 之后你改 `.agents` 将不再生效。
+
+XWork 的防护：打开工作区时检查 `.opencode` 是否被忽略，未忽略则写入 `.opencode/.gitignore`（内容 `*`）使其自我忽略。
+
+若该工作区**已有被 git 跟踪的 `.opencode/**` 内容**（例如你自己提交过 `.opencode/opencode.json`），XWork **不会擅自改动**，而是**跳过桥接并在界面提示**。要启用桥接需按提示处置：
+
+1. 若你跟踪的是**自己的配置文件** → 把它从索引移除（`git rm --cached <路径>`），或接受它被忽略；
+2. 若跟踪的是**已被物化的联接内容**（`.opencode/agents/**`、`.opencode/commands/**`）→ 按此顺序处理，顺序错了会二次丢内容：
+   1. 先恢复 `.agents/{agents,commands}` 的目标目录与文件（`.agents` 通常被 git 忽略，clone 出来的工作区里没有它）；
+   2. `git rm --cached -r .opencode/agents .opencode/commands`
+   3. 删除已被物化的真目录 `.opencode/{agents,commands}`
+   4. 重新打开工作区（桥接会自动重建）
+
+### 关闭 / 清理
+
+在 `xwork-settings.json` 里设置（**需重启应用**，无 UI 开关）：
+
+```json
+{ "agentsBridge": { "enabled": false } }
+```
+
+关闭后 XWork 会遍历所有已注册工作区摘除联接；若 `.opencode` 内只剩 XWork 写入的 `.gitignore`，该目录一并清理（你自写的文件与目录绝不会被删除）。
+
+### 限制
+
+- 仅复数目录名；不支持 `.agents/agent`、`.agents/command`
+- 不支持 `temperature` 字段（引擎无此字段）
+- 跨卷 / 网络盘 / 非 NTFS 工作区无法创建联接，桥接会被跳过（仅提示，不影响其它功能）
+
+> 实现细节与全部实测依据见 [功能设计文档/agents目录junction桥接设计.md](功能设计文档/agents目录junction桥接设计.md)。
 
 ## 架构
 
@@ -64,7 +154,7 @@
 │  渲染进程 (React, App.jsx)                                               │
 │    │ window.xwork.*（preload contextBridge）                             │
 │    │ ←── engine:event（IPC，全局事件流转发）                              │
-│ 主进程 (index / engine / bridge / settings / undo / tasks / task-runner / config / logger)        │
+│ 主进程 (index / engine / bridge / settings / undo / tasks / task-runner / config / logger / agents-bridge / agents-selfcheck) │
 │    │ HTTP REST + 全局 SSE (GET /api/event)                                │
 └────┼─────────────────────────────────────────────────────────────────────┘
      ▼
@@ -77,6 +167,7 @@ opencode V2 serve（127.0.0.1:4096，本地无头引擎，强制 Basic Auth）
 - **渲染层**：React 单页应用（对话流 + 消息内联任务展示 + 文件树 + 设置面板 + 定时任务管理页）。
 - **桥接层**（`bridge.js`）：调用 opencode V2 REST API（`/api/*`，Basic Auth）；实时事件走**全局事件流** `GET /api/event`（per-session 事件端点不可用，故不用），并在桥内把 V2 事件**归一化**为渲染层沿用的 V1 事件名与消息结构（`{info, parts}`），使渲染层与任务引擎无需感知 V2 差异。
 - **消息发送**：V2 为异步收件箱模型 —— `POST /api/session/{id}/prompt` 立即返回受理回执，首个 step 完成由事件等待（`message.updated` / `session.idle`，归一化自 `session.execution.*`）确定；流式增量（`session.text.delta` 等）经归一化后驱动实时渲染。
+- **`.agents` 桥接**（`agents-bridge.js` / `agents-selfcheck.js`）：引擎启动前（`engine.start()` 的**唯一封装** `startEngineWithBridge`）在工作区建立 `.opencode/{agents,commands}` → `.agents/{agents,commands}` 目录联接，并做 git 防污染（索引检查为硬闸门，随后用**探针路径**复验忽略规则，必要时写 `.opencode/.gitignore`）。引擎就绪后异步跑**收敛式自检**：按 `location[directory]` 查询 `/api/agent`、`/api/command` 并校验响应回显（不带 location 会永远返回引擎启动目录的注册表，热切换后会查错工作区），轮询至"连续两次样本相等且含期望条目且不跌破峰值 90%"才判成功。阻断与未收敛经 `engine.bridge.warning` 事件在界面提示。
 
 ## 技术栈
 
@@ -129,7 +220,7 @@ npm run dev
 
 | 文件 | 说明 |
 | --- | --- |
-| `xwork-settings.json` | 应用设置：`modelGroups`（模型组）、`permission`（权限策略）、`theme`、`workspace`、`modelUsage`（模型使用统计） |
+| `xwork-settings.json` | 应用设置：`modelGroups`（模型组）、`permission`（权限策略）、`theme`、`workspace`、`modelUsage`（模型使用统计）、`agentsBridge`（`.agents` 桥接开关，默认启用；**手工编辑需重启应用**——`load()` 有实例级缓存） |
 | `xwork-workspaces.json` | 工作区注册表（历史目录 + 最近使用 + 会话数） |
 | `xwork-tasks.json` | 定时任务存储：任务定义 + 执行历史（上限 100 条/任务） |
 | `config/opencode/opencode.json` | 引擎配置：每个模型组写入一个 `xgroup-*` provider；全局权限规则 |
@@ -144,10 +235,10 @@ npm run dev
 
 ```
 app/                        Electron 应用（源码 + 构建配置）
-  src/main/                 主进程：index（IPC）/ engine（进程管理）/ bridge（引擎 API 桥）/ settings（设置与 Key）/ undo（回退兜底恢复）/ tasks（cron 解析 + 任务存储 + 调度器）/ task-runner（任务执行器：串行队列 / 重试 / 持久化）/ config（应用配置）/ logger
+  src/main/                 主进程：index（IPC）/ engine（进程管理）/ bridge（引擎 API 桥）/ settings（设置与 Key）/ undo（回退兜底恢复）/ tasks（cron 解析 + 任务存储 + 调度器）/ task-runner（任务执行器：串行队列 / 重试 / 持久化）/ config（应用配置）/ logger / agents-bridge（.agents 联接与 git 防污染）/ agents-selfcheck（收敛式自检判据）
   src/preload/              contextBridge 桥接层
   src/renderer/             React 渲染层（App.jsx / styles.css / main.jsx）
-  scripts/                  dev.mjs（开发启动）/ build-dist.mjs（一键打包）/ gen-icon.mjs（图标生成）
+  scripts/                  dev.mjs（开发启动）/ build-dist.mjs（一键打包）/ gen-icon.mjs（图标生成）/ test-agents-bridge*.cjs（`.agents` 桥接回归，`test-agents-bridge-all.cjs` 一次跑完）
   resources/                engine/（内置 opencode.exe）、git/（内置 MinGit，undo 依赖）
   build/                    图标与本地 Electron zip（打包用）
   release/                  打包产物（NSIS 安装器 / win-unpacked）
