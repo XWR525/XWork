@@ -1266,10 +1266,10 @@ export default function App() {
     for (const m of messages) {
       const notice = m.subagentNotice || (m.parts || []).map((p) => p.subagentNotice).find(Boolean)
       if (!notice || !notice.childID || !notice.state) continue
-      // noticeAt：后台任务的耗时要用**通知到达时间**收尾 —— 引擎在后台化那一刻就把 time.end 定住了，
-      // 直接用 part 的 time 会显示成"2.1s"，而实际跑了 45s（2026-10-19 截图发现）
-      const at = m.time && (m.time.created || m.time.completed)
-      subagentLive.digest(notice.childID, { noticeState: notice.state, noticeAt: at || Date.now() })
+      // noticeAt：后台任务的耗时要用**通知到达时间**收尾 —— 引擎在后台化那一刻就把 time.end 定住了
+      // （实测显示成 2.2s，实际跑了 ~52s）。时间戳由**桥层**塞进 notice.at：
+      // normalize() 把 message.time 存成了数字，渲染层取 m.time.created 是拿不到的（踩过一次）。
+      subagentLive.digest(notice.childID, { noticeState: notice.state, noticeAt: notice.at || Date.now() })
     }
   }, [messages])
   useEffect(() => {

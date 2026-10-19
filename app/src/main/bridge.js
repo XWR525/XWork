@@ -457,7 +457,11 @@ class Bridge {
         childID: e.metadata.childID || '',
         agent: e.metadata.agent || '',
         state: e.metadata.state || '', // completed | error | cancelled（V10；注意不是 failed）
-        description: e.description || ''
+        description: e.description || '',
+        // at：通知到达时刻。**必须在这里带上**——后台任务的耗时要靠它收尾：
+        // 引擎在后台化那一刻就把 tool part 的 time.end 定住了（实测会显示成 2s，实际跑了 50s），
+        // 而渲染层的 normalize() 把 message.time 存成数字，取不到 created（曾因此修不动）。
+        at: created || Date.now()
       }
       return {
         info: { id: e.id, role: 'system', time: { created }, subagentNotice: notice },
