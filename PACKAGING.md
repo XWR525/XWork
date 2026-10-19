@@ -143,6 +143,17 @@ npm run build:dist
    `.\release\win-unpacked\resources\engine\opencode.exe --version` → 应输出 `opencode v2.x.x`
 3. 应用启动后确认引擎就绪（左下角状态「就绪」），V2 引擎数据落在 `<userData>\opencode\data\opencode2\`（含 `opencode.db`）
 4. 有干净机器时，安装 `XWork-Installer-<版本>.exe` 后直接使用
+5. **主进程模块完整性（必做，0.6.4 曾因此事故）**：确认包内包含全部主进程模块：
+
+   ```powershell
+   cd app
+   node scripts/test-main-build-manifest.cjs     # 源码 require 与 electron.vite.config.mjs 的 input 清单一致性
+   npx asar list release\win-unpacked\resources\app.asar | Select-String '^\\out\\main'
+   ```
+
+   `app/electron.vite.config.mjs` 的主进程 `input` 是**显式清单**——新增 `src/main/*.js` 模块若漏登记，
+   构建不会报错、单元测试也不会失败，但**装上去一启动就报 `Cannot find module './<模块名>'`**。
+   上述检查已纳入 `node scripts/test-agents-bridge-all.cjs`（打包前跑一遍即可拦住）。
 
 > V2 引擎强制 HTTP Basic Auth（用户名 `opencode`，密码由 XWork 按数据目录派生并注入 `OPENCODE_SERVER_PASSWORD`）。
 > 手动用 curl/浏览器访问引擎接口时必须带 `Authorization: Basic base64(opencode:<密码>)`，否则一律 401。
@@ -153,6 +164,23 @@ npm run build:dist
 - 引擎更新：`npm i -g opencode2 --registry=https://registry.npmmirror.com` 更新到新版本后重新打包（脚本自动复制并校验 V2 版本号）
 - 引擎数据目录：V2 使用 `opencode2` 子目录（`config/opencode2`、`data/opencode2`），与 V1 的 `opencode` 目录并存互不干扰 ——
   升级后 V1 时代的会话历史不会出现在 V2 中（引擎不支持自动迁移），降级回 V1 亦不受影响
+- **升级引擎后必须重跑 `.agents` 桥接回归**（本功能依赖引擎的符号链接跟随语义与 location 查询口径，均可能随引擎版本变化）：
+
+  ```bash
+  cd app
+  node scripts/test-agents-bridge-all.cjs
+  ```
+
+  全绿方可发布引擎升级。各项失败的含义与处置：
+  | 失败项 | 含义 | 处置 |
+  | --- | --- | --- |
+  | 设置存储 | 与引擎升级无关（settings.js 自测） | 按报错修实现或断言 |
+  | 单测 T-A*/T-B* | 联接判定或**命名推导公式**变了 | 对照新引擎二进制核对 `decode()` 的前缀剥离规则，更新 `collectMdNames` |
+  | 单测 T-C*/T-D* / T-F* | git 防污染判据失效（忽略语义或 `check-ignore` 行为变化） | 勿发布：会造成 `.agents` 内容泄漏进仓库 |
+  | 集成 I-2* | **引擎不再跟随联接**，或 `location` 查询口径变了 | 勿发布：本功能整体失效，需回到 loader 插件方案或等上游 PR #54594 |
+  | 自检 S-3/S-4 | location 参数形态或**响应回显**变了 | 核对 `v2-openapi.json` 的 `location` 参数定义并更新 `locationQuery` |
+
+  > 背景与全部实测依据见 [功能设计文档/agents目录junction桥接设计.md](功能设计文档/agents目录junction桥接设计.md) §2（证据分层）与 §7（测试方案）。
 
 ## 常见问题
 

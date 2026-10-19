@@ -1,6 +1,9 @@
 {
   "skillApiBase": "http://localhost:4321",
-  "enginePort": 4096,
+  "updateSource": {
+    "latestApi": "http://192.168.99.201:8418/api/v1/repos/xuwr/XWork/releases/latest",
+    "downloadBase": "http://192.168.99.201:8418/xuwr/XWork/releases/download"
+  },
   "window": {
     "width": 1180,
     "height": 780,
@@ -36,6 +39,12 @@
     "engineStopTimeoutMs": 5000,
     "engineKillWaitMs": 2000,
     "engineHealthTimeoutMs": 1500,
-    "portFreeTimeoutMs": 3000
+    "portFreeTimeoutMs": 3000,
+    "subagentLiveMs": 200,
+    "subagentPollMs": 1500,
+    "subagentStaleMs": 8000,
+    "subagentOutcomeGraceMs": 5000,
+    "subagentUnknownAfterMs": 15000,
+    "subagentPollFailMaxCount": 3
   }
 }
