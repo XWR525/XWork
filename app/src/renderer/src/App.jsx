@@ -686,6 +686,7 @@ export default function App() {
   const [agentsLoading, setAgentsLoading] = useState(true)
   const agentsLoadingSince = useRef(0)
   const agentsBootstrap = useRef(true) // 首轮加载负责收掉初始转圈（见 loadAgents）
+  const agentsRetryRef = useRef(0) // 冷启动空列表的重试计数（引擎就绪但 agents 为空时重试，最多 10 次）
 
   // 工作区：当前目录 + 文件树（懒加载）+ 已添加文件（相对路径清单）
   const [workspace, setWorkspace] = useState('')
@@ -1390,6 +1391,25 @@ export default function App() {
     }, timings.enginePollMs)
     return () => clearInterval(timer)
   }, [engine.running, timings])
+
+  // 冷启动竞态兜底（2026-10-19 自动化发现）：`agents:list` 在引擎就绪前会返回 `{agents:[], source:'engine-down'}`，
+  // 而唯一的重载点是 `server.connected` —— 该事件常常在渲染层注册监听【之前】就发出去了。
+  // 结果：选择器永久停留在兜底的 Build/Plan 两项，**子智能体名册与工作区自定义 agent 全部消失**
+  // （实测冷启动后 15s 仍然为空）。这里在"引擎在跑 + 列表为空 + 不在加载中"时按 2s 重试，最多 10 次。
+  useEffect(() => {
+    if (!engine.running) return
+    if (agentList && agentList.length) {
+      agentsRetryRef.current = 0
+      return
+    }
+    if (agentsLoading) return
+    if (agentsRetryRef.current >= 10) return
+    const timer = setTimeout(() => {
+      agentsRetryRef.current += 1
+      loadAgents({ silent: true })
+    }, 2000)
+    return () => clearTimeout(timer)
+  }, [engine.running, agentList, agentsLoading])
 
   // 自动滚动到底部：仅在贴底时跟随最新内容；用户上滑后停止跟随（保持当前位置可阅读），
   // 上滑中且有新内容（viewMessages/busy 变化）时显示「↓ 新消息」提示；滚回底部自动隐藏并恢复跟随。
