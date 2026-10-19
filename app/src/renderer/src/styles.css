@@ -20,6 +20,20 @@
   --radius: 10px;
 }
 
+/* ---------- 全局基础字体：表单控件必须显式继承 ----------
+   Chromium 的 UA 样式表不会让表单控件继承 font-family：button 会回落成 Arial，
+   input/textarea 各回落成默认。Arial 没有中文字形，中文会走另一套回退字体，
+   表现为【笔画断成点状、发虚】——0.6.4 的智能体下拉框正是踩了这个坑：
+   同一容器里 div 分组标题清晰（继承到 Microsoft YaHei），而 button 里的选项标题/描述
+   碎成点。实测 computed font-family：div = "Segoe UI", "Microsoft YaHei", …；button = Arial。
+   字体族本身仍由 body 决定，这里只把继承关系补上。 */
+button,
+input,
+textarea,
+select {
+  font-family: inherit;
+}
+
 /* ---------- 暗色主题 ---------- */
 :root[data-theme='dark'] {
   --bg: #0f1115;
@@ -462,6 +476,239 @@ body.resizing-task .task-side {
   margin-right: 4px;
 }
 
+/* 回复时间 + 徽标的左侧簇：`space-between` 只作用于「簇 ↔ ⋯ 按钮」，
+   簇内用 2px 小间距让 🤖n **紧贴**回复时间 */
+.session-meta-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* 父会话行的子智能体计数徽标（设计 §5.4(a) + §5.6：11px、--panel 底、--border 描边）
+   v1 决策 D3：不可点击，仅 title 提示；下钻走 L1 卡片的「展开子智能体过程」 */
+.subagent-badge {
+  font-size: 11px;
+  line-height: 1.3;
+  padding: 0 4px;
+  margin: 0;
+  border-radius: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  white-space: nowrap;
+  user-select: none;
+}
+
+/* ── L1 子智能体卡片（设计 §5.6）──────────────────────────────────────────── */
+.subagent-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel2);
+  padding: 8px 10px;
+  margin: 6px 0;
+  max-width: 100%;
+}
+/* 运行中：左边框 2px accent（§5.6） */
+.subagent-card.running,
+.subagent-card.background {
+  border-left: 2px solid var(--accent);
+}
+.subagent-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.subagent-avatar {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  /* §5.6 / v2-S-1：--accent 是十六进制，rgba(var(--accent), .12) 不成立 ⇒ 用 color-mix */
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  flex-shrink: 0;
+}
+.subagent-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: blink 1.2s infinite;
+  flex-shrink: 0;
+}
+.subagent-name {
+  font-size: 13px;
+  font-weight: 500;
+}
+.subagent-desc {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subagent-activity {
+  font-size: 12px;
+  font-family: Consolas, monospace;
+  color: var(--text-dim);
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subagent-conclusion {
+  font-size: 12px;
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subagent-error {
+  font-size: 12px;
+  color: var(--danger);
+  margin-top: 3px;
+  word-break: break-word;
+}
+.subagent-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+.subagent-raw {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  max-height: 260px;
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* L2 面板卡的元信息行与降级容器（设计 §5.3 要点 6 / v3-S-6） */
+.subagent-meta {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  margin-top: 3px;
+}
+.subagent-card.degraded {
+  border-style: dashed;
+}
+
+/* 模式选择器：只读名册项与分组小字说明（设计 §5.5(c)） */
+.mp-opt-ro {
+  padding: 6px 10px;
+  border-radius: 6px;
+  cursor: default;
+  opacity: 0.72;
+}
+.mp-opt-ro:hover {
+  background: var(--panel2);
+}
+.mp-opt-hint {
+  padding: 4px 10px 8px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+/* 展开/收起动画：与「思考过程」（.reasoning-body）同款 —— grid 行 0fr→1fr，无需测量高度。
+   wrapper 常驻、只切 .open，过渡才有明确的起始/结束态；inner 负责裁剪溢出的时间线内容 */
+.subagent-expand {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.28s ease;
+}
+.subagent-expand.open {
+  grid-template-rows: 1fr;
+}
+.subagent-expand-inner {
+  overflow: hidden;
+  min-height: 0;
+}
+/* 展开按钮的插入符：始终 ▶，展开时旋转 90°（与思考过程的 caret 行为一致） */
+.subagent-caret {
+  display: inline-block;
+  margin-right: 4px;
+  font-size: 10px;
+  transition: transform 0.2s ease;
+}
+.subagent-toggle.open .subagent-caret {
+  transform: rotate(90deg);
+}
+
+/* 展开态：子会话时间线 */
+.subagent-child {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.subagent-child-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+.subagent-child-user {
+  font-size: 12.5px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin: 6px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-dim);
+}
+.subagent-child-msg {
+  margin: 6px 0;
+}
+.subagent-child-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+/* 新增状态胶囊修饰类（v2-S-1）：必须显式声明 background/border-color，
+   否则会继承 .tool-status 的 --panel 底 + --border 描边，在暗色主题下与卡片容器对比不足 */
+.tool-status.pending {
+  background: var(--panel);
+  border-color: var(--border);
+  color: var(--text-dim);
+}
+.tool-status.background {
+  background: var(--panel);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.tool-status.finalizing {
+  background: var(--panel);
+  border-color: var(--border);
+  color: var(--text-dim);
+}
+.tool-status.cancelled,
+.tool-status.unknown {
+  background: var(--panel);
+  border-color: var(--border);
+  color: var(--text-dim);
+}
+
 /* 拖动排序指示线：绝对定位于行间固定间隙内，不占文档流 → 出现/消失不产生列表跳变 */
 .session-row {
   position: relative;
@@ -883,6 +1130,148 @@ body.resizing-task .task-side {
   position: relative; /* 工作区切换遮罩的定位基准 */
 }
 
+/* ── 会话标题行（固定，不随消息滚动；2026-10-19）──────────────────────────── */
+.chat-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  /* 保证标题行永远压在消息之上（消息区自带滚动，不依赖 z-index，但保留以便下拉层叠） */
+  position: relative;
+  z-index: 5;
+  user-select: none;
+}
+.chat-head-title {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 60%;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  /* 两种状态共用同一几何：主视图（span 语义）与子视图（可点返回）不能有任何尺寸差异，
+     否则切进子会话时整行文字会横向跳一下（2026-10-19 用户反馈） */
+  padding: 2px 4px;
+  border-radius: 4px;
+  text-align: left;
+  cursor: default;
+}
+.chat-head-title.back {
+  cursor: pointer;
+}
+.chat-head-title.back:hover {
+  background: var(--panel2);
+}
+.chat-head-input {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 1px 5px;
+  min-width: 140px;
+  max-width: 60%;
+  outline: none;
+}
+.chat-head-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 徽标：可点击（与左侧会话列表里那个「不可点击」的徽标不同 —— 这里是下钻入口） */
+.chat-head-badge-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+.chat-head-badge {
+  font-size: 11.5px;
+  line-height: 1.5;
+  padding: 1px 7px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background: var(--panel2);
+  color: var(--text-dim);
+  white-space: nowrap;
+  cursor: pointer;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chat-head-badge:hover,
+.chat-head-badge.active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+/* 下拉框 */
+.chat-head-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 40;
+  min-width: 280px;
+  max-width: 520px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+}
+.chat-head-item {
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.chat-head-item:hover {
+  background: var(--panel2);
+}
+.chat-head-item.active {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.chat-head-item-title {
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-head-item-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-dim);
+  flex-wrap: wrap;
+}
+.chat-head-item-agent {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 180px;
+}
+.chat-head-item-sid {
+  font-family: Consolas, monospace;
+  opacity: 0.8;
+}
+
+/* 子会话视图：输入区整体隐藏（用户拍板），消息区自然占满剩余高度 */
+.main.child-view .composer {
+  display: none;
+}
+
 /* ---------- 工作区切换过渡 ---------- */
 /* 遮罩：覆盖引擎重启等待期，淡入出现；leaving 时淡出收起 */
 .ws-switch-mask {
@@ -1139,6 +1528,56 @@ body.resizing-task .task-side {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  /* 芯片现在可点：展开查看输入/输出（2026-10-19） */
+  display: block;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+}
+.tool-chip:hover {
+  border-color: var(--text-dim);
+}
+
+/* 展开/收起动画：与思考过程、子智能体卡片同款（grid 行 0fr→1fr，0.28s） */
+.tool-chip-caret {
+  display: inline-block;
+  margin-right: 5px;
+  font-size: 9px;
+  transition: transform 0.2s ease;
+}
+.tool-chip.open .tool-chip-caret {
+  transform: rotate(90deg);
+}
+.tool-chip-wrap {
+  margin: 4px 0;
+}
+.tool-chip-wrap .tool-chip {
+  margin: 0;
+}
+.tool-chip-expand {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.28s ease;
+}
+.tool-chip-expand.open {
+  grid-template-rows: 1fr;
+}
+.tool-chip-expand-inner {
+  overflow: hidden;
+  min-height: 0;
+}
+/* 展开区与芯片拼成一个整体：上边框去掉（芯片自带），底部圆角 */
+.tool-chip-wrap .tool-body {
+  border: 1px solid var(--border);
+  border-top: none;
+  border-radius: 0 0 6px 6px;
+  background: var(--panel);
+}
+/* 工具失败时的错误正文（ToolIOView 的「错误」字段） */
+.tool-err {
+  color: var(--danger);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .tool-chip.running {
@@ -1350,10 +1789,16 @@ body.resizing-task .task-side {
   gap: 5px;
   /* 宽度随内容自适应：长模型名完整展示（不截断为 …）；外层 .model-picker 已 flex-shrink:0 防压缩 */
   max-width: none;
-  height: 22px;
-  padding: 0 8px;
+  /* ⚠ 不要用固定 height + line-height:1 组合（这是"文字被截掉下半截"的根因）：
+     实测 12px 文字配 line-height:1 时，.mp-label 的 scrollHeight=84 而 offsetHeight=72
+     （放大 6 倍测量），即有 12px 内容溢出盒子，再被 overflow:hidden 切掉——表现为
+     Deploy Agent 的 p/y/g 尾巴与「署」的下半截消失（CJK 字形需要约一整 em 的垂直空间，
+     而 line-height:1 的行框恰好只有 1em，字形必然撑破行框）。
+     改为由行高决定高度（去掉固定 height、line-height 用像素值给足余量、去掉按钮上的
+     overflow:hidden），让盒子自然容纳字形；横向省略仍由 .mp-label 的 ellipsis 负责。 */
+  padding: 2px 8px;
   font-size: 12px;
-  line-height: 1;
+  line-height: 18px;
   color: var(--text);
   background: transparent;
   border: none;
@@ -1369,6 +1814,8 @@ body.resizing-task .task-side {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  /* 显式继承按钮行高：避免被 UA 或父级 ul/li 样式重置成 normal/1 导致再次裁切 */
+  line-height: inherit;
 }
 
 .mp-arrow {
@@ -1378,14 +1825,40 @@ body.resizing-task .task-side {
   flex-shrink: 0;
 }
 
+/* 智能体选择器「加载中」态：只锁这个按钮本身（不禁用输入框/发送/对话区）。
+   引擎启动后注册表要 2~4 秒才收敛，此前列表只有兜底两项，给出明确的进行中反馈，
+   并避免在列表不完整时误选。转圈沿用工作区遮罩同款视觉（border-top-color 用强调色）。 */
+.model-pick-btn.is-loading,
+.model-pick-btn:disabled {
+  cursor: default;
+  color: var(--text-dim);
+}
+.model-pick-btn.is-loading:hover {
+  background: transparent; /* 加载中不给悬浮反馈，避免看起来可点 */
+}
+.mp-spinner {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
 .model-pop {
   position: absolute;
   right: 0;
   bottom: calc(100% + 8px);
   z-index: 300; /* 高于所有弹窗遮罩（perm-mask 100 / z-top 120），portal 到 body 后不被遮挡可正常交互 */
-  min-width: 220px;
-  max-height: 260px;
+  /* 宽度随内容在上下限之间自适应：长描述不再把盒子撑宽（描述单行截断），文案短时也不会过窄 */
+  width: max-content;
+  min-width: 230px;
+  max-width: min(460px, 92vw);
+  /* 高度自适应内容，超出后内部滚动（条目多时不会顶破屏幕；260px 约 5~6 条） */
+  max-height: min(340px, 52vh);
   overflow-y: auto;
+  overflow-x: hidden;
   background: var(--panel2);
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -1393,20 +1866,28 @@ body.resizing-task .task-side {
   box-shadow: 0 -6px 20px rgba(0, 0, 0, 0.35);
   display: flex;
   flex-direction: column;
+  /* ⚠ 动画绝不能从 opacity:0 起步（这是"下拉框文字全看不见"的真正原因）。
+     原实现 `@keyframes pop-up { from { opacity: 0; transform: translateY(4px) } }`（只有 from）
+     意味着【动画未完成时整框透明】；而 headless/无合成器环境以及某些渲染时序下动画会停在
+     起始帧（实测 computed opacity 恒为 0，文本、字体、颜色都正确却完全不可见）。
+     改为只做极轻微的位移动画且显式给出 to 状态：opacity 始终为 1，动画即便不跑也无副作用。 */
   animation: pop-up 0.12s ease-out;
 }
 
 @keyframes pop-up {
   from {
-    opacity: 0;
-    transform: translateY(4px);
+    transform: translateY(2px);
+  }
+  to {
+    transform: translateY(0);
   }
 }
 
 .model-opt {
   text-align: left;
-  display: inline-flex;
-  align-items: center; /* 选项内容垂直居中（避免文字贴底） */
+  display: flex; /* 列方向：标题在上、描述在下（原 inline-flex + align-items:center 会把两者排成一行） */
+  flex-direction: column;
+  align-items: stretch;
   border: none;
   background: transparent;
   color: var(--text);
@@ -1414,9 +1895,19 @@ body.resizing-task .task-side {
   padding: 7px 10px;
   border-radius: 6px;
   cursor: pointer;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  /* ⚠ 这里【绝对不能】加 overflow:hidden —— 这是"选项文字完全看不见"的真凶。
+     实测（computed 值）：`.model-opt{overflow:hidden}` + `flex-direction:column` 时，
+     两个子元素 .mp-opt-title / .mp-opt-desc 的 offsetHeight/clientHeight 全为 0
+     （scrollHeight 却有内容），父容器塌成 14px；去掉后恢复正常 50px、文字完整显示。
+     原因：子元素的 max-width:100% 在 column flex 容器里反推出 0 宽度，随即 min-height:auto
+     解析为 0，overflow:hidden 又把溢出裁掉 → 看起来整行空白。
+     横向裁切改由子元素各自的 overflow:hidden + text-overflow:ellipsis 负责，效果相同。 */
+  user-select: none;
+}
+
+/* 单行条目（模型名 / 工作区名等只用 .mp-opt-title，无描述）保持垂直居中观感 */
+.model-opt > .mp-opt-title:only-child {
+  line-height: 1.35;
 }
 
 .model-opt.active {
@@ -1452,19 +1943,85 @@ body.resizing-task .task-side {
   font-weight: 700;
 }
 
-/* 模式选择（AgentPicker）选项：标题 + 说明两行 */
+/* 模式选择（AgentPicker）选项：标题 + 说明两行。
+   排版要点（0.6.4 修正：此前长描述会把下拉框撑爆）：
+   ① 描述默认 nowrap + ellipsis（单行截断），不再 white-space:normal 多行撑高；
+   ② 交互式悬停（鼠标 / 键盘聚焦）时才展开完整描述；
+   ③ 换行必须发生在【两行之间】——.model-opt 用 column 布局（原 align-items:center 会把
+      两个 div 排成一行）；同时补 min-width:0，否则 flex 子项不会收缩、ellipsis 不生效。
+   可读性（0.6.4 第二次修正：真机反馈"完全看不清"）：
+   像素级排查结论（分析 2240×1560 真机截图）：背景亮度 241、文字笔画最暗 84-85，
+   即文字**渲染正常**（对应 #4b5563 on #eef1f6，对比度 6.68 已达 AA），
+   观感差主要来自截图/预览的多级缩放——12px 中文字在 1.44× 抓图后再缩小，
+   一像素宽的笔画被邻域平均掉。故这里做"抗缩放"增强：再放大一号、加深到 AAA 级，
+   让笔画更粗更实，缩放后仍能留住对比。 */
 .mp-opt-title {
-  font-size: 12px;
+  font-size: 13px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* 下伸部（g p q j y）的余量：这类字母的尾巴落在基线下方，而该行框的下缘与 .mp-opt
+     的内容盒下缘【完全对齐】（实测：内容盒底 22.0px，字形最低笔画也画到 22.0px），
+     即零余量——在部分 DPI / 光栅口径下最后一两行像素会被切掉或被抗锯齿吃掉，表现为
+     "字母下 1/3 显示不全"（中文无下伸部，故只有英文名暴露此问题）。
+     ⚠ 加大 line-height 实测不改变内容盒高度（由字体度量决定），所以必须用
+     padding-bottom 把盒子真正撑高，才有稳定的下伸余量。 */
+  padding-bottom: 2px;
+  /* 抗缩放/抗子像素碎裂：真机截图（2240×1560）显示选项文字的笔画断成点状
+     （同一容器里的分组标题却清晰），墨量仅该区域 0.12%。选项是按钮 + flex 列布局，
+     更易被 Chromium 判为"可优化文本"而走低质量光栅路径。这里对文本渲染显式收口：
+     几何精度光栅 + 关掉连字/字距微调（CJK 不需要），让笔画连成实线。 */
+  text-rendering: geometricPrecision;
+  font-kerning: none;
+  font-variant-ligatures: none;
 }
 .mp-opt-desc {
-  font-size: 11px;
+  font-size: 12.5px;
   color: var(--text-dim);
-  margin-top: 2px;
-  white-space: normal;
-  line-height: 1.4;
+  margin-top: 3px;
+  line-height: 1.45;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-rendering: geometricPrecision;
+  font-kerning: none;
+  font-variant-ligatures: none;
 }
-.model-opt:hover .mp-opt-desc {
-  color: rgba(255, 255, 255, 0.85);
+/* 亮色主题专项加深：--text-dim 在浅底上本就偏淡（4.39，小字不达 AA），
+   加深到 #3d4653（8.43，AAA）；暗色主题下 --text-dim 为 5.10 已达标，保持原样 */
+:root[data-theme='light'] .mp-opt-desc,
+:root:not([data-theme='dark']) .mp-opt-desc {
+  color: #3d4653;
+}
+.model-opt:hover .mp-opt-desc,
+.model-opt:focus-visible .mp-opt-desc {
+  /* 悬停/聚焦时背景是强调色（--accent，比 panel2 暗得多）。这里必须用纯白：
+     半透明白会让小字更糊，而 .model-opt:hover 的标题本就是 #fff，两者一致层级更稳。
+     实测：白字 on --accent 亮色 4.55 / 暗色 4.22（半透明白 0.95 只有 3.77） */
+  color: #fff;
+}
+/* 悬停/键盘聚焦时展开完整描述（不改变常用态下的整齐排布） */
+.model-opt:hover .mp-opt-desc,
+.model-opt:focus-visible .mp-opt-desc {
+  white-space: normal;
+}
+.model-opt:hover .mp-opt-title {
+  white-space: normal;
+}
+
+/* 分组标题：用于把「工作区自定义（.agents）」与「引擎内置」两组选项分开。
+   同样受浅底低对比与缩放影响，加深到 AAA 级并放大到 12px。 */
+.mp-opt-group {
+  font-size: 12px;
+  color: var(--text-dim);
+  padding: 8px 10px 4px;
+  letter-spacing: 0.03em;
+}
+:root[data-theme='light'] .mp-opt-group,
+:root:not([data-theme='dark']) .mp-opt-group {
+  color: #3d4653;
 }
 
 /* 发送 / 停止：圆角矩形右下角的圆形按钮 */
