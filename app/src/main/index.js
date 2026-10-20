@@ -1236,6 +1236,16 @@ ipcMain.handle('settings:apply-theme', (_e, theme) => {
   return { ok: true }
 })
 
+// 读取流式正文揭示档位（供渲染进程启动时应用）
+ipcMain.handle('settings:get-stream-reveal', () => settings.public().streamReveal)
+
+// 应用流式正文揭示档位：emerge = 浮现 | typewriter = 打字机。仅持久化，不重启引擎（纯渲染层偏好）
+ipcMain.handle('settings:apply-stream-reveal', (_e, mode) => {
+  if (mode !== 'emerge' && mode !== 'typewriter') return { ok: false }
+  settings.save({ streamReveal: mode })
+  return { ok: true }
+})
+
 // 关闭时动作：quit = 关闭程序 | tray = 最小化到托盘（仅持久化，主进程读取后即时生效）
 ipcMain.handle('settings:apply-close-action', (_e, action) => {
   if (action !== 'tray' && action !== 'quit') return { ok: false }

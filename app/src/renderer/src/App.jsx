@@ -1,10 +1,11 @@
-import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import React, { memo, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { createPortal } from 'react-dom'
 import { marked } from 'marked'
 import hljs from 'highlight.js/lib/common'
 import markedKatex from 'marked-katex-extension'
 import ABOUT_LOGO from './assets/logo.svg'
-import { advanceTypewriter, TW_TICK_MS } from './typewriter.mjs'
+import { advanceTypewriterBurst, TW_TICK_MS } from './typewriter.mjs'
+import { sampleTotal, unwrapEmerge, wrapEmerge } from './emergeDom.mjs'
 import {
   mergeToolState,
   resolveToolName,
@@ -40,6 +41,17 @@ import {
   childSessionLabel,
   shortSid
 } from './sessionList.mjs'
+// ===== 渲染层跨组件上下文 =====
+// ⚠ 必须放在下方「marked 配置块」【之前】：验收脚本（Part B）会把该配置块整段塞进 Function 求值，
+// 那段里不能出现 createContext 之类的外部引用。
+// 揭示档位：'emerge'（浮现，默认）/ 'typewriter'（打字机）。经 context 下发以穿透 MessageView 的 memo，
+// 切换即时生效、无需重启（设计 §5.6 / D9）。
+const RevealModeContext = createContext('emerge')
+
+// 贴底跟随的「内容长高」通知：揭示动画每帧只改组件本地 shown，消息数组不变 ⇒ App 的滚动 effect 不触发，
+// 视口会自己往上漂（"输出快结束时就不贴底"）。揭示层在 layout effect 里调它，滚动跟**真实高度**走。
+const ScrollFollowContext = createContext(null)
+
 marked.setOptions({ gfm: true, breaks: true })
 
 function escapeHtml(s) {
@@ -670,6 +682,8 @@ export default function App() {
   const permCfgRef = useRef(null)
   const [appInfo, setAppInfo] = useState(null) // 应用版本信息（「关于」面板）
   const [theme, setTheme] = useState('light') // 界面主题：dark | light
+  // 流式正文揭示档位：emerge = 浮现（默认）| typewriter = 打字机。纯渲染层偏好，切换即时生效（§5.6）
+  const [streamReveal, setStreamReveal] = useState('emerge')
   const [modelSel, setModelSel] = useState(null) // 当前会话选择的模型 {providerID, modelID}，null = 未选择（发送前必须有效）
   const [agent, setAgent] = useState('build') // 当前会话的模式（opencode agent：build 默认 / plan 只读规划）
   // 智能体列表（引擎注册表，含工作区 .agents 里的自定义项）——由主进程 agents:list 提供。
@@ -713,6 +727,7 @@ export default function App() {
 
   const listRef = useRef(null)
   const listStickRef = useRef(true) // 对话区是否贴底：上滑即 false，滚回底部自动恢复
+  const lastScrollTopRef = useRef(0) // 上一次 scrollTop：判定「用户是否真的往上滚」（见 onListScroll）
   const [showNewHint, setShowNewHint] = useState(false) // 上滑停止跟随期间有新内容时，显示「↓ 新消息」提示
   const currentRef = useRef(currentID)
   currentRef.current = currentID
@@ -761,9 +776,14 @@ export default function App() {
         // 该会话任务仍在后台运行：用流式缓存恢复（含切走期间的增量），
         // 避免引擎「流式中 GET 快照文本为空」导致正文截断；token 统计仍取 GET（info 字段不受流式影响）
         // 恢复时刻已累积的文本视为已揭示（revealTo）：直接显示全文，后续增量从该位置继续打字机
+        // 口径必须与 MessageView 的 mdText 完全一致（join('\n')）：多 text part 时若用 join('')，
+        // revealTo 会少 (parts-1) 个字符 ⇒ 恢复后会重打尾部几个字（设计 §5.9）
         const restored = streamCacheRef.current[sid].map((m) => {
           if (!m.streaming && !m.streamed) return m
-          const md = (m.parts || []).filter((p) => p.type === 'text').map((p) => p.text || '').join('')
+          const md = (m.parts || [])
+            .filter((p) => p.type === 'text')
+            .map((p) => p.text || '')
+            .join('\n')
           return md ? { ...m, revealTo: md.length } : m
         })
         streamCacheRef.current[sid] = restored // 同步缓存引用，保证后续增量基于同一份数组
@@ -1420,6 +1440,7 @@ export default function App() {
     if (!el) return
     if (listStickRef.current) {
       el.scrollTop = el.scrollHeight
+      lastScrollTopRef.current = el.scrollTop
       setShowNewHint(false)
     } else {
       setShowNewHint(true)
@@ -1428,12 +1449,22 @@ export default function App() {
 
   // 对话区滚动：距底 <30px 视为贴底（恢复跟随），否则上滑（停止跟随）；
   // 「↓ 新消息」提示仅在「上滑中 + 有新消息/busy 变化」（下方 effect）时出现
+  //
+  // 判定用「滚动方向」而不是「单次测量的距底距离」：程序化贴底若因高度还没算准（mermaid 异步渲染、
+  // 图片加载）而落不到底，距离会 >30px，旧写法会把 listStickRef 误置 false ⇒ 此后永久不跟随。
+  // 内容长高本身不会改变 scrollTop，所以"往上滚"才是用户意图。
   const onListScroll = () => {
     const el = listRef.current
     if (!el) return
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30
-    listStickRef.current = nearBottom
-    if (nearBottom) setShowNewHint(false)
+    const cur = el.scrollTop
+    const prev = lastScrollTopRef.current
+    lastScrollTopRef.current = cur
+    if (el.scrollHeight - cur - el.clientHeight < 30) {
+      listStickRef.current = true
+      setShowNewHint(false)
+    } else if (cur < prev) {
+      listStickRef.current = false
+    }
   }
 
   // 「↓ 新消息」：点击回到底部并恢复跟随
@@ -1443,6 +1474,15 @@ export default function App() {
     listStickRef.current = true
     setShowNewHint(false)
   }
+
+  // 贴底跟随：只在贴底时滚到底；供揭示层（head/尾每帧长高）与 mermaid 补渲染后调用。
+  // 回调用 useCallback([]) 保持身份稳定，避免 context 变化让所有消息重渲染。
+  const nudgeScroll = useCallback(() => {
+    const el = listRef.current
+    if (!el || !listStickRef.current) return
+    el.scrollTop = el.scrollHeight
+    lastScrollTopRef.current = el.scrollTop
+  }, [])
 
   // 操作提示自动消失
   useEffect(() => {
@@ -1671,6 +1711,17 @@ export default function App() {
     window.dispatchEvent(new CustomEvent(MERMAID_THEME_EVENT))
   }, [theme])
 
+  // 启动时加载已保存的流式揭示档位（旧 preload 无 getStreamReveal 时保持默认「浮现」）
+  useEffect(() => {
+    if (typeof api.getStreamReveal !== 'function') return
+    api
+      .getStreamReveal()
+      .then((v) => {
+        if (v === 'emerge' || v === 'typewriter') setStreamReveal(v)
+      })
+      .catch(() => {})
+  }, [])
+
   // Mermaid 图表全局后处理：DOM 中出现 .md-mermaid 占位符即调度渲染
   // （子树 childList 覆盖消息/详情新增，class 变化覆盖流式打字结束的时刻；rAF 合帧节流）
   useEffect(() => {
@@ -1681,6 +1732,7 @@ export default function App() {
       requestAnimationFrame(() => {
         scheduled = false
         scanMermaid(document.body)
+        nudgeScroll() // mermaid 补渲染会改变高度：贴底时就地跟一下（否则视口被撑开）
       })
     }
     const observer = new MutationObserver(schedule)
@@ -1699,6 +1751,16 @@ export default function App() {
     setTheme(t)
     if (typeof api.applyTheme === 'function') {
       api.applyTheme(t).catch(() => setToast('主题保存失败'))
+    }
+  }
+  // 切换流式揭示档位（浮现 / 打字机）：即时生效并持久化。
+  // 经 context 下发 ⇒ 穿透 MessageView 的 memo，正在流式的消息立刻换档（进度承接，不重打）
+  const applyStreamReveal = (v) => {
+    if (v === streamReveal) return
+    setStreamReveal(v)
+    setSettingsData((d) => (d ? { ...d, streamReveal: v } : d))
+    if (typeof api.applyStreamReveal === 'function') {
+      api.applyStreamReveal(v).catch(() => setToast('流式效果保存失败'))
     }
   }
   // 关闭时动作（quit=关闭程序 / tray=最小化到托盘）：即时保存并同步本地状态
@@ -2453,6 +2515,9 @@ export default function App() {
   }
 
   return (
+    // 揭示档位经 context 下发：穿透 MessageView 的 memo，切换即时生效（§5.6 / D9）
+    <RevealModeContext.Provider value={streamReveal}>
+    <ScrollFollowContext.Provider value={nudgeScroll}>
     <div className="app">
       {/* 自绘标题栏：无边框窗口的拖拽区 + 窗口控制按钮 */}
       <header className="topbar titlebar" onDoubleClick={() => api.windowMaximize()}>
@@ -3343,9 +3408,11 @@ export default function App() {
           data={settingsData}
           busy={busy}
           theme={theme}
+          streamReveal={streamReveal}
           appInfo={appInfo}
           appConfig={appConfig}
           onThemeChange={applyTheme}
+          onStreamRevealChange={applyStreamReveal}
           onCloseActionChange={applyCloseAction}
           onNotifyTaskChange={applyNotifyTask}
           onClose={() => setSettingsOpen(false)}
@@ -3354,6 +3421,8 @@ export default function App() {
         />
       )}
     </div>
+    </ScrollFollowContext.Provider>
+    </RevealModeContext.Provider>
   )
 }
 
@@ -4255,7 +4324,7 @@ function GroupCard({
 }
 
 // 设置面板：总览式（左侧导航 + 右侧内容），含「模型设置」「界面设置」「权限设置」「关于」
-function SettingsPanel({ data, busy, theme, appInfo, appConfig, onThemeChange, onCloseActionChange, onNotifyTaskChange, onClose, onSave, onSaveConfig }) {
+function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, onThemeChange, onStreamRevealChange, onCloseActionChange, onNotifyTaskChange, onClose, onSave, onSaveConfig }) {
   const [tab, setTab] = useState('model') // model | appearance | permission | config | about
   const [form, setForm] = useState(data)
   useEffect(() => setForm(data), [data])
@@ -4766,6 +4835,31 @@ function SettingsPanel({ data, busy, theme, appInfo, appConfig, onThemeChange, o
                 <label className="set-radio">
                   <input type="radio" name="theme" checked={theme === 'light'} onChange={() => onThemeChange('light')} />
                   🌞 亮色
+                </label>
+              </div>
+
+              <div className="set-group">
+                <div className="set-title">流式文字效果</div>
+                <div className="set-desc">
+                  AI 输出时新文字的呈现方式，切换即时生效（正在输出的回复也会立刻换档），无需重启。
+                </div>
+                <label className="set-radio">
+                  <input
+                    type="radio"
+                    name="streamReveal"
+                    checked={(streamReveal || 'emerge') === 'emerge'}
+                    onChange={() => onStreamRevealChange('emerge')}
+                  />
+                  ✨ 浮现（模糊 → 清晰）
+                </label>
+                <label className="set-radio">
+                  <input
+                    type="radio"
+                    name="streamReveal"
+                    checked={streamReveal === 'typewriter'}
+                    onChange={() => onStreamRevealChange('typewriter')}
+                  />
+                  ⌨️ 打字机（逐字直出）
                 </label>
               </div>
 
@@ -5795,7 +5889,7 @@ const MessageView = memo(function MessageView({ m, onCopy, onUndo, canUndo, gitA
           }
           return null
         })}
-        {mdText.trim() && <TextBlock key="text" text={mdText} streamed={m.streamed} revealTo={m.revealTo} />}
+        {mdText.trim() && <TextBlock key="text" text={mdText} streamed={m.streamed} revealTo={m.revealTo} streaming={m.streaming} />}
       </div>
       {/* 只读视图（子会话下钻）不提供复制按钮 —— 用户拍板：子会话只读，去掉「回退至此」「复制」 */}
       {mdText.trim() && !m.streaming && !m.aborted && !readOnly && (
@@ -5810,13 +5904,41 @@ const MessageView = memo(function MessageView({ m, onCopy, onUndo, canUndo, gitA
   )
 })
 
-// 文本块：曾流式输出的消息走打字机逐字揭示，历史消息直接渲染 Markdown
-// revealTo：恢复会话时已累积文本的长度（视为已揭示），后续增量从该位置继续打字机
-function TextBlock({ text, streamed, revealTo }) {
-  if (!streamed) {
+// 文本块：曾流式输出的消息走揭示动画，历史消息直接渲染 Markdown
+// revealTo：恢复会话时已累积文本的长度（视为已揭示），后续增量从该位置继续
+// streaming：引擎是否仍在输出。与「已追平」取【或】作为 .streaming 判据（§4.5）——
+//   只跟 shown 会让 mermaid 用截断围栏源码渲染，并让光标在追平空档熄灭
+// progress：揭示进度 { shown, carry, rateCps, samples, seeded, seededAt }，**在 TextBlock 持有**。
+//   切档只换子组件、不换状态所有者 ⇒ 进度不重置（P1：否则从 revealTo 重打一遍）
+function TextBlock({ text, streamed, revealTo, streaming }) {
+  const mode = useContext(RevealModeContext)
+  const progressRef = useRef(null)
+  if (!progressRef.current) {
+    progressRef.current = { shown: revealTo ?? 0, carry: 0, rateCps: 0, samples: [], seeded: false, seededAt: 0 }
+  }
+  const progress = progressRef.current
+  // 换档后重新播种水位环：打字机档期间到达的文字不该在切回浮现时再浮一次
+  // （播种帧不包裹，见 emergeDom.sampleTotal；shown/carry 保持不动 ⇒ 进度不倒退）
+  const modeRef = useRef(mode)
+  if (modeRef.current !== mode) {
+    modeRef.current = mode
+    progress.seeded = false
+  }
+  // ★ 揭示态是「粘住」的：session.idle 后的权威重载（normalize）不带 streamed，
+  // 若此时退回"直接渲染全文"，正在补打的剩余文本会一次性刷出（用户看到的"先按规矩打、然后全出"）。
+  // 一旦本条消息在本实例内进入过揭示态，就一直走揭示路径；换会话/重开时组件重挂、自然回到直出。
+  const everRevealedRef = useRef(false)
+  if (streamed) everRevealedRef.current = true
+  const reveal = streamed || everRevealedRef.current
+  if (!reveal) {
     return <div className="md-body" dangerouslySetInnerHTML={{ __html: marked.parse(text) }} />
   }
-  return <TypewriterText text={text} startFrom={revealTo} />
+  // key 让换档时重建容器：同一 __html 时 React 不重写 innerHTML，否则旧档的 .em 包裹会残留
+  return mode === 'typewriter' ? (
+    <TypewriterText key="tw" text={text} startFrom={revealTo} progress={progress} streaming={streaming} />
+  ) : (
+    <EmergeText key="em" text={text} startFrom={revealTo} progress={progress} streaming={streaming} />
+  )
 }
 
 // 打字机组件：积压驱动的「按需追赶」（速率与推进逻辑在 ./typewriter.mjs，可离线单测）。
@@ -5824,25 +5946,112 @@ function TextBlock({ text, streamed, revealTo }) {
 // 用 ref 记录已揭示长度与结转余量，文本增长时持续追赶而不重置。
 // 全程对已揭示文本渲染 Markdown（单一渲染路径），避免流式中格式/纯文本来回切换闪烁。
 // startFrom：初始已揭示长度（0 = 从空开始；恢复会话传已累积文本长度避免重新打印）
-function TypewriterText({ text, startFrom }) {
+// progress：与 EmergeText 共享的进度对象（切档承接）；缺省时行为与改造前一致
+function TypewriterText({ text, startFrom, progress, streaming }) {
   const textRef = useRef(text)
   textRef.current = text
-  const shownRef = useRef(startFrom ?? 0)
-  const carryRef = useRef(0)
-  const [shown, setShown] = useState(startFrom ?? 0)
+  const nudge = useContext(ScrollFollowContext) // 每揭示一帧通知贴底跟随（A）
+  const shownRef = useRef(progress ? progress.shown : (startFrom ?? 0))
+  const carryRef = useRef(progress ? progress.carry : 0)
+  const [shown, setShown] = useState(progress ? progress.shown : (startFrom ?? 0))
+  const advancing = shown < text.length
   useEffect(() => {
+    if (!advancing) return // 已追平：不起定时器（避免每条历史消息留一个 40Hz 空转）
     const timer = setInterval(() => {
-      const next = advanceTypewriter({ text: textRef.current, shown: shownRef.current, carry: carryRef.current })
+      const next = advanceTypewriterBurst({ text: textRef.current, shown: shownRef.current, carry: carryRef.current })
       carryRef.current = next.carry
-      if (next.step <= 0) return // 无推进（已追平或本帧不足 1 字）：不 setState，零重渲染
+      if (progress) progress.carry = next.carry
+      if (next.step <= 0) return
+      shownRef.current = next.shown
+      setShown(next.shown)
+      if (progress) {
+        progress.shown = next.shown
+        progress.rateCps = (next.step * 1000) / TW_TICK_MS
+      }
+    }, TW_TICK_MS)
+    return () => clearInterval(timer)
+  }, [advancing])
+  // 内容是逐帧长高的：消息数组不变 ⇒ App 的滚动 effect 不会跑 ⇒ 由这里通知贴底跟随（A）
+  useLayoutEffect(() => {
+    if (nudge) nudge()
+  }, [shown, nudge])
+  // 打字机落后或引擎仍在输出时挂 .streaming（光标已按用户要求全局隐藏，见 styles.css）
+  const lagging = !!streaming || shown < text.length
+  return (
+    <div className={'md-body' + (lagging ? ' streaming' : '')} dangerouslySetInnerHTML={{ __html: marked.parse(text.slice(0, shown)) }} />
+  )
+}
+
+// 浮现档的 DOM 层（末窗采集 / 负延迟包裹 / 降级还原）在 ./emergeDom.mjs ——
+// 抽成独立模块是为了让真浏览器验收脚本能求值同一份源码（scripts/accept-emerge.mjs）。
+
+// 系统「减少动态效果」偏好；运行中改变也生效。降级一律由 JS 判定（D8）：
+// CSS 里不写 @media，因为内联 --em-dur 会盖掉它，媒体规则会变成死代码。
+function usePrefersReducedMotion() {
+  const query = '(prefers-reduced-motion: reduce)'
+  const [reduced, setReduced] = useState(
+    () => typeof window !== 'undefined' && typeof window.matchMedia === 'function' && window.matchMedia(query).matches
+  )
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
+    const mq = window.matchMedia(query)
+    setReduced(mq.matches) // 首帧与 matchMedia 对齐（避免 hydrate 前后不一致）
+    const onChange = (e) => setReduced(e.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+  return reduced
+}
+
+// 浮现档：新字以「模糊→清晰」出现，已浮现的文字保持稳定、绝不重播。
+// 机制（D2）：每帧整体重建子树会让动画从第 0 帧重播 ⇒ 用负 animation-delay 把「重播」变成「定位」，
+// 不需要 rAF、不需要保留节点身份。出生时刻由水位环推导（emerge.mjs）。
+// **必须 useLayoutEffect**：useEffect 在绘制之后运行，每帧会先看到全亮的一帧再包回模糊（40Hz 预闪）。
+function EmergeText({ text, startFrom, progress, streaming }) {
+  const textRef = useRef(text)
+  textRef.current = text
+  const nudge = useContext(ScrollFollowContext) // 每揭示一帧通知贴底跟随（A）
+  const ref = useRef(null)
+  const [shown, setShown] = useState(progress ? progress.shown : (startFrom ?? 0))
+  const shownRef = useRef(shown)
+  const reduced = usePrefersReducedMotion()
+  const advancing = shown < text.length
+  useEffect(() => {
+    if (!advancing) return // 已追平：不起定时器
+    const timer = setInterval(() => {
+      const next = advanceTypewriterBurst({ text: textRef.current, shown: shownRef.current, carry: progress.carry })
+      progress.carry = next.carry
+      if (next.step <= 0) return // 无推进：不 setState，零重渲染
+      progress.rateCps = (next.step * 1000) / TW_TICK_MS
+      progress.shown = next.shown
       shownRef.current = next.shown
       setShown(next.shown)
     }, TW_TICK_MS)
     return () => clearInterval(timer)
-  }, [])
-  // 打字机落后时容器挂 .streaming，光标由 CSS 伪元素渲染在最后一个块级内容的行尾
-  const lagging = shown < text.length
+  }, [advancing])
+
+  const html = marked.parse(text.slice(0, shown))
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const now = performance.now() // 同一 effect 内只取一次（§5.8）
+    if (reduced) {
+      // 降级：不包裹；水位环照常推进，关掉降级后新字仍能正常浮现
+      sampleTotal(el, progress, now)
+      unwrapEmerge(el)
+      if (nudge) nudge()
+      return
+    }
+    wrapEmerge(el, progress, now)
+    if (nudge) nudge() // 每揭示一帧内容都在长高 ⇒ 通知贴底跟随（A）
+  }, [shown, html, reduced, nudge])
+
+  const lagging = !!streaming || shown < text.length
   return (
-    <div className={'md-body' + (lagging ? ' streaming' : '')} dangerouslySetInnerHTML={{ __html: marked.parse(text.slice(0, shown)) }} />
+    <div
+      ref={ref}
+      className={'md-body' + (lagging ? ' streaming' : '')}
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
   )
 }

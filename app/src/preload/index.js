@@ -53,6 +53,9 @@ contextBridge.exposeInMainWorld('xwork', {
   saveSettings: (settings, restart) => ipcRenderer.invoke('settings:save', settings, restart),
   getTheme: () => ipcRenderer.invoke('settings:get-theme'),
   applyTheme: (theme) => ipcRenderer.invoke('settings:apply-theme', theme),
+  // 流式揭示档位：emerge（浮现，默认）| typewriter（打字机）。纯渲染层偏好，不重启引擎
+  getStreamReveal: () => ipcRenderer.invoke('settings:get-stream-reveal'),
+  applyStreamReveal: (mode) => ipcRenderer.invoke('settings:apply-stream-reveal', mode),
   applyCloseAction: (action) => ipcRenderer.invoke('settings:apply-close-action', action),
   applyNotifyTask: (on) => ipcRenderer.invoke('settings:apply-notify-task', on),
   messageSend: (sessionID, text, model, agent) => ipcRenderer.invoke('message:send', sessionID, text, model, agent),

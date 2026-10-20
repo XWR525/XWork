@@ -28,6 +28,13 @@ export const TW_MAX_STEP = Math.ceil((TW_MAX_CPS * TW_TICK_MS) / 1000)
 // 它是「余量不得攒成未来突发」的保证（防「直落」），不兼任瞬时上限（那由 TW_MAX_STEP 直接给）。
 export const TW_CARRY_MAX = 2
 
+// 高速追赶：到达速率远超 300 字/秒时，积压会无限增长 ⇒ 关流那一刻要么长时间补打、
+// 要么被整段刷出（用户可见的"先按规矩打，然后一下子全出"）。这里在一帧内连续推进多次，
+// 等效提高上限：lag<500 → 1 次（基线 300 字/秒不变）；≥500 → 2 次；≥1000 → 3 次（≈900 字/秒）。
+// 只在追不上时生效，正常流式的观感与速率曲线完全不变。
+export const TW_BURST_MAX = 3
+export const TW_BURST_STEP = 500
+
 // 积压 → 目标速率（字/秒）。返回值 ∈ [TW_BASE_CPS, TW_MAX_CPS]，随 lag 单调不减、折点处连续。
 export function typewriterCps(lag) {
   return Math.min(TW_MAX_CPS, Math.max(TW_BASE_CPS, lag / TW_CATCHUP_TAU))
@@ -57,4 +64,20 @@ export function advanceTypewriter({ text, shown, carry }) {
   carry -= target - shown // 按真实推进量扣账，而非 want
   if (carry >= TW_CARRY_MAX) carry -= Math.floor(carry) // ① 余量不进银行，保留 [0, TW_CARRY_MAX)
   return { shown: target, carry, step: target - shown }
+}
+
+// 带高速追赶的单帧推进：积压越大，同一帧内推进的次数越多（等效速率上限 3×）。
+// 逐次调用 advanceTypewriter —— 每次都会用**当时的** lag 重算配额，所以越追越快，
+// 且不改变单次调用的语义（§5.2 的单帧步长断言仍成立）。
+export function advanceTypewriterBurst({ text, shown, carry, burstMax = TW_BURST_MAX }) {
+  const lag0 = text.length - shown
+  if (lag0 <= 0) return { shown, carry: 0, step: 0 }
+  const times = Math.max(1, Math.min(burstMax, 1 + Math.floor(lag0 / TW_BURST_STEP)))
+  let cur = { shown, carry, step: 0 }
+  for (let i = 0; i < times; i++) {
+    const r = advanceTypewriter({ text, shown: cur.shown, carry: cur.carry })
+    cur = { shown: r.shown, carry: r.carry, step: cur.step + r.step }
+    if (r.step <= 0) break
+  }
+  return cur
 }

@@ -20,6 +20,9 @@ const DEFAULT_SETTINGS = {
   modelUsage: {},
   workspace: '', // 当前工作区目录（空 = 默认启动目录）
   theme: 'light', // 界面主题：dark | light（仅影响渲染层，不参与引擎配置）
+  // 流式正文揭示效果：emerge = 浮现（默认，模糊→清晰）| typewriter = 打字机（逐字直出，改造前的行为）
+  // 纯渲染层偏好，切换即时生效、不重启引擎（设计 §5.6）
+  streamReveal: 'emerge',
   closeAction: 'quit', // 点击关闭按钮时的动作：quit = 关闭程序（默认）| tray = 最小化到托盘
   notifyTask: true, // 任务通知：AI 完成回复 / 向你提问时弹系统通知（仅窗口不在前台时）
   // 权限策略：AI 各操作类型的三档配置（生成 V2 permissions 规则数组）
@@ -113,6 +116,10 @@ class Settings {
     }
     // 迁移清理：内置 DeepSeek 已移除，删除旧版本遗留字段
     delete this.cache.deepseek
+    // 流式揭示档位：只接受两个合法值；手改配置文件写了别的东西时回退默认
+    if (this.cache.streamReveal !== 'emerge' && this.cache.streamReveal !== 'typewriter') {
+      this.cache.streamReveal = DEFAULT_SETTINGS.streamReveal
+    }
     return this.cache
   }
 
@@ -123,6 +130,7 @@ class Settings {
     if (raw.theme === 'dark' || raw.theme === 'light') s.theme = raw.theme
     if (raw.closeAction === 'tray' || raw.closeAction === 'quit') s.closeAction = raw.closeAction
     if (typeof raw.notifyTask === 'boolean') s.notifyTask = raw.notifyTask
+    if (raw.streamReveal === 'emerge' || raw.streamReveal === 'typewriter') s.streamReveal = raw.streamReveal
     // 权限策略：校验归一化后整体替换（11 项齐全，缺失项回退默认）
     if (raw.permission !== undefined) s.permission = sanitizePermission(raw.permission)
     // 应用配置用户覆盖层：整体替换（配置内容已由主进程 config:save 校验）
@@ -162,6 +170,7 @@ class Settings {
     const s = this.load()
     return {
       theme: s.theme,
+      streamReveal: s.streamReveal,
       closeAction: s.closeAction,
       notifyTask: s.notifyTask,
       permission: s.permission,

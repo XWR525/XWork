@@ -1446,21 +1446,34 @@ body.resizing-task .task-side {
   border: 1px solid var(--border);
 }
 
-/* 流式打字机光标：挂在最后一个块级内容的行尾（内联跟随文字），避免另起一行 */
-.streaming > :last-child::after {
-  content: '';
-  display: inline-block;
-  width: 7px;
-  height: 14px;
-  background: var(--accent);
-  vertical-align: -2px;
-  margin-left: 2px;
-  animation: blink 0.8s steps(1) infinite;
-}
+/* 流式光标（蓝色小方块）已按用户要求全局移除：
+   浮现档靠模糊淡入表达"仍在输出"，打字机档靠字流本身表达，方块只会抢注意力。
+   如需恢复，把 `.streaming > :last-child::after { content:''; ... }` 那条规则加回来即可。 */
 
 @keyframes blink {
   50% {
     opacity: 0;
+  }
+}
+
+/* 流式「浮现」：新文字从模糊→清晰。只动 opacity + filter，不动 transform
+   （transform 对非替换 inline 无效，改 inline-block 会改变断行机会）。
+   --em-dur / --em-ease / --em-blur 由 EmergeText 写在 .md-body 容器上（继承给所有 span），
+   每个 span 只内联负的 animation-delay —— 负延迟把「每帧重建导致的重播」变成「定位到应有进度」。
+   降级（reduced-motion / 打字机档）由 JS 判定，这里**不写** @media：内联 --em-dur 会盖掉它。 */
+.md-body .em {
+  display: inline;
+  animation: emerge var(--em-dur, 250ms) var(--em-ease, cubic-bezier(.25,.46,.45,.94)) both;
+}
+
+@keyframes emerge {
+  from {
+    opacity: 0;
+    filter: blur(var(--em-blur, 7px));
+  }
+  to {
+    opacity: 1;
+    filter: blur(0);
   }
 }
 
