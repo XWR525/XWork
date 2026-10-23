@@ -120,14 +120,20 @@ export function wrapEmerge(rootEl, progress, now) {
 
   // 同节点内按 at 倒序切（先右后左，左侧偏移不受影响）
   for (const p of plan) {
-    const left = p.node.splitText(p.at)
-    const mid = p.len >= left.data.length ? left : left.splitText(p.len)
+    // splitText(i) 的语义：原节点保留 [0, i)，**返回的是 [i, end)**。
+    // 所以要先切出「从 at 到结尾」的 rest，再把 rest 自己切成正好一块：
+    //   rest.splitText(len) ⇒ rest 变成 [at, at+len)（= 要包的那块），返回值是块之后的剩余。
+    // ⚠ 之前写成 `left.splitText(len)` 当块用，包进 span 的其实是「块之后的内容」——
+    //   中文是连续 2 字块，整体平移一个块看不出来；英文有空格分隔，被包的是词后的空格，
+    //   于是"词不浮现、空格在淡入"（v3.6 P15）。
+    const rest = p.node.splitText(p.at)
+    if (p.len < rest.data.length) rest.splitText(p.len) // rest 缩短为正好一块
     const span = document.createElement('span')
     span.className = 'em'
     // delay = elapsed：正数取负（定位到动画中段）、负数取正（错峰排队，保持起始帧）
     span.style.animationDelay = `${-p.delay}ms`
-    mid.parentNode.insertBefore(span, mid)
-    span.appendChild(mid)
+    rest.parentNode.insertBefore(span, rest)
+    span.appendChild(rest)
   }
   return plan.length
 }
