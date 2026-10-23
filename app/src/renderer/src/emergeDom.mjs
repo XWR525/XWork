@@ -95,7 +95,7 @@ export function wrapEmerge(rootEl, progress, now) {
   const plan = []
   const maxUnits = EMERGE_DEFAULTS.maxUnits
   outer: for (const { node, absStart } of tails) {
-    const chunks = chunkSpans(node.data, absStart, EMERGE_DEFAULTS.cjkGroup)
+    const chunks = chunkSpans(node.data, absStart, EMERGE_DEFAULTS.cjkGroup, EMERGE_DEFAULTS.latinGroup)
     for (let i = chunks.length - 1; i >= 0; i--) {
       const c = chunks[i]
       if (c.isSpace) continue

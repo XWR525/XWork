@@ -23,6 +23,7 @@ export const EMERGE_DEFAULTS = Object.freeze({
   ease: 'cubic-bezier(.25,.46,.45,.94)',
   blur0: 7,
   cjkGroup: 2, // CJK 每块汉字数
+  latinGroup: 3, // 拉丁/数字每块字符数（按"整词一块"会让词内后到的字母继承词首的老年龄 ⇒ 看不到浮现，见 §0.6 P14）
   samplesKeep: 60 // 水位环保留条数（≈1.5s @40Hz）
 })
 
@@ -96,10 +97,11 @@ function tokenize(text) {
 //   absStart：本段首码元在整个容器 textContent 中的绝对偏移
 //   isSpace：语义是「不包裹」，覆盖 ① 空白 ② 无法并入前后块的孤立标点
 // 返回值无损：各块 text 顺序拼接恒等于入参 text，absStart 依次递增。
-export function chunkSpans(text, absStart = 0, cjkGroup = EMERGE_DEFAULTS.cjkGroup) {
+export function chunkSpans(text, absStart = 0, cjkGroup = EMERGE_DEFAULTS.cjkGroup, latinGroup = EMERGE_DEFAULTS.latinGroup) {
   const out = []
   if (typeof text !== 'string' || text.length === 0) return out
   const group = Math.max(1, Math.floor(cjkGroup) || 1)
+  const latin = Math.max(1, Math.floor(latinGroup) || 1)
   const raw = [] // { text, isSpace }
   let lead = '' // 暂存的标点，等并入后块
   let openIdx = -1 // 可承接尾随标点的块下标（-1 = 前面是空白/开头）
@@ -135,17 +137,19 @@ export function chunkSpans(text, absStart = 0, cjkGroup = EMERGE_DEFAULTS.cjkGro
       else lead += tk.text
       continue
     }
-    if (tk.kind === 'cjk') {
+    // CJK 与拉丁/数字都按固定长度切块（词粒度会让块跨越整段打字时间，块首年龄 ≫ 新字年龄）
+    if (tk.kind === 'cjk' || tk.kind === 'word') {
+      const size = tk.kind === 'cjk' ? group : latin
       const cps = codePoints(tk.text)
-      for (let k = 0; k < cps.length; k += group) {
-        const piece = cps.slice(k, k + group).join('')
+      for (let k = 0; k < cps.length; k += size) {
+        const piece = cps.slice(k, k + size).join('')
         const t = lead + piece
         lead = ''
         openIdx = push(t, false)
       }
       continue
     }
-    // word / picto
+    // picto：每个 emoji 自成一块
     const t = lead + tk.text
     lead = ''
     openIdx = push(t, false)
