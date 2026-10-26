@@ -222,10 +222,14 @@ class Bridge {
   // ---- 消息（V2 异步收件箱模型） ----
 
   // 切换会话绑定模型（V2 模型绑定于会话；Model.Ref 用 id 字段，V1 叫 modelID）
+  // variant：推理强度（引擎内置 low/medium/high）。仅透传白名单值；default/非法值不写该字段，
+  // 让引擎把会话 variant 归一化为 default（设计 v1.1 §4.3）。
   async switchModel(sessionID, model) {
-    await this._req('POST', `/api/session/${sessionID}/model`, {
-      model: { providerID: model.providerID, id: model.modelID }
-    })
+    const ref = { providerID: model.providerID, id: model.modelID }
+    if (model.variant === 'low' || model.variant === 'medium' || model.variant === 'high') {
+      ref.variant = model.variant
+    }
+    await this._req('POST', `/api/session/${sessionID}/model`, { model: ref })
     return true
   }
 
@@ -880,8 +884,25 @@ class Bridge {
           properties: { sessionID: d.sessionID, messageID: d.assistantMessageID, info: { finish: 'error' } }
         })
         break
+      case 'session.execution.started':
+        // 「这一轮开始执行」：必须显式归一化成 session.status，否则渲染层的「执行中」状态无法从引擎侧恢复。
+        // 历史事故（2026-10-21）：引擎只会发 execution.started（没有 session.status），而这里原本没有该 case，
+        // 事件落到 default 被丢弃 ⇒ 渲染层 busySessionRef 永远为空 ⇒ 任务运行期间点一下侧栏会话就把 busy
+        // 清成 false 且再也回不来（表现为「AI 还在输出，却显示发送按钮、还能发送」）。
+        out.push({
+          type: 'session.status',
+          properties: { sessionID: d.sessionID, status: { type: 'busy' } }
+        })
+        break
       case 'session.execution.succeeded':
         // 附带 session.updated 触发列表刷新（标题生成/时间戳更新后的兜底同步）
+        out.push({ type: 'session.updated', properties: { sessionID: d.sessionID } })
+        out.push({ type: 'session.idle', properties: { sessionID: d.sessionID } })
+        break
+      case 'session.execution.interrupted':
+        // 用户点了「停止」：引擎以 execution.interrupted 收尾（不是 succeeded / failed）。
+        // 必须同样归一化为 idle —— 否则渲染层收不到结束信号，busy 永远不回落
+        // （表现为点了停止后按钮一直停在「中止」态、会话一直显示「运行中」）。
         out.push({ type: 'session.updated', properties: { sessionID: d.sessionID } })
         out.push({ type: 'session.idle', properties: { sessionID: d.sessionID } })
         break

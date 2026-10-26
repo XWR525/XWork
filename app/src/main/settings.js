@@ -25,6 +25,9 @@ const DEFAULT_SETTINGS = {
   streamReveal: 'emerge',
   closeAction: 'quit', // 点击关闭按钮时的动作：quit = 关闭程序（默认）| tray = 最小化到托盘
   notifyTask: true, // 任务通知：AI 完成回复 / 向你提问时弹系统通知（仅窗口不在前台时）
+  // 推理强度：enabled 总开关；default 为新会话默认档（default | low | medium | high）
+  // 纯发送期参数：不写 opencode.json、不触发引擎重载/重启（设计 v1.1 §4.6）
+  effort: { enabled: true, default: 'default' },
   // 权限策略：AI 各操作类型的三档配置（生成 V2 permissions 规则数组）
   // 默认严格档：全部操作需询问；用户可在设置面板「权限」页切换为 标准/宽松 档
   // 注：V2 已取消 list 动作，此处不再保留该键（历史设置中的该键会被 sanitize 丢弃）
@@ -56,6 +59,10 @@ const PERMISSION_KEYS = Object.keys(DEFAULT_SETTINGS.permission)
 const INTERNAL_ALLOW_PERMS = ['skill']
 const PERMISSION_ACTIONS = ['allow', 'ask', 'deny']
 
+// 推理强度档位：default = 不下发 variant；low/medium/high = 引擎内置变体（v2.6.0 实测，见设计 §12）
+const EFFORT_LEVELS = ['default', 'low', 'medium', 'high']
+const EFFORT_VARIANTS = ['low', 'medium', 'high']
+
 // 校验并归一化权限配置：只保留合法 key 与合法取值，缺失项回退默认
 function sanitizePermission(raw) {
   const base = structuredClone(DEFAULT_SETTINGS.permission)
@@ -64,6 +71,15 @@ function sanitizePermission(raw) {
     if (PERMISSION_ACTIONS.includes(raw[k])) base[k] = raw[k]
   }
   return base
+}
+
+// 校验并归一化推理强度设置：以 base 为底，只接受合法字段；非法/缺失字段保持 base
+function sanitizeEffort(raw, base = DEFAULT_SETTINGS.effort) {
+  const out = { ...base }
+  if (!raw || typeof raw !== 'object') return out
+  if (typeof raw.enabled === 'boolean') out.enabled = raw.enabled
+  if (EFFORT_LEVELS.includes(raw.default)) out.default = raw.default
+  return out
 }
 
 // 渲染进程展示 apiKey 时的掩码值（保存时若仍为该值表示未修改）
@@ -120,6 +136,8 @@ class Settings {
     if (this.cache.streamReveal !== 'emerge' && this.cache.streamReveal !== 'typewriter') {
       this.cache.streamReveal = DEFAULT_SETTINGS.streamReveal
     }
+    // 推理强度：手改配置文件写了非法值时回退默认
+    this.cache.effort = sanitizeEffort(this.cache.effort, DEFAULT_SETTINGS.effort)
     return this.cache
   }
 
@@ -131,6 +149,8 @@ class Settings {
     if (raw.closeAction === 'tray' || raw.closeAction === 'quit') s.closeAction = raw.closeAction
     if (typeof raw.notifyTask === 'boolean') s.notifyTask = raw.notifyTask
     if (raw.streamReveal === 'emerge' || raw.streamReveal === 'typewriter') s.streamReveal = raw.streamReveal
+    // 推理强度：设置页「推理强度」小节可走通用保存；也支持专用 settings:effort（见 saveEffort）
+    if (raw.effort !== undefined) s.effort = sanitizeEffort(raw.effort, s.effort)
     // 权限策略：校验归一化后整体替换（11 项齐全，缺失项回退默认）
     if (raw.permission !== undefined) s.permission = sanitizePermission(raw.permission)
     // 应用配置用户覆盖层：整体替换（配置内容已由主进程 config:save 校验）
@@ -165,6 +185,17 @@ class Settings {
     return s
   }
 
+  // 只保存推理强度设置：不触发 applyToOpencode / 热重载 / 引擎重启。
+  // 设置页「推理强度」小节走这条路径；返回归一化后的 effort（供渲染层同步本地状态）。
+  saveEffort(patch) {
+    const s = this.load()
+    s.effort = sanitizeEffort(patch, s.effort)
+    fs.mkdirSync(path.dirname(this.file), { recursive: true })
+    fs.writeFileSync(this.file, JSON.stringify(s, null, 2))
+    this.cache = s
+    return { ...s.effort }
+  }
+
   // 渲染进程可见（apiKey 脱敏）
   public() {
     const s = this.load()
@@ -173,6 +204,7 @@ class Settings {
       streamReveal: s.streamReveal,
       closeAction: s.closeAction,
       notifyTask: s.notifyTask,
+      effort: { ...s.effort },
       permission: s.permission,
       agentsBridge: { enabled: s.agentsBridge?.enabled !== false },
       modelGroups: (s.modelGroups || []).map((g) => ({
@@ -324,4 +356,4 @@ function buildPermissionRules(s, opts = {}) {
   return rules
 }
 
-module.exports = { Settings, applyToOpencode, MASK }
+module.exports = { Settings, applyToOpencode, MASK, EFFORT_LEVELS, EFFORT_VARIANTS, sanitizeEffort }

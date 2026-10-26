@@ -10,6 +10,8 @@ const path = require('node:path')
 // 不支持的语法（设计取舍）：区间 1-5、混合步进 1-10/2 等复杂写法
 // 任务历史保留上限（条/任务）：超出滚动丢弃最旧，防止 xwork-tasks.json 无限膨胀
 const HISTORY_LIMIT = 100
+// 推理强度白名单（与 settings.js 的 EFFORT_VARIANTS 保持一致；tasks.js 保持零外部依赖，故在此内联）
+const EFFORT_VARIANTS = ['low', 'medium', 'high']
 const CRON_FIELDS = [
   { name: '分', min: 0, max: 59 },
   { name: '时', min: 0, max: 23 },
@@ -153,7 +155,13 @@ function normalizeTask(raw, id) {
     name: String(raw.name || '').trim(),
     workspace: String(raw.workspace || ''),
     prompt: String(raw.prompt || ''),
-    model: raw.model && raw.model.modelID ? { providerID: raw.model.providerID, modelID: raw.model.modelID } : null,
+    model: raw.model && raw.model.modelID
+      ? {
+          providerID: raw.model.providerID,
+          modelID: raw.model.modelID,
+          ...(EFFORT_VARIANTS.includes(raw.model.variant) ? { variant: raw.model.variant } : {})
+        }
+      : null,
     agent: raw.agent === 'plan' ? 'plan' : DEFAULT_TASK.agent, // 定时任务固定 build（仅兼容旧数据）
     schedule: String(raw.schedule || ''),
     sessionID: raw.sessionID || null, // 固定会话 id（引擎分配，删除任务时同步清理）

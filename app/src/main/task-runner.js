@@ -343,7 +343,12 @@ class TaskRunner {
       run.session = await this.ensureSession(task)
       if (run.finished) return run.result
       const prompt = renderPlaceholders(task.prompt)
-      await this.taskBridge.sendMessage(run.session.id, prompt, task.model, task.agent)
+      // 推理强度：功能关闭时不把任务里的 variant 下发给引擎（任务定义保留，重新开启后仍可用）
+      const taskModel =
+        task.model && this.settings.load().effort?.enabled === false
+          ? { ...task.model, variant: undefined }
+          : task.model
+      await this.taskBridge.sendMessage(run.session.id, prompt, taskModel, task.agent)
       // 发送成功，等待事件流判定完成/失败/超时
       return await done
     } catch (e) {

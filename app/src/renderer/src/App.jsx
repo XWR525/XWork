@@ -5,6 +5,7 @@ import hljs from 'highlight.js/lib/common'
 import markedKatex from 'marked-katex-extension'
 import ABOUT_LOGO from './assets/logo.svg'
 import { advanceTypewriterBurst, TW_TICK_MS } from './typewriter.mjs'
+import { easeInOutCubic, iconSize, MORPH_MS, rotateDeg, shapePoints, SIZE_SEND } from './sendButtonMorph.mjs'
 import { sampleTotal, unwrapEmerge, wrapEmerge } from './emergeDom.mjs'
 import {
   mergeToolState,
@@ -558,6 +559,16 @@ function fmtDateTime(ts) {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
+// 执行中会话的已运行时长：ms → mm:ss（超过 1 小时 → h:mm:ss）
+function fmtRunElapsed(ms) {
+  const total = Math.max(0, Math.floor((ms || 0) / 1000))
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  const p = (n) => String(n).padStart(2, '0')
+  return h ? `${h}:${p(m)}:${p(s)}` : `${p(m)}:${p(s)}`
+}
+
 // 工具调用开始时刻：epoch 毫秒 → HH:MM:SS（任务面板工具卡片用；引擎 state.time.start）
 function fmtClock(ts) {
   if (!ts) return ''
@@ -602,6 +613,77 @@ const UNDO_IMPACT_META = {
 // 点击「加载更早」每次追加 TOOL_PAGE 条；有界 DOM 保证展开/收起动画每帧重排成本恒定，长任务不卡顿
 const TOOL_PAGE = 20
 
+// 发送 / 中止按钮图标：形状在两种状态间逐帧插值（旋转 90° + 变形 + 尺寸 17→19px）。
+// 为什么必须「一个按钮 + 一个 svg」而不是维护两个按钮来回切：React 换元素会卸载重建 DOM。
+// 形状动画每次都从起点重来（表现为闪一下），而且点击目标会在切换瞬间消失。
+function SendStopIcon({ active }) {
+  const svgRef = useRef(null)
+  const polyRef = useRef(null)
+  const tRef = useRef(active ? 1 : 0) // 当前形态（0=发送，1=中止），动画期间连续变化
+  const rafRef = useRef(0)
+
+  const paint = useCallback((t) => {
+    const svg = svgRef.current
+    const poly = polyRef.current
+    if (!svg || !poly) return
+    poly.setAttribute('points', shapePoints(t))
+    poly.setAttribute('transform', `rotate(${rotateDeg(t)} 50 50)`)
+    const px = iconSize(t).toFixed(2) + 'px'
+    svg.style.width = px
+    svg.style.height = px
+  }, [])
+
+  useEffect(() => {
+    const target = active ? 1 : 0
+    const from = tRef.current
+    if (from === target) return undefined
+    // 系统「减少动态效果」：直接切到目标形态，不做旋转/变形动画
+    const reduce =
+      typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    if (reduce) {
+      tRef.current = target
+      paint(target)
+      return undefined
+    }
+    const started = performance.now()
+    cancelAnimationFrame(rafRef.current)
+    const tick = (now) => {
+      const p = Math.min(1, (now - started) / MORPH_MS)
+      const t = from + (target - from) * easeInOutCubic(p)
+      tRef.current = t
+      paint(t)
+      if (p < 1) rafRef.current = requestAnimationFrame(tick)
+    }
+    rafRef.current = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(rafRef.current)
+  }, [active, paint])
+
+  const initial = active ? 1 : 0
+  return (
+    <svg
+      ref={svgRef}
+      viewBox="0 0 100 100"
+      aria-hidden="true"
+      style={{ width: SIZE_SEND + 'px', height: SIZE_SEND + 'px' }}
+    >
+      <polygon ref={polyRef} points={shapePoints(initial)} transform={`rotate(${rotateDeg(initial)} 50 50)`} />
+    </svg>
+  )
+}
+
+// 推理强度档位（与主进程 settings.js 的 EFFORT_LEVELS 一致）：default = 不下发 variant
+const EFFORT_OPTIONS = [
+  { value: 'default', label: 'Default', hint: 'No extra field; use the model default' },
+  { value: 'low', label: 'Low', hint: 'reasoning_effort: low' },
+  { value: 'medium', label: 'Medium', hint: 'reasoning_effort: medium' },
+  { value: 'high', label: 'High', hint: 'reasoning_effort: high' }
+]
+const EFFORT_VARIANTS = ['low', 'medium', 'high']
+// 档位 → Model.Ref.variant：default/关闭/未知值一律 undefined（不写该字段）
+const effortVariantOf = (level, enabled) => (enabled && EFFORT_VARIANTS.includes(level) ? level : undefined)
+// 会话 model.variant → 档位：default/缺失/未知值 → default
+const effortFromSession = (variant, enabled) => (enabled && EFFORT_VARIANTS.includes(variant) ? variant : 'default')
+
 export default function App() {
   const [engine, setEngine] = useState({ running: false, version: null, port: 4096 })
   const [engineError, setEngineError] = useState('')
@@ -643,7 +725,42 @@ export default function App() {
   const viewMessages = isChildView ? childMirror || [] : messages
   const parentSession = currentID ? sessions.find((x) => x.id === currentID) : null
   const parentTitle = (parentSession && parentSession.title) || '新会话'
-  const [busy, setBusy] = useState(false)
+  // 多会话并发（设计：同一工作区可同时运行多个会话）：执行中状态按会话记（sessionID → 开始时间（ms）），
+  // 不再是一个布尔。为什么必须按会话：单个布尔只能表达「当前这个」，切到别的会话时会把仍在跑的会话
+  // 误判成空闲（2026-10-21 事故：AI 还在输出却显示发送按钮）。
+  const [runningSessions, setRunningSessions] = useState(() => new Map())
+  const runningRef = useRef(runningSessions) // 事件回调里读最新集合（闭包防过期）
+  runningRef.current = runningSessions
+  // 当前会话视角的 busy：保持既有语义，所有调用点（输入区、停止、禁用态）无需改动
+  const busy = !!currentID && runningSessions.has(currentID)
+  // 运行中会话的计时展示：每秒刷新一次「运行中 · mm:ss」（没有运行中会话时不挂定时器）
+  const [nowTs, setNowTs] = useState(Date.now())
+  useEffect(() => {
+    if (!runningSessions.size) return undefined
+    setNowTs(Date.now())
+    const t = setInterval(() => setNowTs(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [runningSessions.size])
+  // 登记 / 注销「某会话正在执行」。startedAt 缺省为调用时刻（用于侧栏计时）
+  const markRunning = (sid, startedAt) => {
+    if (!sid) return
+    setRunningSessions((prev) => {
+      if (prev.has(sid)) return prev
+      const next = new Map(prev)
+      next.set(sid, startedAt || Date.now())
+      return next
+    })
+  }
+  const markIdle = (sid) => {
+    if (!sid) return
+    setRunningSessions((prev) => {
+      if (!prev.has(sid)) return prev
+      const next = new Map(prev)
+      next.delete(sid)
+      return next
+    })
+  }
+  const clearRunning = () => setRunningSessions((prev) => (prev.size ? new Map() : prev))
   const [stopping, setStopping] = useState(false)
   const [input, setInput] = useState('')
   const [permQueue, setPermQueue] = useState([]) // 待处理的权限请求队列（引擎可能并发弹出多个 ask，逐个确认）
@@ -685,6 +802,16 @@ export default function App() {
   // 流式正文揭示档位：emerge = 浮现（默认）| typewriter = 打字机。纯渲染层偏好，切换即时生效（§5.6）
   const [streamReveal, setStreamReveal] = useState('emerge')
   const [modelSel, setModelSel] = useState(null) // 当前会话选择的模型 {providerID, modelID}，null = 未选择（发送前必须有效）
+  // 推理强度（会话级）：default | low | medium | high；只在发送时随模型下发
+  const [effort, setEffort] = useState('default')
+  const effortRef = useRef('default') // 供全局事件回调读取最新档位（effect 闭包不随渲染更新）
+  effortRef.current = effort
+  // effortSidRef：已按会话回填过档位的 sessionID。session.idle 会重载同一会话，
+  // 此时不得用可能过期的 sessions 反向覆盖用户刚选的档位（设计 §4.5）。
+  const effortSidRef = useRef(null)
+  const effortEnabled = settingsData?.effort?.enabled !== false
+  const effortEnabledRef = useRef(true)
+  effortEnabledRef.current = effortEnabled
   const [agent, setAgent] = useState('build') // 当前会话的模式（opencode agent：build 默认 / plan 只读规划）
   // 智能体列表（引擎注册表，含工作区 .agents 里的自定义项）——由主进程 agents:list 提供。
   // 曾经的 AgentPicker 写死 build/plan，导致 .agents 里的智能体虽然被引擎加载却无处可选。
@@ -731,7 +858,6 @@ export default function App() {
   const [showNewHint, setShowNewHint] = useState(false) // 上滑停止跟随期间有新内容时，显示「↓ 新消息」提示
   const currentRef = useRef(currentID)
   currentRef.current = currentID
-  const busySessionRef = useRef(null) // 引擎当前正在运行任务的会话 id（session.status 实时维护）：切回该会话时恢复 UI busy
   const compactingSidRef = useRef(null) // 正在压缩的会话 id：其 idle/error 事件到达时复位 compacting（压缩中切走也会复位，避免永久卡死）
   // 会话级流式消息缓存 { [sessionID]: 渲染结构消息数组 }：事件流增量始终写入缓存（不因切走丢弃），
   // 切回任务仍在跑的会话时用缓存恢复，避免引擎「流式中 GET 快照文本为空」导致正文截断
@@ -759,20 +885,24 @@ export default function App() {
     setChildViewSid(null)
     setChildPopOpen(false)
     setTitleEditing(false) // 丢弃未保存的标题编辑
-    setBusy(false)
     setStopping(false)
-    // 引擎中该会话的任务仍在后台运行（如中途切走后任务未中止）→ 恢复执行中状态
-    if (busySessionRef.current === sid) setBusy(true)
+    // busy 现在按会话集合推导（runningSessions.has(sid)），切换会话无需复位/恢复。
+    // 该会话仍在执行就继续显示「执行中」，已结束就自然显示空闲。
     // 切换会话：重置对话区贴底状态并隐藏「↓ 新消息」气泡（避免上个会话的上滑残留）
     listStickRef.current = true
     setShowNewHint(false)
     // 恢复该会话绑定的模型（opencode 将模型持久化在会话 model 字段）
     const s = sessions.find((x) => x.id === sid)
     if (s?.model?.providerID) setModelSel({ providerID: s.model.providerID, modelID: s.model.id })
+    // 推理强度：只在切换到另一个会话时回填；session.idle 重载同一会话不覆盖本地档位
+    if (effortSidRef.current !== sid) {
+      effortSidRef.current = sid
+      setEffort(effortFromSession(s?.model?.variant, effortEnabledRef.current))
+    }
     try {
       const msgs = await api.messageList(sid)
       const norm = normalize(msgs)
-      if (busySessionRef.current === sid && streamCacheRef.current[sid]) {
+      if (runningRef.current.has(sid) && streamCacheRef.current[sid]) {
         // 该会话任务仍在后台运行：用流式缓存恢复（含切走期间的增量），
         // 避免引擎「流式中 GET 快照文本为空」导致正文截断；token 统计仍取 GET（info 字段不受流式影响）
         // 恢复时刻已累积的文本视为已揭示（revealTo）：直接显示全文，后续增量从该位置继续打字机
@@ -931,10 +1061,9 @@ export default function App() {
       setTitleEditing(false)
       setMessages([])
       setCtxTokens(null) // 切换工作区后无当前会话，清空 token 统计
-      setBusy(false)
       setStopping(false)
       // 引擎不再随工作区重启：其它工作区正在执行的任务会继续跑，
-      // 故 busySessionRef / 流式缓存**保留**（切回该会话时仍能正确显示执行中状态）
+      // 但 runningSessions / 流式缓存**保留**（切回该会话时仍能正确显示执行中状态）
       // 切换工作区同样重置对话区贴底状态与「↓ 新消息」气泡
       listStickRef.current = true
       setShowNewHint(false)
@@ -1111,25 +1240,25 @@ export default function App() {
             if (!/tool-calls/.test(f)) {
               // 最终完成：流式缓存失效（不因是否当前会话过滤），后续以 GET 全量快照为准
               delete streamCacheRef.current[p.sessionID]
-              busySessionRef.current = null // 最终消息已完成（stop/error），撤销后台恢复标记，避免 loadSession 误恢复 busy
               if (p.sessionID === cur) loadSession(cur)
             }
           }
           break
         }
         case 'session.status': {
-          // 引擎任务运行状态：全局维护（不随当前会话 cur 过滤），
-          // busy 会话 id 记入 ref，用户切回该会话时由 loadSession 恢复 UI busy
+          // 引擎任务运行状态（全局，不随当前会话过滤）：按会话登记/注销「执行中」。
+          // 当前会话的 busy 由 runningSessions 推导，因此切回仍在跑的会话会**立刻**恢复执行中，
+          // 不再依赖 loadSession 里的单槽恢复（2026-10-21 事故：一次侧栏点击就把 busy 永久清成空闲）。
           const running = p.sessionID && p.status?.type === 'busy'
-          if (running) busySessionRef.current = p.sessionID
-          else if (busySessionRef.current === p.sessionID) busySessionRef.current = null
+          if (running) markRunning(p.sessionID)
+          else markIdle(p.sessionID)
           break
         }
         case 'session.idle': {
           // 任务真正结束（多 turn 任务以 idle 为准；POST 只返回首个 step）
-          // 清理不因是否当前会话过滤：切走期间任务结束也要使缓存/busy 恢复标记失效
+          // 清理不因是否当前会话过滤：切走期间任务结束也要使缓存/执行中标记失效。
           delete streamCacheRef.current[p.sessionID]
-          if (busySessionRef.current === p.sessionID) busySessionRef.current = null
+          markIdle(p.sessionID)
           // 压缩会话完成：先于会话匹配复位 compacting——压缩中切换到其他会话时，
           // 压缩会话的 idle 会因 p.sessionID !== cur 被 break 拦截，若此处不复位会永久卡死
           if (compactingSidRef.current === p.sessionID) {
@@ -1137,7 +1266,6 @@ export default function App() {
             setCompacting(false)
           }
           if (p.sessionID !== cur) break
-          setBusy(false)
           setStopping(false)
           loadSession(cur)
           break
@@ -1145,15 +1273,24 @@ export default function App() {
         case 'session.error': {
           // 任务失败（如 API Key 无效）：把错误标记到当前会话最后一条 assistant 消息，
           // 避免失败回复渲染成「空气泡」；最终错误以 session.idle 后的权威重载为准
-          // 清理不因是否当前会话过滤：切走期间任务失败也要使缓存/busy 恢复标记失效
+          // 清理不因是否当前会话过滤：切走期间任务失败也要使缓存/执行中标记失效。
           delete streamCacheRef.current[p.sessionID]
-          if (busySessionRef.current === p.sessionID) busySessionRef.current = null
+          markIdle(p.sessionID)
           // 压缩失败也复位（同 idle：不因会话过滤），避免按钮卡在「压缩中…」
           if (compactingSidRef.current === p.sessionID) {
             compactingSidRef.current = null
             setCompacting(false)
           }
           if (p.sessionID !== cur) break
+          // 引擎级「变体不可用」：复位当前会话档位，避免下一条继续 no-route。
+          // 不自动重发：prompt 已把用户消息写入会话，自动重发会产生两条相同消息（设计 §4.9）。
+          const errName = p.error?.name || ''
+          const errMsg = String(p.error?.message || '')
+          if ((errName === 'provider.no-route' || /Variant unavailable/i.test(errMsg)) && effortRef.current !== 'default') {
+            setEffort('default')
+            effortRef.current = 'default'
+            setToast('所选推理强度在当前引擎不可用，已切回默认，请重新发送')
+          }
           const em = extractError({ error: p.error })
           if (!em) break
           setMessages((ms) => {
@@ -1201,14 +1338,13 @@ export default function App() {
         case 'engine.exited': {
           // 引擎进程退出事件。可能是瞬态（如冷启动端口瞬占），延迟复查：
           // 复查仍健康则忽略并恢复状态；否则提示用户
-          // 引擎进程退出后任何进行中的任务必然中断，立即复位 busy，避免 UI 卡在「执行中」
-          busySessionRef.current = null // 引擎退出，任务中断，撤销后台恢复标记
+          // 引擎进程退出后任何进行中的任务必然中断，立即清空「执行中」集合，避免 UI 卡在执行中。
+          clearRunning()
           streamCacheRef.current = {} // 引擎退出：所有会话流式缓存失效
           // 子智能体（设计 §5.7 ①）：把该世代【未终态】的摘要标记为过期 ⇒ phase 计算据此降级为「状态未知」。
           // 注意不能靠"改写消息"实现：随后的 loadSession 快照会把 part 写回 running（v3-B-1 第 2 问）
           subagentLive.markStale('engine-exited')
           subagentStream.reset() // 展开态镜像一并回收（设计 §5.7 ①）
-          setBusy(false)
           setStopping(false)
           setEngine((e) => ({ ...e, running: false }))
           setTimeout(async () => {
@@ -1517,7 +1653,7 @@ export default function App() {
         // finish 缺失 = 消息仍在流式输出中，绝不判完成（交由 session.idle 权威复位），
         // 否则超长任务中 POST 早于任务结束返回时，会把「还在输出」误判为「已完成」导致 busy 提前消失
         if (last?.info?.id === expectedId && finish && !/tool-calls/.test(JSON.stringify(finish))) {
-          setBusy(false)
+          markIdle(sid)
           setStopping(false)
         }
       } catch {
@@ -1563,15 +1699,26 @@ export default function App() {
         streamCacheRef.current[sid] = next // 流式缓存基线（含本次用户消息），后续增量在此累积
         return next
       })
-      setBusy(true)
+      // 「本会话正在执行」登记：发送即入集合，idle/error（或引擎未受理）时移除。
+      // （另一个来源是 session.status 事件；两者共同保证切走再切回仍能恢复执行中状态）
+      markRunning(sid)
       // 同步等待首个 step 完成；期间实时过程（流式文本/工具/权限/后续 turn）由全局事件流推送
-      const result = await api.messageSend(sid, finalText, modelSel, agent)
+      // 推理强度随模型一起下发（default/功能关闭时不写 variant）；登记会话，避免 idle 重载时用旧列表反向覆盖
+      effortSidRef.current = sid
+      const result = await api.messageSend(
+        sid,
+        finalText,
+        { ...modelSel, variant: effortVariantOf(effort, effortEnabled) },
+        agent
+      )
       // 智能体切换失败不再静默（设计 §5.5(b) / 评审 v2-B-4）：主进程把失败信号带回，这里给用户 toast
       if (result && result.agentSwitchFailed) {
         setToast(`智能体「${result.agentSwitchFailed.agent}」不可用，已按引擎默认发送`)
       }
       settle(result, sid)
       checkDone(sid, result.info.id)
+      // 引擎切变体只发 session.model.selected（bridge 不下发）→ 主动刷新列表，保证切走再切回时档位正确
+      refreshSessions()
     } catch (e) {
       // POST 失败 ≠ 任务失败：可能只是「等待快照」的通道断开/超时，引擎已受理消息、任务仍在推进。
       // 取证：引擎健康且出现了发送时刻之后的新 assistant 消息 → 静默继续（busy 交由 session.idle 事件复位）；
@@ -1594,7 +1741,8 @@ export default function App() {
         console.error('send failed', e)
         setEngineError('发送失败: ' + e.message)
         delete streamCacheRef.current[sid] // 引擎未受理：流式缓存基线作废
-        setBusy(false)
+        // 引擎未受理 ⇒ 撤销「执行中」标记，否则切回该会话会被误显示为执行中
+        markIdle(sid)
         setStopping(false)
       }
     } finally {
@@ -1871,6 +2019,22 @@ export default function App() {
     setSettingsData((d) => (d ? { ...d, notifyTask: v } : d))
   }
 
+  // 推理强度开关/默认档：即时保存（主进程只写 effort，不重载引擎）
+  const applyEffort = (patch) => {
+    api
+      .saveEffort(patch)
+      .then((next) => {
+        setSettingsData((d) => (d ? { ...d, effort: next } : d))
+        // 空会话（尚未创建/绑定）跟随新默认档；已有会话保持自己的档位
+        if (!currentRef.current) {
+          effortSidRef.current = null
+          setEffort(next.default || 'default')
+          effortRef.current = next.default || 'default'
+        }
+      })
+      .catch(() => setToast('推理强度设置保存失败'))
+  }
+
   // 加载设置快照（含模型组）；启动与打开设置时调用
   // quiet=true：启动期引擎可能尚未就绪，失败属预期，静默等 server.connected 重试
   const loadModels = async (quiet = false) => {
@@ -2130,24 +2294,30 @@ export default function App() {
     setTitleEditing(false)
     setMessages([])
     setCtxTokens(null) // 新会话无上下文，清空上一会话残留的 token 统计
-    setBusy(false)
+    // 不清空 runningSessions：其它会话可能在后台继续跑（切回时仍要显示执行中）
     setStopping(false)
     // 新建会话：重置对话区贴底状态并隐藏「↓ 新消息」气泡
     listStickRef.current = true
     setShowNewHint(false)
     setGreeting(pickGreeting())
     setAgent('build') // 新对话默认 build 模式
+    // 新会话用设置里的默认档；清空会话回填标记，下次切换会话重新按引擎绑定回填
+    effortSidRef.current = null
+    setEffort(settingsData?.effort?.default || 'default')
     // 默认最常用模型（须仍存在于模型组中有效），无记录或已失效则置空让用户选择
     await applyFrequentModel()
   }
 
   // 打开程序时（空会话）默认选择最常用模型并回到 build 模式；有会话时由 loadSession 恢复，不覆盖
+  // 只在「会话切换 / 模型组变化」时重跑：effort 开关的即时保存不应重置用户已选的模型
   useEffect(() => {
     if (currentID || !settingsData) return
     applyFrequentModel()
     setAgent('build')
+    effortSidRef.current = null
+    setEffort(settingsData?.effort?.default || 'default')
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentID, settingsData])
+  }, [currentID, settingsData?.modelGroups])
 
   // 子智能体卡片底部的「在右侧面板查看原始输入/输出」（决策 O1=A）。
   // 必须是稳定引用：它会经 props 传到 memo 化的 MessageView（引用一变，整条消息列表都要重渲染）
@@ -2634,7 +2804,12 @@ export default function App() {
                       draggable={pinnedOrder.includes(s.id)}
                       onDragStart={(e) => onDragStart(e, s.id)}
                       onDragEnd={onDragEnd}
-                      onClick={() => loadSession(s.id)}
+                      onClick={() => {
+                        // 点当前会话不再重载：重载会把流式缓存换成 GET 快照。
+                        // 长任务下正文可能短暂回退（执行中状态已由 runningSessions 推导，无需重载恢复）。
+                        if (s.id === currentID) return
+                        loadSession(s.id)
+                      }}
                     >
                   {editingID === s.id ? (
                     <input
@@ -2666,9 +2841,22 @@ export default function App() {
                     </div>
                   )}
                   <div className="session-meta">
-                    {/* 回复时间 + 🤖n 徽标：包成一个左侧簇，让徽标**紧贴**时间（不受 space-between 影响） */}
+                    {/* 左侧簇：运行中标识 / 回复时间 + 🤖n 徽标（徽标紧贴前缀，不受 space-between 影响）*/}
                     <span className="session-meta-left">
-                      <span title="最新回复时间">{fmtDateTime(s.time?.updated || s.time?.created)}</span>
+                      {(() => {
+                        // 多会话并发：该会话在执行中就显示「● 运行中 · mm:ss」，否则显示最近回复时间。
+                        // 同时可能有多个会话处于该状态（同一工作区并行执行），各自独立计时。
+                        const startedAt = runningSessions.get(s.id)
+                        if (startedAt == null) {
+                          return <span title="最新回复时间">{fmtDateTime(s.time?.updated || s.time?.created)}</span>
+                        }
+                        return (
+                          <span className="session-run" title="该会话正在执行（同一工作区可并行多个会话）">
+                            <span className="run-dot" />
+                            运行中{startedAt ? ' · ' + fmtRunElapsed(nowTs - startedAt) : ''}
+                          </span>
+                        )
+                      })()}
                       {(() => {
                         // 父会话行的子智能体计数徽标（I2：子会话不占列表条目，但可下钻）
                         // v1 决策 D3：不可点击，仅 title 提示；下钻走 L1 卡片的「展开」按钮（tooltip 写全称「展开子智能体过程」）
@@ -2997,15 +3185,28 @@ export default function App() {
                     value={modelValid ? modelSel : null}
                     onPick={applyModelSel}
                   />
-                  {busy ? (
-                    <button className="send-btn stop" disabled={stopping} onClick={stop} title={stopping ? '正在停止…' : '停止任务'}>
-                      ■
-                    </button>
-                  ) : (
-                    <button className="send-btn" disabled={!input.trim()} onClick={send} title="发送">
-                      ↑
-                    </button>
+                  {/* 推理强度：会话级，贯穿到下一次 send；设置关闭时整个下拉不渲染，剩余两个下拉右移 */}
+                  {effortEnabled && (
+                    <EffortPicker
+                      value={effort}
+                      onPick={(v) => {
+                        setEffort(v)
+                        effortRef.current = v
+                      }}
+                      disabled={!modelValid || !engine.running}
+                      reason={!engine.running ? '引擎未连接' : !modelValid ? '请先选择模型' : ''}
+                    />
                   )}
+                  {/* 发送 → 中止：同一个按钮 + 同一个 svg，形状逐帧变形（不换元素，动画不闪）*/}
+                  <button
+                    className={`send-btn${busy ? ' stop' : ''}`}
+                    disabled={busy ? stopping : !input.trim()}
+                    onClick={busy ? stop : send}
+                    title={busy ? (stopping ? '正在停止…' : '停止任务') : '发送'}
+                    aria-label={busy ? '停止任务' : '发送'}
+                  >
+                    <SendStopIcon active={busy} />
+                  </button>
                 </div>
               </div>
             </div>
@@ -3415,6 +3616,7 @@ export default function App() {
           onStreamRevealChange={applyStreamReveal}
           onCloseActionChange={applyCloseAction}
           onNotifyTaskChange={applyNotifyTask}
+          onEffortChange={applyEffort}
           onClose={() => setSettingsOpen(false)}
           onSave={saveSettings}
           onSaveConfig={saveAppConfig}
@@ -3877,9 +4079,36 @@ function TasksPage({ notify, setConfirm, settingsData, workspace }) {
                       value={draft.model}
                       onPick={(key) => {
                         const i = key.lastIndexOf('/')
-                        set({ model: { providerID: key.slice(0, i), modelID: key.slice(i + 1) } })
+                        const keep = draft.model?.variant
+                        // 新建任务首次选模型时继承全局默认档；编辑任务保持原值
+                        const inherit =
+                          !editId && !keep && settingsData?.effort?.enabled && settingsData?.effort?.default !== 'default'
+                            ? settingsData.effort.default
+                            : undefined
+                        set({
+                          model: {
+                            providerID: key.slice(0, i),
+                            modelID: key.slice(i + 1),
+                            ...(keep ? { variant: keep } : inherit ? { variant: inherit } : {})
+                          }
+                        })
                       }}
                     />
+                    {settingsData?.effort?.enabled !== false && (
+                      <EffortPicker
+                        value={draft.model?.variant || 'default'}
+                        disabled={!draft.model}
+                        reason="请先选择模型"
+                        onPick={(v) =>
+                          set({
+                            model: {
+                              ...(draft.model || {}),
+                              variant: v === 'default' ? undefined : v
+                            }
+                          })
+                        }
+                      />
+                    )}
                   </div>
                   <div className="tc-resize-bar" title="拖拽调整输入区高度" onMouseDown={startResize} />
                 </div>
@@ -4252,7 +4481,8 @@ function GroupCard({
   onEdit,
   onRemove,
   onCancel,
-  onSubmit
+  onSubmit,
+  onCopy
 }) {
   const boxRef = useRef(null)
   const formRef = useRef(null)
@@ -4296,7 +4526,14 @@ function GroupCard({
       </div>
       <div className="mg-card" ref={cardRef}>
         <div className="mg-card-head">
-          <span className="mg-name">{g.name}</span>
+          <button
+            type="button"
+            className="mg-name"
+            onClick={(e) => onCopy(g.id, e.currentTarget)}
+            title="点击复制组 ID（agent.md 的 model: 前半段）"
+          >
+            {g.name}
+          </button>
           <div className="mg-card-actions">
             <button
               className="mg-test"
@@ -4317,17 +4554,26 @@ function GroupCard({
         <div className="mg-row" title={g.baseURL}>
           {g.baseURL}
         </div>
-        <div className="mg-row">{g.models.join('、')}</div>
+        <div className="mg-refs">
+          {g.models.map((m) => (
+            <div className="mg-ref-row" key={m}>
+              <button type="button" className="mg-ref" onClick={(e) => onCopy(m, e.currentTarget)} title="点击复制模型 ID">
+                {m}
+              </button>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   )
 }
 
 // 设置面板：总览式（左侧导航 + 右侧内容），含「模型设置」「界面设置」「权限设置」「关于」
-function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, onThemeChange, onStreamRevealChange, onCloseActionChange, onNotifyTaskChange, onClose, onSave, onSaveConfig }) {
+function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, onThemeChange, onStreamRevealChange, onCloseActionChange, onNotifyTaskChange, onEffortChange, onClose, onSave, onSaveConfig }) {
   const [tab, setTab] = useState('model') // model | appearance | permission | config | about
   const [form, setForm] = useState(data)
-  useEffect(() => setForm(data), [data])
+  // effort 是即时保存的：只同步这一项，避免保存 effort 时把本地未提交的模型组编辑重置掉
+  useEffect(() => setForm((f) => ({ ...f, effort: data.effort })), [data.effort])
   // 「配置」页表单草稿：由有效配置（默认值 + 用户覆盖层）异步到达后填充；多行字段以文本承载便于编辑
   const [configForm, setConfigForm] = useState(null)
   useEffect(() => {
@@ -4408,7 +4654,8 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
       bottom: below ? undefined : window.innerHeight - r.top + 8,
       right: Math.max(8, window.innerWidth - r.right),
       status: result.ok ? 'ok' : 'fail',
-      error: result.error || ''
+      error: result.error || '',
+      text: result.text || ''
     })
     if (bubbleTimer.current) clearTimeout(bubbleTimer.current)
     if (result.ok) {
@@ -4417,6 +4664,15 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
         setBubble((b) => (b ? { ...b, leaving: true } : b))
         bubbleTimer.current = setTimeout(() => setBubble(null), 250)
       }, 2000)
+    }
+  }
+  // 点击组名 / 模型 ID 复制：反馈复用测试气泡（同一套位置与配色，不再额外占卡片版面）
+  const copyInCard = async (text, anchor) => {
+    try {
+      await navigator.clipboard.writeText(text)
+      showBubble(anchor, { ok: true, text: '已复制 ' + text })
+    } catch (err) {
+      showBubble(anchor, { ok: false, error: '复制失败：' + err.message })
     }
   }
   // 测试连接：卡片测已保存配置（key 由主进程解密）；表单测当前草稿（未保存的 baseURL/key）
@@ -4553,6 +4809,7 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
                     setDraft={setDraft}
                     test={cardTest[g.id]}
                     onTest={(e) => runCardTest(g, e)}
+                    onCopy={copyInCard}
                     formTest={formTest}
                     onFormTest={runFormTest}
                     onEdit={() => startEdit(gi)}
@@ -4581,7 +4838,46 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
                 )}
               </div>
 
+              <div className="set-hint">
+                给某个智能体固定模型：点组名复制组 ID、点模型 ID 复制模型 ID，拼成「组 ID/模型 ID」写进该智能体 .md 的 model: 字段；改完需重启引擎。
+              </div>
+
               <div className="set-hint">模型设置保存后即时热更新生效（个别情况自动回退为重启引擎）；任务执行中不可保存。</div>
+
+              {/* 推理强度：纯发送期参数，即时保存（只写 effort，不重载引擎） */}
+              <div className="set-group">
+                <div className="set-title">推理强度（effort）</div>
+                <div className="set-desc">
+                  在输入区模型下拉右侧显示 effort 档位（Default / Low / Medium / High）；默认档不发送任何额外字段。切换档位不重启引擎、不改配置文件。
+                </div>
+                <label className="set-toggle">
+                  <input
+                    type="checkbox"
+                    checked={data.effort?.enabled !== false}
+                    onChange={(e) => onEffortChange({ enabled: e.target.checked })}
+                  />
+                  <span className="set-toggle-track" />
+                  <span className="set-toggle-label">{data.effort?.enabled !== false ? '开启' : '关闭'}</span>
+                </label>
+                <div className="set-label" style={{ marginTop: 12 }}>
+                  新会话默认档
+                </div>
+                <select
+                  className="set-input"
+                  value={data.effort?.default || 'default'}
+                  disabled={data.effort?.enabled === false}
+                  onChange={(e) => onEffortChange({ default: e.target.value })}
+                >
+                  {EFFORT_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+                <div className="set-hint">
+                  仅影响新会话，已有会话保留自己的档位。若模型不支持该参数，切回默认即可；默认档与改造前完全一致。
+                </div>
+              </div>
             </>
           ) : tab === 'config' ? (
             <>
@@ -4909,7 +5205,7 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
           style={{ top: bubble.top, bottom: bubble.bottom, right: bubble.right }}
           role="status"
         >
-          <span>{bubble.status === 'ok' ? '✓ 连接正常' : '✗ ' + (bubble.error || '连接失败')}</span>
+          <span>{bubble.status === 'ok' ? '✓ ' + (bubble.text || '连接正常') : '✗ ' + (bubble.error || '连接失败')}</span>
           {bubble.status === 'fail' && (
             <button className="test-bubble-close" onClick={() => setBubble(null)} title="关闭">
               ✕
@@ -4936,19 +5232,22 @@ const AGENTS_SPINNER_MIN_MS = 400
 // 引擎内置智能体的中文名与中文描述。
 // 为什么需要：引擎 /api/agent 返回的 name/description 全是英文（如 "The default agent. Executes
 // tools based on configured permissions."），在中文界面里既难认也难选。
-// 命名格式沿用界面既有习惯「英文 - 中文」（与「执行 - Build」同源，只是顺序按用户要求把
-// 中文放在英文之后）：Build - 执行。id 保持不变（引擎按 id 路由，改了会失效）。
+// 命名格式沿用界面既有习惯「英文 - 中文」：Build - 执行。id 保持不变（引擎按 id 路由，改了会失效）。
 // 未登记的内置项（引擎升级后新增）自动回退为引擎原文，不会因为缺条目而显示空白。
+// desc 约定：① 越短越好（下拉项只有两行，超长会被 ellipsis 截断，实测约 31 字为限）。
+// ② 措辞按「任何任务都能对上号」写 —— XWork 也用于文档、报表、资料整理，避免代码 / TDD /
+//    部署门禁这类专有说法（用户明确要求）。仅 build/plan 会出现在主模式列表，其余（general /
+//    explore / 5 个流水线子智能体）只出现在「子智能体（只读）」名册里。
 const BUILTIN_AGENT_ZH = {
   build: { zh: '执行', desc: '默认智能体：按配置的权限直接改文件、跑命令，干活的默认选择' },
   plan: { zh: '规划', desc: '只读智能体：只探索代码、给出方案，不改任何文件、不执行命令' },
-  general: { zh: '通用', desc: '通用智能体：调研复杂问题、执行多步骤任务' },
-  explore: { zh: '探索', desc: '快速探索代码库：回答"某功能在哪、怎么实现的"这类问题' },
-  'code-reviewer': { zh: '代码审查', desc: '审查改动：结构、SOLID、DRY、KISS、YAGNI 与优化点，通常写在测试之前' },
-  'feature-implementer': { zh: '功能实现', desc: '按 TDD 实现功能与修复：先分析入口点，再最小改动、测试先行' },
-  'deploy-agent': { zh: '部署', desc: '执行部署流程：构建门禁、打包、发布与发布后验证' },
-  'report-agent': { zh: '报告', desc: '重建并重启服务、收集证据、撰写最终报告' },
-  'test-creator': { zh: '测试', desc: '为每个步骤编写单元与集成测试，实现前保持失败（RED）' }
+  general: { zh: '通用', desc: '通用智能体：多步骤调研与执行，适合开放式任务' },
+  explore: { zh: '探索', desc: '快速摸清目录或项目：有什么、关键内容在哪' },
+  'code-reviewer': { zh: '代码审查', desc: '审查改动：结构、规范与可维护性，给出通过或需修改的结论' },
+  'feature-implementer': { zh: '功能实现', desc: '把需求落成具体结果：范围最小、随做随验' },
+  'deploy-agent': { zh: '部署', desc: '执行交付流程：校验、打包、发布与发布后确认' },
+  'report-agent': { zh: '报告', desc: '汇总过程与证据，产出最终报告' },
+  'test-creator': { zh: '测试', desc: '为改动补验证：先复现问题，再确认已修好' }
 }
 
 // 模式选择器：与模型选择器同款交互（按钮 + 向上弹出的选项列表），位于模型选择器左侧
@@ -5010,16 +5309,25 @@ function AgentPicker({ value, onPick, options, loading }) {
     }
     const customMains = src.filter((a) => a.mode !== 'subagent' && a.source === 'custom').map(mapOne)
     const builtinMains = src.filter((a) => a.mode !== 'subagent' && a.source !== 'custom').map(mapOne)
+    // 只读名册里同样把内置子智能体本地化：名称「英文名 - 中文名」（与主模式一致）。
+    // 描述换成一句简短中文（引擎原文是整段英文说明，单行 ellipsis 下只能看到半句）。
+    // 工作区自定义项保持用户原文（含「（工作区 .agents）」来源标注），未登记的内置 id 回退引擎原文。
     const roster = src
       .filter((a) => a.mode !== 'primary')
-      .map((a) => ({
-        key: 'ro:' + a.id, // 与主模式项可能同 id（mode:'all'）⇒ key 必须区分，否则 React 重复 key
-        id: a.id,
-        label: `${a.name}${a.model && a.model.modelID ? ` · ${a.model.modelID}` : ''}`,
-        desc: `${a.description || '子智能体'}${a.source === 'custom' ? '（工作区 .agents）' : '（引擎内置）'}`,
-        group: 'roster',
-        readOnly: true
-      }))
+      .map((a) => {
+        const zh = a.source === 'custom' ? null : BUILTIN_AGENT_ZH[a.id]
+        const model = a.model && a.model.modelID ? ` · ${a.model.modelID}` : ''
+        return {
+          key: 'ro:' + a.id, // 与主模式项可能同 id（mode:'all'）⇒ key 必须区分，否则 React 重复 key
+          id: a.id,
+          label: (zh ? `${a.name} - ${zh.zh}` : a.name) + model,
+          desc: zh
+            ? zh.desc
+            : `${a.description || '子智能体'}${a.source === 'custom' ? '（工作区 .agents）' : '（引擎内置）'}`,
+          group: 'roster',
+          readOnly: true
+        }
+      })
     const out = []
     const both = customMains.length > 0 && builtinMains.length > 0
     out.push({ group: 'header', label: both || customMains.length ? '工作区 .agents' : '主模式（引擎内置）' })
@@ -5185,6 +5493,86 @@ function ModelPicker({ models, value, onPick }) {
                 </button>
               ))
             )}
+          </div>,
+          document.body
+        )}
+    </div>
+  )
+}
+
+// 推理强度选择器：交互与 ModelPicker 完全一致（自定义菜单 + portal + 向上弹出），仅文案/选项不同
+function EffortPicker({ value, onPick, disabled, reason }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef(null)
+  const [pos, setPos] = useState(null)
+  // 点击外部 / 失焦时关闭
+  useEffect(() => {
+    if (!open) return
+    const close = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false)
+    }
+    window.addEventListener('click', close)
+    window.addEventListener('blur', close)
+    return () => {
+      window.removeEventListener('click', close)
+      window.removeEventListener('blur', close)
+    }
+  }, [open])
+  // 禁用时收起菜单（例如切会话后功能被关闭）
+  useEffect(() => {
+    if (disabled) setOpen(false)
+  }, [disabled])
+  // 菜单经 portal 渲染到 body（弹窗容器裁剪不到），按按钮位置固定定位、向上弹出
+  useLayoutEffect(() => {
+    if (!open) return
+    const update = () => {
+      const btn = ref.current?.querySelector('.model-pick-btn')
+      if (!btn) return
+      const r = btn.getBoundingClientRect()
+      setPos({
+        right: Math.max(8, window.innerWidth - r.right),
+        bottom: Math.max(8, window.innerHeight - r.top + 8)
+      })
+    }
+    update()
+    window.addEventListener('resize', update)
+    window.addEventListener('scroll', update, true)
+    return () => {
+      window.removeEventListener('resize', update)
+      window.removeEventListener('scroll', update, true)
+    }
+  }, [open])
+  const current = EFFORT_OPTIONS.find((o) => o.value === value) || EFFORT_OPTIONS[0]
+  return (
+    <div className="model-picker effort-picker" ref={ref}>
+      <button
+        className="model-pick-btn"
+        disabled={disabled}
+        onClick={() => {
+          if (!disabled) setOpen(!open)
+        }}
+        title={disabled ? reason || '推理强度不可用' : current.hint}
+      >
+        <span className="mp-label">{disabled ? '—' : current.label}</span>
+        <span className="mp-arrow">{open ? '▴' : '▾'}</span>
+      </button>
+      {open &&
+        pos &&
+        createPortal(
+          <div className="model-pop effort-pop" style={{ position: 'fixed', right: pos.right, bottom: pos.bottom }}>
+            {EFFORT_OPTIONS.map((o) => (
+              <button
+                key={o.value}
+                className={`model-opt ${o.value === value ? 'active' : ''}`}
+                title={o.hint}
+                onClick={() => {
+                  onPick(o.value)
+                  setOpen(false)
+                }}
+              >
+                {o.label}
+              </button>
+            ))}
           </div>,
           document.body
         )}

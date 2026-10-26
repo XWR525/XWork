@@ -21,7 +21,7 @@ const crypto = require('node:crypto')
 const { execSync } = require('node:child_process')
 const { Engine, findGit } = require('./engine')
 const { Bridge } = require('./bridge')
-const { Settings, applyToOpencode, MASK } = require('./settings')
+const { Settings, applyToOpencode, MASK, EFFORT_VARIANTS } = require('./settings')
 const { restoreMissingFiles, restoreWorkspaceToSnapshot, collectUndoImpact } = require('./undo')
 const { TaskStore, Scheduler, isValidCron, nextRunAfter, normalizeTask, describeCron } = require('./tasks')
 const { TaskRunner } = require('./task-runner')
@@ -1038,6 +1038,12 @@ ipcMain.handle('provider:list', async () => {
 // 读取设置（apiKey 已脱敏）
 ipcMain.handle('settings:get', () => settings.public())
 
+// 推理强度设置：读 / 写（只写 effort 子对象，不触发 applyToOpencode、热重载或重启）
+ipcMain.handle('settings:effort', (_e, patch) => {
+  if (patch === undefined) return settings.load().effort
+  return settings.saveEffort(patch)
+})
+
 // 智能体列表（供输入区选择器）：引擎注册表 + 标注哪些来自工作区 .agents
 // 为什么需要：`.agents/agents/*.md` 经桥接被引擎加载后，界面上原本没有任何入口能选到它们
 // （AgentPicker 曾写死 build/plan 两项）。本通道把注册表暴露给渲染层。
@@ -1375,9 +1381,15 @@ ipcMain.handle('message:send', async (_e, sessionID, text, model, agent) => {
   if (!model || typeof model !== 'object' || !model.providerID || !model.modelID) {
     return { ok: false, error: '未配置模型，请先在设置中配置模型组并选择模型' }
   }
+  // 推理强度白名单：只允许引擎内置变体 low/medium/high；非法值丢弃（否则引擎会 no-route 硬失败）
+  let safeModel = model
+  if (model.variant !== undefined && !EFFORT_VARIANTS.includes(model.variant)) {
+    console.warn('[message:send] 非法 effort variant，已丢弃:', JSON.stringify(model.variant))
+    safeModel = { ...model, variant: undefined }
+  }
   wsRecord(engine.workspace())
-  const result = await bridge.sendMessage(sessionID, text, model, agent)
-  settings.recordModelUsage(model) // 仅成功发送的消息计入使用统计（新对话默认最常用模型）
+  const result = await bridge.sendMessage(sessionID, text, safeModel, agent)
+  settings.recordModelUsage(safeModel) // 仅成功发送的消息计入使用统计（新对话默认最常用模型）
   return result
 })
 
