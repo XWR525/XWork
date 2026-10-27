@@ -88,8 +88,9 @@ contextBridge.exposeInMainWorld('xwork', {
   skillInstall: (id) => ipcRenderer.invoke('skill:install', id),
   skillInstalled: () => ipcRenderer.invoke('skill:installed'),
   skillUninstall: (slug) => ipcRenderer.invoke('skill:uninstall', slug),
-  // 定时任务：列表/创建/更新/删除/立即执行
+  // 定时任务：列表/聚合统计/创建/更新/删除/立即执行
   taskList: () => ipcRenderer.invoke('tasks:list'),
+  taskOverview: () => ipcRenderer.invoke('tasks:overview'),
   taskHistory: (id) => ipcRenderer.invoke('tasks:history', id),
   taskNextRuns: (expr, count) => ipcRenderer.invoke('tasks:next-runs', expr, count),
   taskCreate: (task) => ipcRenderer.invoke('tasks:create', task),

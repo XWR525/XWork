@@ -6,6 +6,73 @@ import markedKatex from 'marked-katex-extension'
 import ABOUT_LOGO from './assets/logo.svg'
 import { advanceTypewriterBurst, TW_TICK_MS } from './typewriter.mjs'
 import { easeInOutCubic, iconSize, MORPH_MS, rotateDeg, shapePoints, SIZE_SEND } from './sendButtonMorph.mjs'
+import {
+  Bot,
+  CalendarClock,
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ChevronUp,
+  Clock,
+  Clock3,
+  Coffee,
+  Copy,
+  Database,
+  Download,
+  File,
+  FileArchive,
+  FileAudio,
+  FileCode2,
+  FileCog,
+  FileImage,
+  FileJson,
+  FileLock2,
+  FileSpreadsheet,
+  FileTerminal,
+  FileText,
+  FileVideo,
+  Flag,
+  Folder,
+  FolderOpen,
+  Globe,
+  History,
+  Info,
+  Keyboard,
+  Lightbulb,
+  ListChecks,
+  Loader2,
+  MessageSquarePlus,
+  MessagesSquare,
+  Minus,
+  Moon,
+  MoreHorizontal,
+  Palette,
+  Pencil,
+  Pin,
+  Play,
+  Plus,
+  Puzzle,
+  Rocket,
+  RotateCcw,
+  RotateCwClock,
+  Search,
+  Settings,
+  ShieldCheck,
+  Sparkles,
+  Square,
+  Sun,
+  Sunrise,
+  Terminal,
+  Timer,
+  Trash2,
+  TrendingUp,
+  Wrench,
+  X,
+  XCircle
+} from 'lucide-react'
+import { __iconData as copyIconData } from 'lucide-react/dist/esm/icons/copy.mjs'
 import { sampleTotal, unwrapEmerge, wrapEmerge } from './emergeDom.mjs'
 import {
   mergeToolState,
@@ -53,10 +120,30 @@ const RevealModeContext = createContext('emerge')
 // 视口会自己往上漂（"输出快结束时就不贴底"）。揭示层在 layout effect 里调它，滚动跟**真实高度**走。
 const ScrollFollowContext = createContext(null)
 
+// 聊天内容列宽度（消息列表 + 输入框共用）
+const CHAT_COL_DEFAULT = 840
+const CHAT_COL_MIN = 720
+const CHAT_COL_MAX = 1200
+const CHAT_COL_GUTTER = 32
+
 marked.setOptions({ gfm: true, breaks: true })
 
 function escapeHtml(s) {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+}
+
+// Lucide 图标数据 → 字符串 SVG，供 marked 生成的 HTML（代码块复制按钮）使用
+function lucideSvg(data, size = 12, strokeWidth = 1.8) {
+  const nodes = (data?.node || [])
+    .map(([tag, attrs]) => {
+      const a = Object.entries(attrs || {})
+        .filter(([k]) => k !== 'key')
+        .map(([k, v]) => `${k}="${escapeHtml(String(v))}"`)
+        .join(' ')
+      return `<${tag} ${a} />`
+    })
+    .join('')
+  return `<svg class="lucide lucide-copy" xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${nodes}</svg>`
 }
 
 // LaTeX 公式渲染（$..$ 行内 / $$..$$ 块级）；代码块 highlight.js 语法高亮，未识别语言降级纯文本
@@ -71,7 +158,8 @@ marked.use({
         return `<div class="md-mermaid"><pre><code class="hljs language-plaintext">${escapeHtml(text)}</code></pre></div>`
       }
       const name = language && hljs.getLanguage(language) ? language : 'plaintext'
-      return `<pre><code class="hljs language-${name}">${hljs.highlight(text, { language: name }).value}</code></pre>`
+      const copyBtn = `<button type="button" class="code-copy" title="复制代码" aria-label="复制代码">${lucideSvg(copyIconData, 12, 1.8)}<span class="code-copy-label">复制</span></button>`
+      return `<div class="code-block">${copyBtn}<pre><code class="hljs language-${name}">${hljs.highlight(text, { language: name }).value}</code></pre></div>`
     }
   }
 })
@@ -241,20 +329,20 @@ function rerenderMermaidTheme() {
 // 空会话问候语：按时间段分组，随机取一条（localStorage 记录上次索引避免连续重复）
 const GREETINGS = [
   { from: 5, to: 11, items: [
-    { title: '🌞 早安，开始今天的工作吧', sub: '把要做的事交给 AI，或先从一个新对话开始' },
-    { title: '🚀 新的一天，新的想法', sub: '想好要解决什么问题了吗？' }
+    { Icon: Sunrise, title: '早安，开始今天的工作吧', sub: '把要做的事交给 AI，或先从一个新对话开始' },
+    { Icon: Rocket, title: '新的一天，新的想法', sub: '想好要解决什么问题了吗？' }
   ]},
   { from: 12, to: 18, items: [
-    { title: '☕ 下午好，趁现在把想法落地', sub: '有什么需要帮忙处理的？' },
-    { title: '📌 下午好，继续推进', sub: '打开工作区，或直接聊聊你的计划' }
+    { Icon: Coffee, title: '下午好，趁现在把想法落地', sub: '有什么需要帮忙处理的？' },
+    { Icon: Pin, title: '下午好，继续推进', sub: '打开工作区，或直接聊聊你的计划' }
   ]},
   { from: 19, to: 23, items: [
-    { title: '🌙 晚上好，专注时刻', sub: '把白天的想法整理成行动' },
-    { title: '💡 晚间灵感最活跃', sub: '想聊点什么？AI 随时待命' }
+    { Icon: Moon, title: '晚上好，专注时刻', sub: '把白天的想法整理成行动' },
+    { Icon: Lightbulb, title: '晚间灵感最活跃', sub: '想聊点什么？AI 随时待命' }
   ]},
   { from: 0, to: 4, items: [
-    { title: '🕛 还在奋斗，注意休息', sub: '保持节奏，随时可以开始' },
-    { title: '🌌 深夜效率高，也别太晚', sub: '简短任务也可以先丢过来' }
+    { Icon: Clock3, title: '还在奋斗，注意休息', sub: '保持节奏，随时可以开始' },
+    { Icon: Sparkles, title: '深夜效率高，也别太晚', sub: '简短任务也可以先丢过来' }
   ]}
 ]
 
@@ -327,28 +415,28 @@ const DEFAULT_TIMINGS = {
   subagentPollFailMaxCount: 3
 }
 
-// 文件图标：按扩展名映射到 emoji（资源管理器风格，按文件类型显示）
+// 文件图标：按扩展名映射到 Lucide 图标（资源管理器风格，按文件类型显示）
 const FILE_ICONS = {
-  js: '🟨', mjs: '🟨', cjs: '🟨', ts: '🟦', jsx: '🟨', tsx: '🟦',
-  py: '🐍', java: '☕', go: '🐹', rs: '🦀', rb: '💎', php: '🐘',
-  c: '⚙️', h: '⚙️', cpp: '⚙️', cc: '⚙️', cs: '⚙️',
-  sh: '🐚', ps1: '🪟', bat: '🪟', cmd: '🪟',
-  html: '🌐', htm: '🌐', css: '🎨', scss: '🎨', less: '🎨', vue: '💚', svelte: '🔥',
-  json: '📋', yaml: '📋', yml: '📋', toml: '📋', xml: '📋', ini: '📋', conf: '📋', config: '📋',
-  md: '📝', markdown: '📝', txt: '📄', log: '📜',
-  doc: '📄', docx: '📄', rtf: '📄', pdf: '📕',
-  xls: '📊', xlsx: '📊', csv: '📊',
-  ppt: '📽️', pptx: '📽️',
-  png: '🖼️', jpg: '🖼️', jpeg: '🖼️', gif: '🖼️', svg: '🖼️', webp: '🖼️', ico: '🖼️', bmp: '🖼️',
-  mp3: '🎵', wav: '🎵', flac: '🎵', ogg: '🎵',
-  mp4: '🎬', avi: '🎬', mov: '🎬', webm: '🎬', mkv: '🎬',
-  zip: '🗜️', rar: '🗜️', '7z': '🗜️', tar: '🗜️', gz: '🗜️',
-  exe: '⚙️', msi: '⚙️', dll: '🧩', lock: '🔒', db: '🗄️', sql: '🗄️'
+  js: FileCode2, mjs: FileCode2, cjs: FileCode2, ts: FileCode2, jsx: FileCode2, tsx: FileCode2,
+  py: FileCode2, java: FileCode2, go: FileCode2, rs: FileCode2, rb: FileCode2, php: FileCode2,
+  c: FileCog, h: FileCog, cpp: FileCog, cc: FileCog, cs: FileCog,
+  sh: FileTerminal, ps1: FileTerminal, bat: FileTerminal, cmd: FileTerminal,
+  html: Globe, htm: Globe, css: Palette, scss: Palette, less: Palette, vue: Palette, svelte: Palette,
+  json: FileJson, yaml: FileJson, yml: FileJson, toml: FileJson, xml: FileJson, ini: FileJson, conf: FileJson, config: FileJson,
+  md: FileText, markdown: FileText, txt: FileText, log: FileText,
+  doc: FileText, docx: FileText, rtf: FileText, pdf: FileText,
+  xls: FileSpreadsheet, xlsx: FileSpreadsheet, csv: FileSpreadsheet,
+  ppt: FileText, pptx: FileText,
+  png: FileImage, jpg: FileImage, jpeg: FileImage, gif: FileImage, svg: FileImage, webp: FileImage, ico: FileImage, bmp: FileImage,
+  mp3: FileAudio, wav: FileAudio, flac: FileAudio, ogg: FileAudio,
+  mp4: FileVideo, avi: FileVideo, mov: FileVideo, webm: FileVideo, mkv: FileVideo,
+  zip: FileArchive, rar: FileArchive, '7z': FileArchive, tar: FileArchive, gz: FileArchive,
+  exe: FileCog, msi: FileCog, dll: FileCog, lock: FileLock2, db: Database, sql: Database
 }
 function fileIcon(name) {
   const dot = name.lastIndexOf('.')
-  if (dot <= 0) return '📄'
-  return FILE_ICONS[name.slice(dot + 1).toLowerCase()] || '📄'
+  const Icon = dot > 0 ? FILE_ICONS[name.slice(dot + 1).toLowerCase()] || File : File
+  return <Icon size={13} strokeWidth={1.8} aria-hidden="true" />
 }
 
 // 路径归一化：统一分隔符与大小写，用于会话目录与当前工作区的比较（Windows 路径不区分大小写）
@@ -569,14 +657,6 @@ function fmtRunElapsed(ms) {
   return h ? `${h}:${p(m)}:${p(s)}` : `${p(m)}:${p(s)}`
 }
 
-// 工具调用开始时刻：epoch 毫秒 → HH:MM:SS（任务面板工具卡片用；引擎 state.time.start）
-function fmtClock(ts) {
-  if (!ts) return ''
-  const d = new Date(ts)
-  const p = (n) => String(n).padStart(2, '0')
-  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
-}
-
 // 工具调用耗时：end - start → 人类可读（0.4s / 12.3s / 2m 05s）；进行中或无 end 返回空
 function fmtDur(start, end) {
   if (!start || !end) return ''
@@ -590,7 +670,6 @@ function fmtDur(start, end) {
   return `${m}m ${String(rs).padStart(2, '0')}s`
 }
 
-const STATUS_LABEL = { pending: '等待', running: '执行中', completed: '完成', error: '失败' }
 
 // 目标 user 消息之后是否存在 AI 工具调用（决定「回退至此」按钮是否可用）
 function hasToolChangeAfter(messages, idx) {
@@ -604,9 +683,9 @@ function hasToolChangeAfter(messages, idx) {
 
 // undo 后「实际影响清单」的类型文案（主进程 collectUndoImpact 分类：delete/restore/recover，见 undo功能设计.md §6.3）
 const UNDO_IMPACT_META = {
-  delete: { icon: '❌', note: '已删除（本轮新建）' },
-  restore: { icon: '✏️', note: '已还原到本轮之前' },
-  recover: { icon: '✅', note: '已找回（本轮被删/改名，undo 后恢复）' }
+  delete: { Icon: XCircle, note: '已删除（本轮新建）' },
+  restore: { Icon: RotateCcw, note: '已还原到本轮之前' },
+  recover: { Icon: CheckCircle2, note: '已找回（本轮被删/改名，undo 后恢复）' }
 }
 
 // 任务执行面板分页：默认展示最近 TOOL_PAGE 条工具步骤（执行中最关心的是底部最新条目），
@@ -614,8 +693,8 @@ const UNDO_IMPACT_META = {
 const TOOL_PAGE = 20
 
 // 发送 / 中止按钮图标：形状在两种状态间逐帧插值（旋转 90° + 变形 + 尺寸 17→19px）。
-// 为什么必须「一个按钮 + 一个 svg」而不是维护两个按钮来回切：React 换元素会卸载重建 DOM。
-// 形状动画每次都从起点重来（表现为闪一下），而且点击目标会在切换瞬间消失。
+// 发送 / 停止：保留原先的 SVG 形变动画（其余界面图标使用 Lucide）
+// 一个按钮 + 一个 svg：React 换元素会卸载重建 DOM，形变会闪一下且在切换瞬间丢失点击目标。
 function SendStopIcon({ active }) {
   const svgRef = useRef(null)
   const polyRef = useRef(null)
@@ -721,7 +800,7 @@ export default function App() {
   )
   const childSnap = useCallback(() => (childViewSid ? subagentStream.get(childViewSid) : null), [childViewSid])
   const childMirror = useSyncExternalStore(childSub, childSnap, childSnap)
-  // 对话区实际渲染的消息：主会话 messages / 子会话镜像（面板的 toolSteps/latestTodos 也基于它）
+  // 对话区实际渲染的消息：主会话 messages / 子会话镜像
   const viewMessages = isChildView ? childMirror || [] : messages
   const parentSession = currentID ? sessions.find((x) => x.id === currentID) : null
   const parentTitle = (parentSession && parentSession.title) || '新会话'
@@ -778,9 +857,9 @@ export default function App() {
   const [greeting, setGreeting] = useState(pickGreeting) // 空会话问候语（每次新对话重取）
   const [editingID, setEditingID] = useState(null) // 正在重命名的会话
   const [editingTitle, setEditingTitle] = useState('')
-  const [settingsOpen, setSettingsOpen] = useState(false) // 设置面板
-  const [skillHubOpen, setSkillHubOpen] = useState(false) // SKILL HUB 弹窗
-  const [page, setPage] = useState('chat') // 主视图：chat（对话）| tasks（定时任务管理页）
+  const [page, setPage] = useState('chat') // 主视图：chat（Work）| tasks（定时任务）| hub（Skill Hub）| settings（设置）
+  const [settingsResetKey, setSettingsResetKey] = useState(0) // 设置页「取消」时递增：丢弃草稿并重新挂载
+  const [settingsVisited, setSettingsVisited] = useState(false) // 首次进入设置后才挂载（保证拿到最新设置快照）
   const [skills, setSkills] = useState([]) // 技能列表（来自本地技能服务，按 sort_order 升序）
   const [skillLoading, setSkillLoading] = useState(false)
   const [skillError, setSkillError] = useState('')
@@ -837,14 +916,19 @@ export default function App() {
   const [addedFiles, setAddedFiles] = useState([]) // 已添加文件（相对工作区路径，发送时注入）
   const [ctxMenu, setCtxMenu] = useState(null) // 文件右键菜单 {x, y, abs, rel, type, name}
   const [sideTab, setSideTab] = useState('chat') // 侧栏分段：chat（对话历史）| files（工作区文件）
-  const [panelOpen, setPanelOpen] = useState(false) // 任务执行面板：默认折叠，执行中由收起窄条上的圆点闪烁提示
-  const [sidebarW, setSidebarW] = useState(240) // 左边栏宽度（拖动边缘调整）
-  const [taskW, setTaskW] = useState(300) // 任务面板展开宽度（拖动边缘调整）
-  // 拖拽实时宽度（null = 未拖拽）+ 当前拖拽方向（'left' | 'task'）：拖拽期间只更新被拖一侧的宽度
-  // （覆盖在聊天区上），另一侧保持提交值，互不影响；松手时一次性提交到 sidebarW/taskW（瞬时让位）
+  const [sidebarW, setSidebarW] = useState(256) // 左边栏宽度（拖动边缘调整）
+  const [chatColW, setChatColW] = useState(() => {
+    try {
+      const raw = localStorage.getItem('xwork-chat-col-width')
+      if (raw != null) {
+        const n = Number(raw)
+        if (Number.isFinite(n)) return Math.min(CHAT_COL_MAX, Math.max(CHAT_COL_MIN, n))
+      }
+    } catch {}
+    return CHAT_COL_DEFAULT
+  })
+  // 拖拽实时宽度（null = 未拖拽）：拖拽期间只更新 dragW（覆盖在聊天区上），松手提交到 sidebarW
   const [dragW, setDragW] = useState(null)
-  const [dragType, setDragType] = useState(null)
-  const [toolVisible, setToolVisible] = useState(TOOL_PAGE) // 任务面板已展示的工具步骤数（分页：从最新向前展示，按钮加载更早）
   const [composerH, setComposerH] = useState(null) // 输入区高度（拖动上缘调整，null = 按内容自适应）
   // 渲染层配置（来自 app/app.config.json，经 config:get IPC 获取）：文件树隐藏列表 + 各时长
   const [hideDirs, setHideDirs] = useState(HIDE_DIRS)
@@ -853,6 +937,7 @@ export default function App() {
   const [wsSwitching, setWsSwitching] = useState(null) // 工作区切换中（= 目标目录，null = 空闲），驱动切换遮罩
 
   const listRef = useRef(null)
+  const chatAreaRef = useRef(null)
   const listStickRef = useRef(true) // 对话区是否贴底：上滑即 false，滚回底部自动恢复
   const lastScrollTopRef = useRef(0) // 上一次 scrollTop：判定「用户是否真的往上滚」（见 onListScroll）
   const [showNewHint, setShowNewHint] = useState(false) // 上滑停止跟随期间有新内容时，显示「↓ 新消息」提示
@@ -868,6 +953,97 @@ export default function App() {
   expandedRef.current = expandedDirs
   const wsTimer = useRef(null) // 遮罩「已切换到」提示的收起定时器
   const wsPollBusy = useRef(false) // 文件树轮询防重入（上次未完成时跳过本次）
+
+  // 用户消息点状目录：只用于 Work 主会话；以 user 消息为跳转锚点
+  const [outlineActive, setOutlineActive] = useState(null)
+  const [outlineHover, setOutlineHover] = useState(null)
+  const scrollAnimRef = useRef(null)
+
+  // 500ms 自定义滚动动画：目标位置每帧实时计算，动态内容不会留旧坐标
+  const animateScrollTop = useCallback((el, getTarget, onDone) => {
+    if (!el) return
+    if (scrollAnimRef.current != null) cancelAnimationFrame(scrollAnimRef.current)
+    const from = el.scrollTop
+    const start = performance.now()
+    const step = (now) => {
+      const t = Math.min(1, (now - start) / 500)
+      const eased = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2
+      const max = Math.max(0, el.scrollHeight - el.clientHeight)
+      const target = Math.max(0, Math.min(getTarget(), max))
+      el.scrollTop = from + (target - from) * eased
+      if (t < 1) {
+        scrollAnimRef.current = requestAnimationFrame(step)
+      } else {
+        scrollAnimRef.current = null
+        el.scrollTop = Math.max(0, Math.min(getTarget(), el.scrollHeight - el.clientHeight))
+        onDone?.()
+      }
+    }
+    scrollAnimRef.current = requestAnimationFrame(step)
+  }, [])
+  const updateOutlineActive = useCallback(() => {
+    if (isChildView) {
+      setOutlineActive(null)
+      return
+    }
+    const list = listRef.current
+    if (!list) return
+    const rows = [...list.querySelectorAll('[data-user-msg]')]
+    if (!rows.length) {
+      setOutlineActive(null)
+      return
+    }
+    const threshold = list.getBoundingClientRect().top + 72
+    let active = rows[0].dataset.userMsg
+    for (const row of rows) {
+      if (row.getBoundingClientRect().top <= threshold) active = row.dataset.userMsg
+      else break
+    }
+    setOutlineActive((prev) => (prev === active ? prev : active))
+  }, [isChildView])
+
+  const outlineItems = useMemo(() => {
+    if (isChildView) return []
+    return messages
+      .map((m, index) => {
+        if (m.role !== 'user') return null
+        if ((m.parts || []).some((p) => p.type === 'compaction')) return null
+        const full = (m.parts || [])
+          .filter((p) => p.type === 'text')
+          .map((p) => p.text || '')
+          .join('\n')
+          .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '')
+          .trim()
+        return { id: m.id, index, full: full || '（附件消息）' }
+      })
+      .filter(Boolean)
+  }, [messages, isChildView])
+
+  const jumpToUser = useCallback((id) => {
+    const list = listRef.current
+    if (!list) return
+    const selector = `[data-user-msg="${CSS.escape(String(id))}"]`
+    if (!list.querySelector(selector)) return
+    listStickRef.current = false
+    setShowNewHint(false)
+    setOutlineActive(id)
+    setOutlineHover(null)
+    animateScrollTop(list, () => {
+      const target = list.querySelector(selector)
+      if (!target) return list.scrollTop
+      return list.scrollTop + target.getBoundingClientRect().top - list.getBoundingClientRect().top - 10
+    })
+  }, [animateScrollTop])
+
+  const showOutlineTip = (item, event) => {
+    const list = listRef.current
+    if (!list) return
+    const r = event.currentTarget.getBoundingClientRect()
+    const lr = list.getBoundingClientRect()
+    const rawTop = r.top - lr.top + r.height / 2
+    const top = Math.max(48, Math.min(lr.height - 48, rawTop))
+    setOutlineHover({ id: item.id, full: item.full, top })
+  }
 
   const api = window.xwork
 
@@ -1583,6 +1759,12 @@ export default function App() {
     }
   }, [viewMessages, busy])
 
+  // 消息数量/会话变化后刷新目录当前点（布局落定后再查询锚点）
+  useEffect(() => {
+    const timer = setTimeout(updateOutlineActive, 60)
+    return () => clearTimeout(timer)
+  }, [currentID, messages.length, isChildView, updateOutlineActive])
+
   // 对话区滚动：距底 <30px 视为贴底（恢复跟随），否则上滑（停止跟随）；
   // 「↓ 新消息」提示仅在「上滑中 + 有新消息/busy 变化」（下方 effect）时出现
   //
@@ -1601,14 +1783,25 @@ export default function App() {
     } else if (cur < prev) {
       listStickRef.current = false
     }
+    setOutlineHover((h) => (h ? null : h))
+    updateOutlineActive()
   }
 
-  // 「↓ 新消息」：点击回到底部并恢复跟随
+  // 「↓ 新消息」：500ms 滑到底部，结束后恢复跟随
   const jumpToLatest = () => {
     const el = listRef.current
-    if (el) el.scrollTop = el.scrollHeight
-    listStickRef.current = true
+    if (!el) return
+    listStickRef.current = false
     setShowNewHint(false)
+    animateScrollTop(
+      el,
+      () => el.scrollHeight - el.clientHeight,
+      () => {
+        listStickRef.current = true
+        el.scrollTop = el.scrollHeight
+        lastScrollTopRef.current = el.scrollTop
+      }
+    )
   }
 
   // 贴底跟随：只在贴底时滚到底；供揭示层（head/尾每帧长高）与 mermaid 补渲染后调用。
@@ -1618,6 +1811,11 @@ export default function App() {
     if (!el || !listStickRef.current) return
     el.scrollTop = el.scrollHeight
     lastScrollTopRef.current = el.scrollTop
+  }, [])
+
+  // 卸载时取消滚动动画，避免 rAF 操作已销毁的列表
+  useEffect(() => () => {
+    if (scrollAnimRef.current != null) cancelAnimationFrame(scrollAnimRef.current)
   }, [])
 
   // 操作提示自动消失
@@ -1840,6 +2038,44 @@ export default function App() {
     } catch (e) {
       setToast('复制失败: ' + e.message)
     }
+  }, [])
+
+  // 代码块复制：marked 生成按钮，事件委托统一处理（对话/任务历史/详情/子智能体都生效）
+  useEffect(() => {
+    const onClick = async (event) => {
+      const btn = event.target?.closest?.('.code-copy')
+      if (!btn) return
+      const code = btn.closest('.code-block')?.querySelector('pre code')
+      if (!code) return
+      event.preventDefault()
+      event.stopPropagation()
+      const label = btn.querySelector('.code-copy-label')
+      const oldLabel = label?.textContent || '复制'
+      const raw = code.textContent || ''
+      clearTimeout(btn._copyTimer)
+      try {
+        if (window.xwork && typeof window.xwork.copyText === 'function') {
+          await window.xwork.copyText(raw)
+        } else if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          await navigator.clipboard.writeText(raw)
+        } else {
+          throw new Error('剪贴板不可用')
+        }
+        btn.classList.remove('failed')
+        btn.classList.add('copied')
+        if (label) label.textContent = '已复制'
+      } catch (e) {
+        btn.classList.add('failed')
+        if (label) label.textContent = '复制失败'
+        setToast('复制代码失败: ' + ((e && e.message) || e))
+      }
+      btn._copyTimer = setTimeout(() => {
+        btn.classList.remove('copied', 'failed')
+        if (label) label.textContent = oldLabel
+      }, 1400)
+    }
+    document.addEventListener('click', onClick)
+    return () => document.removeEventListener('click', onClick)
   }, [])
 
   // 启动时加载已保存的界面主题（旧 preload 无 getTheme 时保持默认亮色）
@@ -2102,12 +2338,20 @@ export default function App() {
     })
   }
 
-  // 打开设置：刷新数据后展示面板
+  // 打开设置：切到整页设置并刷新数据（设置页常驻挂载，切走再回来保留未保存草稿）
   const openSettings = async () => {
-    setSettingsOpen(true)
+    setPage('settings')
     await loadModels()
+    // 数据就绪后再首次挂载，避免挂载时用启动期的旧快照初始化表单
+    setSettingsVisited(true)
     // 加载有效应用配置（默认值 + 用户覆盖层），供「配置」页表单展示
     api.getConfig().then(setAppConfig).catch(() => {})
+  }
+
+  // 设置页「取消」：回 Work，并弃掉未保存草稿（递增 key 重新挂载设置面板）
+  const closeSettings = () => {
+    setPage('chat')
+    setSettingsResetKey((k) => k + 1)
   }
 
   // 保存「配置」页表单：写入用户覆盖层，刷新渲染层即时生效字段；窗口尺寸重启应用后生效
@@ -2124,12 +2368,12 @@ export default function App() {
     }
   }
 
-  // 打开 SKILL HUB：拉取技能列表（主进程经 IPC 请求本地技能服务，无 CORS 限制）
+  // 打开 SKILL HUB：切到整页并拉取技能列表（主进程经 IPC 请求本地技能服务，无 CORS 限制）
   const openSkillHub = async () => {
-    setSkillHubOpen(true)
+    setPage('hub')
     setSkillLoading(true)
     setSkillError('')
-    refreshInstalled() // 打开弹窗时同步已安装状态（解压目录以磁盘实际为准）
+    refreshInstalled() // 进入页面时同步已安装状态（解压目录以磁盘实际为准）
     try {
       const r = await api.skillList()
       if (r.ok) setSkills(r.skills)
@@ -2139,6 +2383,13 @@ export default function App() {
     } finally {
       setSkillLoading(false)
     }
+  }
+
+  // 左侧栏统一入口：Hub / 设置进入时加载数据，Work / 任务直接切页
+  const goPage = (next) => {
+    if (next === 'hub') return openSkillHub()
+    if (next === 'settings') return openSettings()
+    setPage(next)
   }
 
   // 扫描工作区 .agents/skills，得到已安装技能 slug 集合（文件夹名 = slug），驱动安装/卸载按钮
@@ -2203,43 +2454,76 @@ export default function App() {
     }
   }
 
-  // 拖拽调整侧栏/任务面板宽度：type = 'left'（左边栏右缘）/ 'task'（任务面板左缘）
-  // 覆盖式布局下，拖拽期间只更新 dragW（面板实时变宽、盖在聊天区上），聊天区保持原宽不重排；
-  // mouseup 一次性提交到 sidebarW/taskW → 聊天区瞬时让位（一次布局，无逐帧动画）
-  const startResize = (type, e) => {
+  // 拖拽调整左边栏宽度：拖拽期间只更新 dragW，松手一次性提交到 sidebarW
+  const startResize = (e) => {
     e.preventDefault()
     const startX = e.clientX
-    const baseW = type === 'left' ? sidebarW : taskW
-    const min = type === 'left' ? 160 : 200
-    const max = type === 'left' ? 480 : 600
-    let latestW = null // 闭包内记录最新拖拽宽度，onUp 一次性提交（避免在 setState updater 里做副作用）
-    setDragType(type)
+    const baseW = sidebarW
+    let latestW = null
     const onMove = (ev) => {
-      // 左边栏向右拉变宽；任务面板向左拉变宽
-      const delta = type === 'left' ? ev.clientX - startX : startX - ev.clientX
-      latestW = Math.min(max, Math.max(min, baseW + delta))
+      latestW = Math.min(480, Math.max(160, baseW + ev.clientX - startX))
       setDragW(latestW)
     }
     const onUp = () => {
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
-      document.body.classList.remove('resizing', type === 'left' ? 'resizing-left' : 'resizing-task')
-      if (latestW !== null) (type === 'left' ? setSidebarW : setTaskW)(latestW)
+      document.body.classList.remove('resizing', 'resizing-left')
+      if (latestW !== null) setSidebarW(latestW)
       setDragW(null)
-      setDragType(null)
     }
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
-    document.body.classList.add('resizing', type === 'left' ? 'resizing-left' : 'resizing-task')
+    document.body.classList.add('resizing', 'resizing-left')
   }
 
-  // 拖拽调整输入区高度：向上拉变高（消息区自动腾出空间），最小 100px（手柄到窗口底边的距离），最大不超过窗口一半
+  const saveChatColW = (w) => {
+    try {
+      localStorage.setItem('xwork-chat-col-width', String(w))
+    } catch {}
+  }
+
+  // 双侧抓手：左右同时扩展/收缩，宽度变化 = 鼠标位移 × 2
+  const startChatResize = (side, e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    const area = chatAreaRef.current
+    if (!area) return
+    const max = Math.max(CHAT_COL_MIN, Math.min(CHAT_COL_MAX, area.clientWidth - CHAT_COL_GUTTER))
+    const base = Math.min(chatColW, max)
+    const startX = e.clientX
+    let latest = base
+    const onMove = (ev) => {
+      const delta = side === 'right' ? ev.clientX - startX : startX - ev.clientX
+      const next = Math.round(Math.min(max, Math.max(CHAT_COL_MIN, base + delta * 2)))
+      latest = next
+      setChatColW(next)
+    }
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      document.body.classList.remove('resizing')
+      saveChatColW(latest)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+    document.body.classList.add('resizing')
+  }
+
+  const resetChatColW = () => {
+    setChatColW(CHAT_COL_DEFAULT)
+    saveChatColW(CHAT_COL_DEFAULT)
+  }
+
+  // 拖拽调整输入区高度：向上拉变高（消息区自动腾出空间），最小高度读 CSS
+  // （必须同时容纳圆角输入框与下方快捷键提示），最大不超过窗口一半
   const startResizeV = (e) => {
     e.preventDefault()
     const startY = e.clientY
-    const startH = document.querySelector('.composer')?.offsetHeight ?? 120
+    const composerEl = document.querySelector('.composer')
+    const startH = composerEl?.offsetHeight ?? 134
+    const minH = Math.max(100, parseFloat(getComputedStyle(composerEl).minHeight) || 134)
     const onMove = (ev) => {
-      const h = Math.min(window.innerHeight * 0.5, Math.max(100, startH + (startY - ev.clientY)))
+      const h = Math.min(window.innerHeight * 0.5, Math.max(minH, startH + (startY - ev.clientY)))
       setComposerH(Math.round(h))
     }
     const onUp = () => {
@@ -2260,7 +2544,6 @@ export default function App() {
         setToast(r.error || '保存失败')
         return
       }
-      setSettingsOpen(false)
       const applied = r && r.applied
       const fallback = note || (restart ? (applied === 'hot' ? '设置已保存，已热更新生效（无需重启）' : '设置已保存，引擎已重启生效') : '设置已保存，重启引擎后生效')
       setToast(fallback)
@@ -2318,12 +2601,6 @@ export default function App() {
     setEffort(settingsData?.effort?.default || 'default')
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentID, settingsData?.modelGroups])
-
-  // 子智能体卡片底部的「在右侧面板查看原始输入/输出」（决策 O1=A）。
-  // 必须是稳定引用：它会经 props 传到 memo 化的 MessageView（引用一变，整条消息列表都要重渲染）
-  const showSubagentInPanel = useCallback(() => {
-    setPanelOpen(true)
-  }, [])
 
   // 删除历史会话（项目风格确认框确认后从引擎删除）
   const removeSession = async (sid) => {
@@ -2550,51 +2827,6 @@ export default function App() {
     setDropPos(null)
   }
 
-  // 任务执行面板：按时间顺序提取所有工具调用。
-  // 数据源用 viewMessages（用户拍板：进入子会话视图时面板**跟随**显示该子会话的工具步骤）
-  // useMemo([viewMessages])：未变时数组引用稳定；元素持有 part 引用 → 配合 ToolCard memo 不重渲染
-  const toolSteps = useMemo(() => {
-    const out = []
-    for (const m of viewMessages) {
-      if (m.role !== 'assistant') continue
-      for (const p of m.parts) {
-        if (p.type === 'tool') {
-          out.push({ key: p.id || p.callID || Math.random().toString(36).slice(2), part: p })
-        }
-      }
-    }
-    return out
-  }, [viewMessages])
-
-  // 面板置顶区（设计 §5.3 第 7 点 / D10 / M-9）：运行中·后台·收尾中的子智能体卡「常驻置顶」，
-  // 不参与 toolVisible 分页计数 —— 否则一次长任务里它会被"加载更早"的历史挤出视口。
-  // dep 里放 viewMessages：置顶状态由 part/摘要决定，而 part 更新会带动消息变化
-  const { pinnedSteps, otherSteps } = useMemo(() => {
-    const pinned = []
-    const others = []
-    for (const s of toolSteps) {
-      if (isPinnedSubagentPart(s.part)) pinned.push(s)
-      else others.push(s)
-    }
-    return { pinnedSteps: pinned, otherSteps: others }
-  }, [toolSteps, viewMessages])
-
-  // 最新待办列表：倒序遍历消息，取最后一次 todowrite 的 input.todos（每次调用为全量列表，
-  // 最新 part 即当前完整状态）；AI 更新待办产生新 part → 消息变化 → 自动重算实时刷新
-  const latestTodos = useMemo(() => {
-    for (let i = viewMessages.length - 1; i >= 0; i--) {
-      const m = viewMessages[i]
-      if (m.role !== 'assistant') continue
-      for (let j = m.parts.length - 1; j >= 0; j--) {
-        const p = m.parts[j]
-        if (p.type === 'tool' && p.tool === 'todowrite' && Array.isArray(p.state?.input?.todos)) {
-          return p.state.input.todos
-        }
-      }
-    }
-    return null
-  }, [viewMessages])
-
   // 渲染工作区文件树（懒加载：仅渲染已展开路径；隐藏大目录/无关文件）
   // 文件夹样式：类型图标 + 名称；文件点击添加/移除到对话；右键呼出菜单
   const renderWsTree = (nodes, parentAbs, depth) => {
@@ -2616,8 +2848,12 @@ export default function App() {
               onContextMenu={(e) => openCtxMenu(e, { abs, rel: relOf(abs), type: 'dir', name: n.name })}
               title={abs}
             >
-              <span className="ws-arrow">{exp ? '▾' : '▸'}</span>
-              <span className="ws-ic">{exp ? '📂' : '📁'}</span>
+              <span className="ws-arrow">
+                {exp ? <ChevronDown size={12} strokeWidth={1.8} aria-hidden="true" /> : <ChevronRight size={12} strokeWidth={1.8} aria-hidden="true" />}
+              </span>
+              <span className="ws-ic">
+                {exp ? <FolderOpen size={13} strokeWidth={1.8} aria-hidden="true" /> : <Folder size={13} strokeWidth={1.8} aria-hidden="true" />}
+              </span>
               <span className="ws-name">{n.name}</span>
             </div>
             {exp && renderWsTree(wsChildren[abs], abs, depth + 1)}
@@ -2639,7 +2875,7 @@ export default function App() {
           <span className="ws-ic">{fileIcon(n.name)}</span>
           <span className="ws-name">{n.name}</span>
           <button className="ws-add" title={added ? '从对话移除' : '添加到对话'} onClick={(e) => { e.stopPropagation(); toggleAdd(rel) }}>
-            {added ? '✓' : '+'}
+            {added ? <Check size={13} strokeWidth={2} aria-hidden="true" /> : <Plus size={13} strokeWidth={2} aria-hidden="true" />}
           </button>
         </div>
       )
@@ -2677,6 +2913,14 @@ export default function App() {
   const modelValid =
     !!modelSel && availableModels.some((m) => m.providerID === modelSel.providerID && m.modelID === modelSel.modelID)
 
+  // 会话头副标题：当前模式 + 工作区（真实数据，不照搬预览里的演示文案）
+  const agentLabel =
+    agent === 'plan'
+      ? 'Plan'
+      : agent === 'build'
+        ? 'Build'
+        : (agentList || []).find((a) => a.id === agent)?.label || agent
+
   // 下拉值 → 模型对象（格式 providerID/modelID）
   const applyModelSel = (key) => {
     if (!key) return setModelSel(null)
@@ -2689,70 +2933,119 @@ export default function App() {
     <RevealModeContext.Provider value={streamReveal}>
     <ScrollFollowContext.Provider value={nudgeScroll}>
     <div className="app">
-      {/* 自绘标题栏：无边框窗口的拖拽区 + 窗口控制按钮 */}
-      <header className="topbar titlebar" onDoubleClick={() => api.windowMaximize()}>
-        <div className="brand">◈ XWork</div>
-        <div
-          className="engine-status"
-          title={engine.running ? `引擎已连接 v${engine.version}（端口 ${engine.port}）` : '引擎未启动'}
-        >
-          <span className={`dot ${engine.running ? 'ok' : 'bad'}`} />
-          <span>{engine.running ? '就绪' : '未连接'}</span>
+      {/* 最左侧窄导航栏：Work / 定时任务 / Hub / 设置（设置固定在栏底） */}
+      <aside className="nav-rail">
+        <nav className="nav-rail-items" aria-label="主导航">
+          <button
+            className={`nav-rail-btn${page === 'chat' ? ' active' : ''}`}
+            onClick={() => goPage('chat')}
+            title="Work — 对话与工作区"
+            aria-current={page === 'chat' ? 'page' : undefined}
+          >
+            <MessageSquarePlus aria-hidden="true" />
+            <span>Work</span>
+          </button>
+          <button
+            className={`nav-rail-btn${page === 'tasks' ? ' active' : ''}`}
+            onClick={() => goPage('tasks')}
+            title="定时任务"
+            aria-current={page === 'tasks' ? 'page' : undefined}
+          >
+            <RotateCwClock aria-hidden="true" />
+            <span>定时任务</span>
+          </button>
+          <button
+            className={`nav-rail-btn${page === 'hub' ? ' active' : ''}`}
+            onClick={() => goPage('hub')}
+            title="Hub — 技能中心"
+            aria-current={page === 'hub' ? 'page' : undefined}
+          >
+            <Puzzle aria-hidden="true" />
+            <span>Hub</span>
+          </button>
+        </nav>
+        <div className="nav-rail-bottom">
+          <button
+            className={`nav-rail-btn${page === 'settings' ? ' active' : ''}`}
+            onClick={() => goPage('settings')}
+            title="设置"
+            aria-current={page === 'settings' ? 'page' : undefined}
+          >
+            <Settings aria-hidden="true" />
+            <span>设置</span>
+          </button>
+          <div className="nav-rail-sep" />
+          <button
+            className="nav-rail-mini"
+            onClick={() => applyTheme(theme === 'dark' ? 'light' : 'dark')}
+            title={theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'}
+            aria-label={theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'}
+          >
+            {theme === 'dark' ? <Sun aria-hidden="true" /> : <Moon aria-hidden="true" />}
+          </button>
         </div>
-        {engineError && (
-          <div className="engine-error" title={engineError}>
-            {engineError}
-          </div>
-        )}
-        <div className="tb-spacer" />
-        <button className="settings-btn" onClick={() => setPage(page === 'tasks' ? 'chat' : 'tasks')} title={page === 'tasks' ? '回到主页' : '定时任务（预览版）'}>
-          {page === 'tasks' ? '🔙 回到主页' : '⏰ 定时任务'}
-        </button>
-        <button className="settings-btn" onClick={openSkillHub} title="Skill Hub（预览版）">
-          🧩 Skill Hub
-        </button>
-        <button className="settings-btn" onClick={openSettings} title="模型与设置">
-          ⚙️ 设置
-        </button>
-        <div className="win-controls">
-          <button className="wc-btn" title="最小化" onClick={() => api.windowMinimize()}>
-            ─
-          </button>
-          <button className="wc-btn" title="最大化 / 还原" onClick={() => api.windowMaximize()}>
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2">
-              <rect x="0.5" y="0.5" width="9" height="9" rx="1" />
-            </svg>
-          </button>
-          <button className="wc-btn wc-close" title="关闭" onClick={() => api.windowClose()}>
-            ✕
-          </button>
-        </div>
-      </header>
+      </aside>
 
-      <div className="body">
+      <div className="app-stage">
+        {/* 自绘标题栏：无边框窗口的拖拽区 + 窗口控制按钮 */}
+        <header className="topbar titlebar" onDoubleClick={() => api.windowMaximize()}>
+          <div className="brand">
+            XWork
+            {appInfo?.version ? <span className="brand-ver">{appInfo.version}</span> : null}
+          </div>
+          <div
+            className="engine-status"
+            title={engine.running ? `引擎已连接 v${engine.version}（端口 ${engine.port}）` : '引擎未启动'}
+          >
+            <span className={`dot ${engine.running ? 'ok' : 'bad'}`} />
+            <span>{engine.running ? '就绪' : '未连接'}</span>
+          </div>
+          {engineError && (
+            <div className="engine-error" title={engineError}>
+              {engineError}
+            </div>
+          )}
+          <div className="tb-spacer" />
+          <div className="win-controls">
+            <button className="wc-btn" title="最小化" onClick={() => api.windowMinimize()}>
+              <Minus size={12} strokeWidth={1.8} aria-hidden="true" />
+            </button>
+            <button className="wc-btn" title="最大化 / 还原" onClick={() => api.windowMaximize()}>
+              <Square size={10} strokeWidth={1.6} aria-hidden="true" />
+            </button>
+            <button className="wc-btn wc-close" title="关闭" onClick={() => api.windowClose()}>
+              <X size={12} strokeWidth={1.8} aria-hidden="true" />
+            </button>
+          </div>
+        </header>
+
+        <div className="body">
         {page === 'chat' ? (
         <>
-        <aside className="sidebar" style={{ width: dragType === 'left' ? dragW : sidebarW }}>
+        <aside className="sidebar" style={{ width: dragW ?? sidebarW }}>
           <div
             className="resize-handle"
             title="拖动调整宽度"
             onMouseDown={(e) => startResize('left', e)}
           />
           <button className="new-btn" onClick={newChat}>
-            🗨️ 新对话
+            <MessageSquarePlus size={16} strokeWidth={1.8} aria-hidden="true" />
+            <span>新对话</span>
           </button>
           <div className="side-tabs">
             <button
               className={`side-tab ${sideTab === 'chat' ? 'active' : ''}`}
               onClick={() => setSideTab('chat')}
             >
-              💬 对话
+              <MessagesSquare size={13} strokeWidth={1.8} aria-hidden="true" />
+              <span>对话</span>
             </button>
             <button
               className={`side-tab ${sideTab === 'files' ? 'active' : ''}`}
               onClick={() => setSideTab('files')}
             >
-              📁 工作区
+              <Folder size={13} strokeWidth={1.8} aria-hidden="true" />
+              <span>工作区</span>
             </button>
           </div>
 
@@ -2764,7 +3057,8 @@ export default function App() {
               <div className="session-head" title={workspace || '未选择工作区'}>
                 {/* key 随工作区变化：切换后标识文字淡入 */}
                 <span className="session-ws-label" key={workspace || 'none'}>
-                  📂 {workspace ? workspace.split(/[\\/]/).pop() : '未选择工作区'}
+                  <FolderOpen size={12} strokeWidth={1.8} aria-hidden="true" />
+                  <span>{workspace ? workspace.split(/[\\/]/).pop() : '未选择工作区'}</span>
                 </span>
               </div>
               {/* key 随工作区变化：切换后新列表重挂载，触发淡入上滑动画 */}
@@ -2836,7 +3130,9 @@ export default function App() {
                         setEditingTitle(s.title || s.slug || '')
                       }}
                     >
-                      {pinnedOrder.includes(s.id) && <span className="pin-badge">📌</span>}
+                      {pinnedOrder.includes(s.id) && (
+                        <span className="pin-badge"><Pin size={11} strokeWidth={1.8} aria-hidden="true" /></span>
+                      )}
                       {s.title || s.slug || '未命名'}
                     </div>
                   )}
@@ -2863,7 +3159,7 @@ export default function App() {
                         const n = childBadgeCount(childIndex, s.id)
                         return n > 0 ? (
                           <span className="subagent-badge" title={`${n} 个子智能体会话`}>
-                            🤖{n}
+                            <Bot size={11} strokeWidth={1.8} aria-hidden="true" />{n}
                           </span>
                         ) : null
                       })()}
@@ -2877,7 +3173,7 @@ export default function App() {
                         setMenu({ sid: s.id, x: rect.right - 104, y: rect.bottom + 4 })
                       }}
                     >
-                      ⋯
+                      <MoreHorizontal size={14} strokeWidth={1.8} aria-hidden="true" />
                     </button>
                   </div>
                   {menu && menu.sid === s.id && (
@@ -2916,7 +3212,8 @@ export default function App() {
               <div className={`side-view ws-panel ${sideTab === 'chat' ? 'inactive' : ''}`}>
               <div className="ws-head">
                 <span className="ws-label" title={workspace || '未打开工作区'}>
-                  📂 {workspace ? workspace.split(/[\\/]/).pop() : '未打开工作区'}
+                  <FolderOpen size={12} strokeWidth={1.8} aria-hidden="true" />
+                  <span>{workspace ? workspace.split(/[\\/]/).pop() : '未打开工作区'}</span>
                 </span>
                 <button className="ws-open-btn" onClick={openWorkspace} disabled={busy}>
                   {workspace ? '切换' : '打开文件夹'}
@@ -2939,8 +3236,11 @@ export default function App() {
                   onClick={toggleWsAll}
                   disabled={busy}
                 >
-                  <span>{wsAllOpen ? '📂' : '📁'} 所有工作区</span>
-                  <span className="caret">›</span>
+                  <span>
+                    {wsAllOpen ? <FolderOpen size={13} strokeWidth={1.8} aria-hidden="true" /> : <Folder size={13} strokeWidth={1.8} aria-hidden="true" />}
+                    所有工作区
+                  </span>
+                  <span className="caret"><ChevronRight size={13} strokeWidth={1.8} aria-hidden="true" /></span>
                 </button>
                 <div className={`ws-all-list ${wsAllOpen ? 'open' : ''}`}>
                   {allWs.length === 0 ? (
@@ -2984,18 +3284,18 @@ export default function App() {
           </div>
         </aside>
 
-        {/* padding-left 为左边栏预留空间（提交值 sidebarW，拖拽中不更新 → 拖拽期间聊天区不重排）；
-            padding-right 为任务面板预留空间：折叠时留窄条宽(40px)，展开时留面板宽(taskW)；
-            两者都瞬时一次布局（不做动画），配合面板/侧栏的覆盖式位移避免逐帧重排 */}
+        {/* padding-left 为左边栏预留空间（提交值 sidebarW，拖拽中不更新 → 拖拽期间聊天区不重排） */}
         <main
           className={`main${isChildView ? ' child-view' : ''}`}
-          style={{ paddingRight: panelOpen ? taskW : 40, paddingLeft: sidebarW }}
+          style={{ paddingLeft: sidebarW, '--chat-col-w': `${chatColW}px` }}
         >
           {/* 会话标题行（固定，不随消息滚动；2026-10-19 用户需求）
               主会话视图：[主会话标题] [🤖n 可点 → 子会话下拉]
               子会话视图：[‹ 主会话标题（点返回）] [🤖子会话标题（仍可点 → 切换）] */}
           {currentID && (
             <div className="chat-head">
+              <div className="chat-head-main">
+                <div className="chat-head-line">
               {/* 两种状态用同一元素、同一内边距 ⇒ 切到子会话时标题**不会位移**（用户反馈：
                   之前的「‹」箭头 + button 的额外 padding 让整行文字跳了一下，故彻底去掉箭头）。
                   主视图：双击标题重命名；子视图：单击标题返回主会话（hover 高亮 + tooltip 说明）。 */}
@@ -3053,7 +3353,8 @@ export default function App() {
                     }}
                     title={isChildView ? '切换子智能体会话' : `${childSessions.length} 个子智能体会话`}
                   >
-                    🤖{isChildView ? childViewTitle : childSessions.length}
+                    <Bot size={13} strokeWidth={1.8} aria-hidden="true" />
+                    {isChildView ? childViewTitle : childSessions.length}
                   </button>
                   {childPopOpen && (
                     <div className="chat-head-pop">
@@ -3081,13 +3382,26 @@ export default function App() {
                   )}
                 </div>
               )}
+                </div>
+                <div className="chat-head-meta">
+                  <span className="chat-head-meta-dot" />
+                  <span className="chat-head-meta-mode">{agentLabel}</span>
+                  <span className="chat-head-meta-sep">·</span>
+                  <span className="chat-head-meta-ws" title={workspace || '未选择工作区'}>
+                    {workspace || '未选择工作区'}
+                  </span>
+                </div>
+              </div>
             </div>
           )}
-          <div className="list-area">
+          <div className="list-area" ref={chatAreaRef}>
             <div className="message-list" ref={listRef} onScroll={onListScroll}>
               {!currentID && !busy && (
                 <div className="greeting">
-                  <div className="greet-title">{greeting.title}</div>
+                  <div className="greet-title">
+                    <greeting.Icon size={20} strokeWidth={1.8} aria-hidden="true" />
+                    <span>{greeting.title}</span>
+                  </div>
                   <div className="greet-sub">{greeting.sub}</div>
                 </div>
               )}
@@ -3101,17 +3415,17 @@ export default function App() {
                   加载更早的 {viewMessages.length - childVisible} 条
                 </button>
               ) : null}
-              {(isChildView ? viewMessages.slice(-childVisible) : viewMessages).map((m, mi) => (
+              {(isChildView ? viewMessages.slice(-childVisible) : viewMessages).map((m, mi, arr) => (
                 <MessageView
                   key={m.id}
                   m={m}
+                  showName={mi === 0 || arr[mi - 1].role !== 'assistant'}
                   onCopy={copyText}
                   onUndo={openUndoConfirm}
                   canUndo={!isChildView && m.role === 'user' && hasToolChangeAfter(messages, mi)}
                   gitAvailable={gitState.available}
                   busy={busy}
                   readOnly={isChildView}
-                  onShowSubagentInPanel={showSubagentInPanel}
                   parentSid={isChildView ? childViewSid : currentID}
                 />
               ))}
@@ -3123,6 +3437,53 @@ export default function App() {
                 </div>
               )}
             </div>
+            {!isChildView && (
+              <div className="chat-col-resizers">
+                <button
+                  type="button"
+                  className="chat-col-resizer left"
+                  title="拖动调整聊天内容宽度；双击恢复默认"
+                  aria-label="拖动调整聊天内容宽度（左侧）"
+                  onMouseDown={(e) => startChatResize('left', e)}
+                  onDoubleClick={resetChatColW}
+                />
+                <button
+                  type="button"
+                  className="chat-col-resizer right"
+                  title="拖动调整聊天内容宽度；双击恢复默认"
+                  aria-label="拖动调整聊天内容宽度（右侧）"
+                  onMouseDown={(e) => startChatResize('right', e)}
+                  onDoubleClick={resetChatColW}
+                />
+              </div>
+            )}
+            {!isChildView && outlineItems.length > 0 && (
+              <nav
+                className="chat-outline"
+                aria-label="用户消息目录"
+                onScroll={() => setOutlineHover((h) => (h ? null : h))}
+              >
+                {outlineItems.map((item, i) => (
+                  <button
+                    key={item.id || item.index}
+                    type="button"
+                    className={'chat-outline-dot' + (outlineActive === item.id ? ' active' : '')}
+                    title={item.full}
+                    aria-label={`跳转到第 ${i + 1} 条用户消息：${item.full.slice(0, 80)}`}
+                    onClick={() => jumpToUser(item.id)}
+                    onMouseEnter={(e) => showOutlineTip(item, e)}
+                    onMouseLeave={() => setOutlineHover((h) => (h && h.id === item.id ? null : h))}
+                    onFocus={(e) => showOutlineTip(item, e)}
+                    onBlur={() => setOutlineHover((h) => (h && h.id === item.id ? null : h))}
+                  />
+                ))}
+              </nav>
+            )}
+            {outlineHover && (
+              <div className="chat-outline-tip-float" style={{ top: outlineHover.top }} aria-hidden="true">
+                {outlineHover.full}
+              </div>
+            )}
             {showNewHint && (
               <button className="new-hint" onClick={jumpToLatest} title="回到最新内容">
                 ↓ 新消息
@@ -3137,6 +3498,7 @@ export default function App() {
               title="拖动调整高度"
               onMouseDown={startResizeV}
             />
+            <div className="composer-main">
             <div className="composer-box">
               {addedFiles.length > 0 && (
                 <div className="composer-files">
@@ -3150,7 +3512,7 @@ export default function App() {
               )}
               <textarea
                 value={input}
-                placeholder="想让我做什么？"
+                placeholder={'继续追问，或描述下一步…\nEnter 发送 · Shift + Enter 换行'}
                 rows={2}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => {
@@ -3161,7 +3523,7 @@ export default function App() {
                 }}
               />
               <div className="composer-foot">
-                <div className="composer-actions">
+                <div className="composer-left">
                   {/* 当前上下文 token 统计：最近 assistant 消息的 info.tokens（input + cache.read），完成时刷新 */}
                   {ctxTokens !== null && (
                     <span className="ctx-tokens" title="当前会话上下文长度(Token)">
@@ -3179,6 +3541,8 @@ export default function App() {
                       {compacting ? '压缩中…' : '压缩'}
                     </button>
                   )}
+                </div>
+                <div className="composer-right">
                   <AgentPicker value={agent} onPick={setAgent} options={agentList} loading={agentsLoading} />
                   <ModelPicker
                     models={availableModels}
@@ -3210,6 +3574,7 @@ export default function App() {
                 </div>
               </div>
             </div>
+            </div>
           </div>
 
           {/* 工作区切换遮罩：覆盖引擎重启等待期；完成后中央改为「已切换到」提示，短暂停留后收起 */}
@@ -3217,126 +3582,141 @@ export default function App() {
             <div className={`ws-switch-mask ${wsSwitching.leaving ? 'leaving' : ''}`}>
               <div className="ws-switch-box">
                 {wsSwitching.done ? (
-                  <span className="ws-done-icon">✓</span>
+                  <span className="ws-done-icon"><CheckCircle2 size={18} strokeWidth={2} aria-hidden="true" /></span>
                 ) : (
                   <span className="ws-spinner" />
                 )}
-                <span>
-                  {wsSwitching.done
-                    ? `已切换到 📂 ${wsSwitching.dir.split(/[\\/]/).pop()}`
-                    : `正在切换到 📂 ${wsSwitching.dir.split(/[\\/]/).pop()}…`}
+                <span className="ws-switch-text">
+                  <FolderOpen size={14} strokeWidth={1.8} aria-hidden="true" />
+                  <span>
+                    {wsSwitching.done
+                      ? `已切换到 ${wsSwitching.dir.split(/[\\/]/).pop()}`
+                      : `正在切换到 ${wsSwitching.dir.split(/[\\/]/).pop()}…`}
+                  </span>
                 </span>
               </div>
             </div>
           )}
         </main>
-
-        {/* 任务面板：覆盖式抽屉（absolute + transform 位移，GPU 合成不触发整行重排）。
-            展开/收起只平移自身；主区空间由 .main 的 padding-right 瞬时预留（一次布局，不做动画） */}
-        <aside className={`task-side ${panelOpen ? 'open' : ''}`} style={{ width: dragType === 'task' ? dragW : taskW }}>
-          <div
-            className="resize-handle"
-            title="拖动调整宽度"
-            onMouseDown={(e) => startResize('task', e)}
-          />
-          <div className="task-panel">
-            {/* 标题行在滚动区之外，天然固定于顶部，内容滚动不会从其后方穿越 */}
-            <div className="panel-head">
-              <span className="panel-title">任务执行过程</span>
-              {/* 折叠时重置分页：重新展开始终只渲染最近 TOOL_PAGE 条，避免累积加载的历史持续占据 DOM */}
-              <button
-                className="panel-toggle"
-                title="折叠"
-                onClick={() => {
-                  setPanelOpen(false)
-                  setToolVisible(TOOL_PAGE)
-                }}
-              >
-                »
-              </button>
-            </div>
-            <div className="task-body">
-              {busy && currentStep && (
-                <div className="current-step">
-                  {currentStep.kind === 'tool' && <div className="cs-text">正在执行 {currentStep.tool}</div>}
-                  {currentStep.kind === 'thinking' && <div className="cs-text">正在思考…</div>}
-                  {currentStep.kind === 'writing' && (
-                    <>
-                      <div className="cs-text">正在生成回复</div>
-                      <div className="cs-preview">{currentStep.text.slice(-200)}</div>
-                    </>
-                  )}
-                  {currentStep.kind === 'working' && <div className="cs-text">任务进行中…</div>}
-                </div>
-              )}
-              {toolSteps.length === 0 ? (
-                <div className="empty-hint">暂无执行记录</div>
-              ) : (
-                <>
-                  {/* 置顶区：运行中/后台/收尾中的子智能体卡常驻最上方（不参与下面的分页计数） */}
-                  {pinnedSteps.map((s) => (
-                    <SubagentCard key={s.key} part={s.part} variant="panel" parentSid={isChildView ? childViewSid : currentID} />
-                  ))}
-                  {/* 分页：倒序展示（最新在上、更早在下），只渲染最近 toolVisible 条；
-                      隐藏的是最早的记录，底部按钮向下逐批加载更早的。
-                      计数只统计普通工具卡（otherSteps），置顶卡不计入（§5.3 第 7 点） */}
-                  {otherSteps.slice(-toolVisible).reverse().map((s) =>
-                    s.part.tool === 'subagent' ? (
-                      <SubagentCard key={s.key} part={s.part} variant="panel" parentSid={isChildView ? childViewSid : currentID} />
-                    ) : (
-                      <ToolCard key={s.key} part={s.part} />
-                    )
-                  )}
-                  {otherSteps.length > toolVisible && (
-                    <button className="load-more" onClick={() => setToolVisible((v) => v + TOOL_PAGE)}>
-                      加载更早的 {otherSteps.length - toolVisible} 条
-                    </button>
-                  )}
-                </>
-              )}
-            </div>
-            {/* 待办列表区（面板下 1/4）：展示最新一份 todowrite 待办，随 AI 更新实时刷新；无待办时隐藏 */}
-            {latestTodos && latestTodos.length > 0 && (
-              <div className="todo-panel">
-                <div className="todo-head">
-                  <span className="todo-head-title">待办列表</span>
-                  <span className="todo-count">
-                    {latestTodos.filter((x) => x.status === 'completed').length}/{latestTodos.length}
-                  </span>
-                </div>
-                <div className="todo-list">
-                  {latestTodos.map((x) => (
-                    <div
-                      key={x.id || x.content || x.title}
-                      className={`todo-item${x.status === 'completed' ? ' done' : x.status === 'in_progress' ? ' active' : ''}`}
-                    >
-                      <span className="todo-icon">
-                        {x.status === 'completed' ? '✓' : x.status === 'in_progress' ? '▶' : '○'}
-                      </span>
-                      <span className="todo-text">{x.content ?? x.title}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        </aside>
-        {/* 折叠后的窄条：常驻绝对定位在右侧（z-index 低于面板），展开时被面板覆盖 */}
-        <div className="task-strip" title="任务执行过程" onClick={() => setPanelOpen(true)}>
-          <span className={`ts-dot ${busy ? 'busy' : ''}`} />
-          <span className="ts-text">执行过程</span>
-        </div>
         </>
-        ) : (
-        <TasksPage notify={setToast} setConfirm={setConfirm} settingsData={settingsData} workspace={workspace} />
-        )}
+        ) : page === 'tasks' ? (
+          <TasksPage notify={setToast} setConfirm={setConfirm} settingsData={settingsData} workspace={workspace} />
+        ) : page === 'hub' ? (
+          <section className="skill-hub-page">
+            <div className="page-head">
+              <div>
+                <div className="page-eyebrow">能力扩展</div>
+                <h1 className="page-title">Hub</h1>
+                <p className="page-sub">安装技能包，扩展 XWork 的执行能力。安装后引擎会自动识别，无需重启应用。</p>
+              </div>
+              <div className="page-actions">
+                <button className="page-btn" onClick={openSkillHub} disabled={skillLoading}>
+                  刷新
+                </button>
+                <button className="page-btn primary" onClick={restartEngine}>
+                  重启引擎
+                </button>
+              </div>
+            </div>
+            <div className="hub-status-row">
+              <span className={`hub-service${skillError ? ' bad' : ''}`}>
+                <span className="hub-service-dot" />
+                {skillLoading ? '技能加载中…' : skillError ? '技能服务未连接' : '技能服务已连接'}
+              </span>
+              <span className="hub-installed-count">
+                已安装 {skills.filter((s) => skillInstalled[s.slug]).length} / {skills.length}
+              </span>
+            </div>
+            <div className="skill-hub-scroll">
+              <div className="skill-hub-inner">
+                {skillLoading ? (
+                  <div className="skill-hub-state">技能加载中…</div>
+                ) : skillError ? (
+                  <div className="skill-hub-state">
+                    <div className="skill-hub-error">{skillError}</div>
+                    <button className="primary" onClick={openSkillHub}>
+                      重试
+                    </button>
+                  </div>
+                ) : skills.length === 0 ? (
+                  <div className="skill-hub-state">暂无可用技能</div>
+                ) : (
+                  <div className="skill-list">
+                    {[...skills]
+                      .sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0))
+                      .map((s) => (
+                        <div className="skill-card" key={s.id} data-skill-id={s.id}>
+                          <div className="skill-icon">
+                            {s.icon && !/\p{Extended_Pictographic}/u.test(String(s.icon)) ? s.icon : <Puzzle size={26} strokeWidth={1.8} aria-hidden="true" />}
+                          </div>
+                          <div className="skill-card-main">
+                            <div className="skill-card-head">
+                              <div className="skill-name-row">
+                                <span className="skill-name">{s.name}</span>
+                                {skillInstalled[s.slug] ? <span className="skill-installed-badge">已安装</span> : null}
+                              </div>
+                              <span className="skill-slug">/{s.slug}</span>
+                            </div>
+                            <div className="skill-desc">{s.description}</div>
+                          </div>
+                          <div className="skill-card-foot">
+                            <span className="skill-meta">{s.file_count ?? 0} 个文件</span>
+                            {skillInstalled[s.slug] ? (
+                              <button className="skill-install installed" onClick={() => uninstallSkill(s)}>
+                                卸载
+                              </button>
+                            ) : (
+                              <button className="skill-install" disabled={skillBusy === s.id} onClick={() => installSkill(s)}>
+                                {skillBusy === s.id ? '安装中…' : '安装'}
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </section>
+        ) : null}
+
+        {/* 设置页首次进入后常驻挂载：从 rail 切走时仅隐藏，保留未保存草稿；点「取消」时用 key 重挂载丢弃草稿 */}
+        {settingsVisited && settingsData ? (
+          <div className={`view-pane${page === 'settings' ? ' active' : ''}`}>
+            <SettingsPanel
+              key={settingsResetKey}
+              data={settingsData}
+              busy={busy}
+              theme={theme}
+              streamReveal={streamReveal}
+              appInfo={appInfo}
+              appConfig={appConfig}
+              onThemeChange={applyTheme}
+              onStreamRevealChange={applyStreamReveal}
+              onCloseActionChange={applyCloseAction}
+              onNotifyTaskChange={applyNotifyTask}
+              onEffortChange={applyEffort}
+              onClose={closeSettings}
+              onSave={saveSettings}
+              onSaveConfig={saveAppConfig}
+            />
+          </div>
+        ) : page === 'settings' ? (
+          <div className="page-loading">
+            <span>正在加载设置…</span>
+            <button className="page-btn" onClick={openSettings}>
+              重试
+            </button>
+          </div>
+        ) : null}
+      </div>
       </div>
 
       {/* 文件右键菜单：打开 / 打开所在文件夹 / 复制路径 */}
       {ctxMenu && (
         <div className="ctx-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }}>
           <div className="ctx-title" title={ctxMenu.abs}>
-            {ctxMenu.type === 'dir' ? '📁' : fileIcon(ctxMenu.name)} {ctxMenu.name}
+            {ctxMenu.type === 'dir' ? <Folder size={14} strokeWidth={1.8} aria-hidden="true" /> : fileIcon(ctxMenu.name)} {ctxMenu.name}
           </div>
           <button
             onClick={() => {
@@ -3527,10 +3907,10 @@ export default function App() {
               <div className="undo-impact-head">实际影响（{undoResult.impact.length} 个）</div>
               <div className="undo-impact-list">
                 {undoResult.impact.map((f, i) => {
-                  const meta = UNDO_IMPACT_META[f.type] || { icon: '📄', note: '' }
+                  const meta = UNDO_IMPACT_META[f.type] || { Icon: FileText, note: '' }
                   return (
                     <div className="undo-impact-item" key={i}>
-                      <span className="undo-impact-icon">{meta.icon}</span>
+                      <span className="undo-impact-icon"><meta.Icon size={14} strokeWidth={1.8} aria-hidden="true" /></span>
                       <span className="undo-impact-path">{f.path}</span>
                       <span className="undo-impact-note">{meta.note}</span>
                     </div>
@@ -3547,81 +3927,7 @@ export default function App() {
         </div>
       )}
 
-      {skillHubOpen && (
-        <div className="perm-mask" onClick={() => setSkillHubOpen(false)}>
-          <div className="perm-card skill-hub-card" onClick={(e) => e.stopPropagation()}>
-            <div className="perm-title">🧩 Skill Hub</div>
-            {skillLoading ? (
-              <div className="skill-hub-state">技能加载中…</div>
-            ) : skillError ? (
-              <div className="skill-hub-state">
-                <div className="skill-hub-error">{skillError}</div>
-                <button className="primary" onClick={openSkillHub}>重试</button>
-              </div>
-            ) : skills.length === 0 ? (
-              <div className="skill-hub-state">暂无可用技能</div>
-            ) : (
-              <div className="skill-list">
-                {[...skills]
-                  .sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0))
-                  .map((s) => (
-                    <div className="skill-card" key={s.id} data-skill-id={s.id}>
-                      <div className="skill-icon">{s.icon || '🧩'}</div>
-                      <div className="skill-card-main">
-                        <div className="skill-card-head">
-                          <span className="skill-name">{s.name}</span>
-                          <span className="skill-slug">/{s.slug}</span>
-                        </div>
-                        <div className="skill-desc">{s.description}</div>
-                        <div className="skill-meta">{s.file_count ?? 0} 个文件</div>
-                      </div>
-                      {skillInstalled[s.slug] ? (
-                        <button className="skill-install" onClick={() => uninstallSkill(s)}>
-                          卸载
-                        </button>
-                      ) : (
-                        <button
-                          className="skill-install"
-                          disabled={skillBusy === s.id}
-                          onClick={() => installSkill(s)}
-                        >
-                          {skillBusy === s.id ? '安装中…' : '安装'}
-                        </button>
-                      )}
-                    </div>
-                  ))}
-              </div>
-            )}
-            <div className="perm-btns">
-              <button onClick={restartEngine}>重启引擎</button>
-              <button className="primary" onClick={() => setSkillHubOpen(false)}>
-                关闭
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {toast && <div className="toast">{toast}</div>}
-
-      {settingsOpen && settingsData && (
-        <SettingsPanel
-          data={settingsData}
-          busy={busy}
-          theme={theme}
-          streamReveal={streamReveal}
-          appInfo={appInfo}
-          appConfig={appConfig}
-          onThemeChange={applyTheme}
-          onStreamRevealChange={applyStreamReveal}
-          onCloseActionChange={applyCloseAction}
-          onNotifyTaskChange={applyNotifyTask}
-          onEffortChange={applyEffort}
-          onClose={() => setSettingsOpen(false)}
-          onSave={saveSettings}
-          onSaveConfig={saveAppConfig}
-        />
-      )}
     </div>
     </ScrollFollowContext.Provider>
     </RevealModeContext.Provider>
@@ -3650,12 +3956,53 @@ function fmtTaskDur(ms) {
   if (s < 60) return s + 's'
   return Math.floor(s / 60) + 'm ' + (s % 60) + 's'
 }
+// 任务卡图标：按名称做轻量视觉分类（仅装饰，不参与业务判断）
+function taskIcon(task) {
+  const name = String((task && task.name) || '')
+  const p = { size: 18, strokeWidth: 1.8, 'aria-hidden': true }
+  if (/报告|数据|统计/.test(name)) return <TrendingUp {...p} />
+  if (/清理|临时|缓存/.test(name)) return <Sparkles {...p} />
+  if (/同步|文档|博客|发布/.test(name)) return <Download {...p} />
+  if (/摘要|变更|日志/.test(name)) return <History {...p} />
+  return <Clock {...p} />
+}
+// 任务时间短格式：今天/明天/昨天 HH:mm，其余 M-D HH:mm
+function fmtNextRun(ts) {
+  if (!Number.isFinite(ts) || ts <= 0) return ''
+  const d = new Date(ts)
+  const now = new Date()
+  const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime()
+  const diff = Math.round((day(d) - day(now)) / 86400000)
+  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  if (diff === 0) return `今天 ${hm}`
+  if (diff === 1) return `明天 ${hm}`
+  if (diff === -1) return `昨天 ${hm}`
+  return `${d.getMonth() + 1}-${d.getDate()} ${hm}`
+}
+function fmtRunTime(ts) {
+  if (!Number.isFinite(ts) || ts <= 0) return '—'
+  const d = new Date(ts)
+  const now = new Date()
+  const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime()
+  const diff = Math.round((day(d) - day(now)) / 86400000)
+  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  if (diff === 0) return `今天 ${hm}`
+  if (diff === 1) return `明天 ${hm}`
+  if (diff === -1) return `昨天 ${hm}`
+  return `${d.getMonth() + 1}-${d.getDate()} ${hm}`
+}
+function TaskStatIcon({ kind }) {
+  const Icon = kind === 'enabled' ? CheckCircle2 : kind === 'week' ? TrendingUp : kind === 'success' ? ShieldCheck : Clock3
+  return <Icon aria-hidden="true" />
+}
 function TasksPage({ notify, setConfirm, settingsData, workspace }) {
   const [createOpen, setCreateOpen] = useState(false) // 创建/编辑向导弹窗
   const [cronOpen, setCronOpen] = useState(false) // cron 构造器弹窗
   const [draft, setDraft] = useState({ ...EMPTY_TASK_DRAFT }) // 向导表单草稿
   const [editId, setEditId] = useState(null) // 编辑中的任务 id（null = 创建）
   const [tasks, setTasks] = useState([]) // 任务列表
+  const [overview, setOverview] = useState(null) // 任务页聚合统计（主进程一次计算）
+  const [filter, setFilter] = useState('all') // 全部 / 已启用 / 已停用
   const [loading, setLoading] = useState(true)
   const [workspaces, setWorkspaces] = useState([]) // 工作区列表（复用 workspace:list）
   const [expandedId, setExpandedId] = useState(null) // 展开执行记录的任务 id（null = 全部收起）
@@ -3667,8 +4014,13 @@ function TasksPage({ notify, setConfirm, settingsData, workspace }) {
   // 拉取任务列表
   const refreshTasks = useCallback(async () => {
     try {
-      const list = await window.xwork.taskList()
+      const overviewPromise =
+        typeof window.xwork.taskOverview === 'function'
+          ? window.xwork.taskOverview().catch(() => null)
+          : Promise.resolve(null)
+      const [list, ov] = await Promise.all([window.xwork.taskList(), overviewPromise])
       setTasks(Array.isArray(list) ? list : [])
+      if (ov) setOverview(ov)
     } catch {
       /* 主进程不可用时保持现状 */
     } finally {
@@ -3853,38 +4205,130 @@ function TasksPage({ notify, setConfirm, settingsData, workspace }) {
   if (draft.workspace && !wsOptions.some((w) => w.dir === draft.workspace)) {
     wsOptions.unshift({ dir: draft.workspace, name: draft.workspace })
   }
+  const enabledCount = tasks.filter((t) => t.enabled).length
+  const disabledCount = tasks.length - enabledCount
+  const filteredTasks = tasks.filter((t) =>
+    filter === 'enabled' ? t.enabled : filter === 'disabled' ? !t.enabled : true
+  )
+  const nextByTask = overview?.nextByTask || {}
+  const recent = overview?.recent || []
+  const stats = overview || {
+    total: tasks.length,
+    enabled: enabledCount,
+    disabled: disabledCount,
+    todayPending: null,
+    nextAt: null,
+    nextName: null,
+    weekRuns: null,
+    weekCompleted: 0,
+    weekFailed: 0,
+    successRate: null
+  }
   return (
     <div className="tasks-page">
       <div className="tasks-head">
         <div className="tasks-title">
-          <span className="tasks-title-main">⏰ 定时任务</span>
+          <div className="page-eyebrow">自动化</div>
+          <span className="tasks-title-main">定时任务</span>
           <span className="tasks-title-sub">在指定工作区按时间计划自动执行 Agent 任务，完成后系统通知反馈</span>
           <span className="tasks-title-sub">请勿关闭电脑或退出客户端，否则任务将无法正常执行</span>
         </div>
         <button className="tasks-create" onClick={openCreate}>
-          🎯 创建任务
+          ＋ 新建任务
         </button>
       </div>
       <div className="tasks-body">
         {loading ? (
           <div className="tasks-loading">加载中…</div>
-        ) : tasks.length === 0 ? (
-          <div className="tasks-empty">
-            <div className="tasks-empty-icon">⏰</div>
-            <div className="tasks-empty-title">暂无定时任务</div>
-            <div className="tasks-empty-sub">
-              创建后可设定：任务工作区、执行内容（prompt）、模型、执行频率（每天 / 每周 / 每 N 小时）
-            </div>
-          </div>
         ) : (
-          <div className="tasks-list">
-            {tasks.map((t) => (
+          <>
+            <div className="tasks-stats">
+              <div className="task-stat">
+                <div className="task-stat-label"><TaskStatIcon kind="enabled" />启用中</div>
+                <div className="task-stat-value">{stats.enabled}<small> / {stats.total}</small></div>
+                <div className="task-stat-note">共 {stats.total} 个定时任务</div>
+              </div>
+              <div className="task-stat">
+                <div className="task-stat-label"><TaskStatIcon kind="today" />今日待执行</div>
+                <div className="task-stat-value">{stats.todayPending === null ? '—' : stats.todayPending}</div>
+                <div className="task-stat-note">
+                  {!overview
+                    ? '统计暂不可用'
+                    : stats.nextAt
+                      ? `下一次 ${fmtNextRun(stats.nextAt)}${stats.nextName ? ' · ' + stats.nextName : ''}`
+                      : '今天暂无计划'}
+                </div>
+              </div>
+              <div className="task-stat">
+                <div className="task-stat-label"><TaskStatIcon kind="week" />近 7 天执行</div>
+                <div className="task-stat-value">{stats.weekRuns === null ? '—' : stats.weekRuns}</div>
+                <div className="task-stat-note">
+                  {!overview
+                    ? '统计暂不可用'
+                    : stats.weekRuns
+                      ? `成功 ${stats.weekCompleted} · 失败 ${stats.weekFailed}`
+                      : '近 7 天暂无执行'}
+                </div>
+              </div>
+              <div className="task-stat">
+                <div className="task-stat-label"><TaskStatIcon kind="success" />成功率</div>
+                <div className="task-stat-value">
+                  {stats.successRate === null ? '—' : stats.successRate}
+                  {stats.successRate !== null && <small>%</small>}
+                </div>
+                <div className="task-stat-note">{stats.weekRuns ? '近 7 天' : '暂无执行数据'}</div>
+              </div>
+            </div>
+
+            <div className="tasks-layout">
+              <div className="tasks-main">
+                {tasks.length === 0 ? (
+                  <div className="tasks-empty">
+                    <div className="tasks-empty-icon"><CalendarClock size={40} strokeWidth={1.5} aria-hidden="true" /></div>
+                    <div className="tasks-empty-title">暂无定时任务</div>
+                    <div className="tasks-empty-sub">
+                      创建后可设定：任务工作区、执行内容（prompt）、模型、执行频率（每天 / 每周 / 每 N 小时）
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                <div className="tasks-toolbar">
+                  <div className="task-filters" role="tablist" aria-label="任务筛选">
+                    {[
+                      ['all', '全部', tasks.length],
+                      ['enabled', '已启用', enabledCount],
+                      ['disabled', '已停用', disabledCount]
+                    ].map(([key, label, count]) => (
+                      <button
+                        key={key}
+                        className={filter === key ? 'active' : ''}
+                        role="tab"
+                        aria-selected={filter === key}
+                        onClick={() => setFilter(key)}
+                      >
+                        {label} <span>{count}</span>
+                      </button>
+                    ))}
+                  </div>
+                  <span className="tasks-filter-count">{filteredTasks.length} 个任务</span>
+                </div>
+                <div className="tasks-list">
+                  {filteredTasks.length === 0 ? (
+                    <div className="tasks-filter-empty">
+                      <div>该筛选下暂无任务</div>
+                      <button onClick={() => setFilter('all')}>查看全部任务</button>
+                    </div>
+                  ) : (
+                    filteredTasks.map((t) => (
               <div key={t.id} className={'task-card' + (t._running ? ' running' : '')}>
                 <div className="task-card-head">
+                  <div className="task-card-icon" aria-hidden="true">
+                    {taskIcon(t)}
+                  </div>
                   <span className="task-card-name" title={t.prompt}>
                     {t.name || '（未命名任务）'}
                   </span>
-                  {t._running && <span className="task-card-badge running">⏳ 执行中…</span>}
+                  {t._running && <span className="task-card-badge running"><Loader2 className="icon-spin" size={12} strokeWidth={1.8} aria-hidden="true" />执行中…</span>}
                   <div className="tb-spacer" />
                   <label className="task-toggle" title={t.enabled ? '点击停用' : '点击启用'}>
                     <input
@@ -3897,9 +4341,20 @@ function TasksPage({ notify, setConfirm, settingsData, workspace }) {
                   </label>
                 </div>
                 <div className="task-card-meta">
-                  <span title={'Cron: ' + t.schedule}>⏱ {t._nextText}</span>
+                  <span title={'Cron: ' + t.schedule}>
+                    <Clock3 size={12} strokeWidth={1.8} aria-hidden="true" /> {t._nextText}
+                  </span>
+                  {t.enabled ? (
+                    t.schedule === '@startup' ? (
+                      <span className="task-next">应用启动时</span>
+                    ) : nextByTask[t.id] ? (
+                      <span className="task-next">下次 {fmtNextRun(nextByTask[t.id])}</span>
+                    ) : null
+                  ) : (
+                    <span className="task-next muted">已停用</span>
+                  )}
                   <span className="task-card-ws" title={t.workspace}>
-                    📁 {t.workspace}
+                    <Folder size={12} strokeWidth={1.8} aria-hidden="true" /> {t.workspace}
                   </span>
                 </div>
                 <div className="task-card-result">
@@ -3922,20 +4377,20 @@ function TasksPage({ notify, setConfirm, settingsData, workspace }) {
                 </div>
                 <div className="task-card-ops">
                   <button disabled={t._running} onClick={() => runNow(t)}>
-                    ▶️ 立即执行
+                    <Play size={13} strokeWidth={1.8} aria-hidden="true" /> 立即执行
                   </button>
                   <button disabled={t._running} onClick={() => openEdit(t)}>
-                    ✏️ 编辑
+                    <Pencil size={13} strokeWidth={1.8} aria-hidden="true" /> 编辑
                   </button>
                   <button disabled={t._running} onClick={() => deleteTask(t)}>
-                    🗑️ 删除
+                    <Trash2 size={13} strokeWidth={1.8} aria-hidden="true" /> 删除
                   </button>
                   <button
                     className={'task-history-toggle' + (expandedId === t.id ? ' open' : '')}
                     onClick={() => toggleHistory(t)}
                     title="展开/收起执行记录"
                   >
-                    📜 执行记录{t._historyCount > 0 ? `（${t._historyCount}）` : ''}
+                    <History size={13} strokeWidth={1.8} aria-hidden="true" /> 执行记录{t._historyCount > 0 ? `（${t._historyCount}）` : ''}
                   </button>
                 </div>
                 {expandedId === t.id && (
@@ -3985,8 +4440,53 @@ function TasksPage({ notify, setConfirm, settingsData, workspace }) {
                   </div>
                 )}
               </div>
-            ))}
-          </div>
+                    ))
+                  )}
+                </div>
+                  </>
+                )}
+              </div>
+              <aside className="tasks-recent" aria-label="近期执行">
+                <div className="tasks-recent-head">
+                  <span className="tasks-recent-title">近期执行</span>
+                  <span className="tasks-recent-sub">{recent.length ? `最近 ${recent.length} 条` : '暂无记录'}</span>
+                </div>
+                {recent.length ? (
+                  <div className="tasks-timeline">
+                    {recent.map((r, i) => {
+                      const task = tasks.find((x) => x.id === r.taskId)
+                      const ok = r.status === 'completed'
+                      const cls = ok ? 'ok' : r.status === 'timeout' ? 'warn' : 'err'
+                      return (
+                        <button
+                          key={`${r.taskId}-${r.runAt}-${i}`}
+                          className="tasks-tl"
+                          title={r.summary || ''}
+                          disabled={!task}
+                          onClick={() => task && setHistoryDetail({ task, item: r })}
+                        >
+                          <span className={`tasks-tl-dot ${cls}`} />
+                          <span className="tasks-tl-main">
+                            <span className="tasks-tl-name">{r.taskName || task?.name || '未知任务'}</span>
+                            <span className="tasks-tl-meta">
+                              {fmtRunTime(r.runAt)}
+                              {fmtTaskDur(r.durationMs) ? ` · ${fmtTaskDur(r.durationMs)}` : ''}
+                            </span>
+                          </span>
+                          <span className={`tasks-tl-tag ${cls}`}>
+                            {TASK_STATUS_TEXT[r.status] || r.status}
+                          </span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                ) : (
+                  <div className="tasks-recent-empty">暂无执行记录</div>
+                )}
+                <div className="tasks-recent-note">完整记录见各任务卡</div>
+              </aside>
+            </div>
+          </>
         )}
       </div>
 
@@ -3997,7 +4497,7 @@ function TasksPage({ notify, setConfirm, settingsData, workspace }) {
             <div className="history-detail-head">
               <div className="history-detail-title">执行详情</div>
               <button className="history-detail-close" onClick={() => setHistoryDetail(null)}>
-                ✕
+                <X size={14} strokeWidth={1.8} aria-hidden="true" />
               </button>
             </div>
             <div className="history-detail-sub">
@@ -4119,7 +4619,7 @@ function TasksPage({ notify, setConfirm, settingsData, workspace }) {
                 <div className="tc-row">
                   {/* 构造按钮置行首（始终可点，经构造器修改）；cron 以构造器同款圆角分框展示，不提供直接改文本 */}
                   <button type="button" className="tc-build" onClick={() => setCronOpen(true)}>
-                    ⏱️ 构造
+                    <Timer size={13} strokeWidth={1.8} aria-hidden="true" /> 构造
                   </button>
                   <span className="cb-parts tc-cron">
                     {(() => {
@@ -4307,7 +4807,7 @@ function CronBuilder({ initial, onApply, onClose }) {
   return (
     <div className="perm-mask">
       <div className="perm-card cron-builder-card" onClick={(e) => e.stopPropagation()}>
-        <div className="perm-title">⏱️ Cron 构造器</div>
+        <div className="perm-title"><Timer size={15} strokeWidth={1.8} aria-hidden="true" /> Cron 构造器</div>
         <div className="cb-fields">
           {CRON_FIELDS.map((f) => {
             const v = fields[f.key]
@@ -4758,29 +5258,37 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
         hideFiles: configForm.hideFilesText.split('\n').map((x) => x.trim()).filter(Boolean)
       })
     }
-    else onClose()
+    // 界面设置 / 关于均为即时生效，没有需要落盘的表单
+    else return
   }
 
   return (
-    <div className="perm-mask">
-      <div className="perm-card settings-card settings-wrap">
+    <div className="settings-page">
+      <div className="page-head settings-page-head">
+        <div>
+          <div className="page-eyebrow">偏好</div>
+          <h1 className="page-title">设置</h1>
+          <p className="page-sub">模型、界面、权限与运行配置，修改后即时生效。</p>
+        </div>
+      </div>
+      <div className="settings-page-main">
         {/* 左侧导航：设置分类 */}
         <div className="settings-nav">
           <div className="settings-nav-title">设置</div>
           <button className={`settings-nav-item ${tab === 'model' ? 'active' : ''}`} onClick={() => setTab('model')}>
-            ⚙️ 模型设置
+            <Settings size={14} strokeWidth={1.8} aria-hidden="true" /> 模型设置
           </button>
           <button className={`settings-nav-item ${tab === 'appearance' ? 'active' : ''}`} onClick={() => setTab('appearance')}>
-            🎨 界面设置
+            <Palette size={14} strokeWidth={1.8} aria-hidden="true" /> 界面设置
           </button>
           <button className={`settings-nav-item ${tab === 'permission' ? 'active' : ''}`} onClick={() => setTab('permission')}>
-            🛡️ 权限设置
+            <ShieldCheck size={14} strokeWidth={1.8} aria-hidden="true" /> 权限设置
           </button>
           <button className={`settings-nav-item ${tab === 'config' ? 'active' : ''}`} onClick={() => setTab('config')}>
-            📄 配置
+            <FileText size={14} strokeWidth={1.8} aria-hidden="true" /> 配置
           </button>
           <button className={`settings-nav-item ${tab === 'about' ? 'active' : ''}`} onClick={() => setTab('about')}>
-            ℹ️ 关于
+            <Info size={14} strokeWidth={1.8} aria-hidden="true" /> 关于
           </button>
         </div>
 
@@ -4799,25 +5307,27 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
                     尚未添加模型组。可添加 DeepSeek / Kimi 等任意 OpenAI 兼容服务，每个组支持多个模型 ID。
                   </div>
                 )}
-                {/* 每个模型组：表单与卡片同挂载，编辑⇄收起平滑动画 */}
-                {(form.modelGroups || []).map((g, gi) => (
-                  <GroupCard
-                    key={g.id}
-                    g={g}
-                    editing={editing === gi}
-                    draft={draft}
-                    setDraft={setDraft}
-                    test={cardTest[g.id]}
-                    onTest={(e) => runCardTest(g, e)}
-                    onCopy={copyInCard}
-                    formTest={formTest}
-                    onFormTest={runFormTest}
-                    onEdit={() => startEdit(gi)}
-                    onRemove={() => removeGroup(gi)}
-                    onCancel={cancelForm}
-                    onSubmit={confirmEdit}
-                  />
-                ))}
+                {/* 每个模型组：表单与卡片同挂载，编辑⇄收起平滑动画；正常态两列 */}
+                <div className="mg-grid">
+                  {(form.modelGroups || []).map((g, gi) => (
+                    <GroupCard
+                      key={g.id}
+                      g={g}
+                      editing={editing === gi}
+                      draft={draft}
+                      setDraft={setDraft}
+                      test={cardTest[g.id]}
+                      onTest={(e) => runCardTest(g, e)}
+                      onCopy={copyInCard}
+                      formTest={formTest}
+                      onFormTest={runFormTest}
+                      onEdit={() => startEdit(gi)}
+                      onRemove={() => removeGroup(gi)}
+                      onCancel={cancelForm}
+                      onSubmit={confirmEdit}
+                    />
+                  ))}
+                </div>
                 {adding ? (
                   <div className="mg-form">
                     <GroupFormFields
@@ -4862,18 +5372,11 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
                 <div className="set-label" style={{ marginTop: 12 }}>
                   新会话默认档
                 </div>
-                <select
-                  className="set-input"
+                <SettingsEffortSelect
                   value={data.effort?.default || 'default'}
                   disabled={data.effort?.enabled === false}
-                  onChange={(e) => onEffortChange({ default: e.target.value })}
-                >
-                  {EFFORT_OPTIONS.map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
-                    </option>
-                  ))}
-                </select>
+                  onChange={(v) => onEffortChange({ default: v })}
+                />
                 <div className="set-hint">
                   仅影响新会话，已有会话保留自己的档位。若模型不支持该参数，切回默认即可；默认档与改造前完全一致。
                 </div>
@@ -4892,7 +5395,7 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
                   value={configForm?.skillApiBase || ''}
                   onChange={(e) => setConfigForm((c) => (c ? { ...c, skillApiBase: e.target.value } : c))}
                 />
-                <div className="set-hint">Skill Hub 技能列表与下载接口的地址。</div>
+                <div className="set-hint">Hub 技能列表与下载接口的地址。</div>
               </div>
 
               {/* 窗口尺寸：宽/高/最小宽/最小高 */}
@@ -5082,7 +5585,7 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
                   }}
                 >
                   <span>打开日志目录</span>
-                  <span>📂</span>
+                  <span><FolderOpen size={14} strokeWidth={1.8} aria-hidden="true" /></span>
                 </button>
                 <div className="set-hint">应用运行日志（含报错）写入该目录，排查问题时可在此查看。</div>
               </div>
@@ -5124,14 +5627,40 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
               <div className="set-group">
                 <div className="set-title">界面风格</div>
                 <div className="set-desc">界面主题即时生效并自动保存，无需重启引擎。</div>
-                <label className="set-radio">
-                  <input type="radio" name="theme" checked={theme === 'dark'} onChange={() => onThemeChange('dark')} />
-                  🌙 暗色
-                </label>
-                <label className="set-radio">
-                  <input type="radio" name="theme" checked={theme === 'light'} onChange={() => onThemeChange('light')} />
-                  🌞 亮色
-                </label>
+                <div className="theme-grid">
+                  <button
+                    className={`theme-card${theme === 'light' ? ' active' : ''}`}
+                    onClick={() => onThemeChange('light')}
+                  >
+                    <span className="theme-preview">
+                      <span className="theme-preview-bar"><i /><i /><i /></span>
+                      <span className="theme-preview-body">
+                        <span className="theme-preview-side" />
+                        <span className="theme-preview-main">
+                          <span className="theme-preview-line" />
+                          <span className="theme-preview-line short" />
+                        </span>
+                      </span>
+                    </span>
+                    <span className="theme-label">亮色 <span className="theme-tick"><Check size={12} strokeWidth={2.2} aria-hidden="true" /></span></span>
+                  </button>
+                  <button
+                    className={`theme-card${theme === 'dark' ? ' active' : ''}`}
+                    onClick={() => onThemeChange('dark')}
+                  >
+                    <span className="theme-preview dark">
+                      <span className="theme-preview-bar"><i /><i /><i /></span>
+                      <span className="theme-preview-body">
+                        <span className="theme-preview-side" />
+                        <span className="theme-preview-main">
+                          <span className="theme-preview-line" />
+                          <span className="theme-preview-line short" />
+                        </span>
+                      </span>
+                    </span>
+                    <span className="theme-label">暗色 <span className="theme-tick"><Check size={12} strokeWidth={2.2} aria-hidden="true" /></span></span>
+                  </button>
+                </div>
               </div>
 
               <div className="set-group">
@@ -5146,7 +5675,7 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
                     checked={(streamReveal || 'emerge') === 'emerge'}
                     onChange={() => onStreamRevealChange('emerge')}
                   />
-                  ✨ 浮现（模糊 → 清晰）
+                  <Sparkles size={14} strokeWidth={1.8} aria-hidden="true" /> 浮现（模糊 → 清晰）
                 </label>
                 <label className="set-radio">
                   <input
@@ -5155,7 +5684,7 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
                     checked={streamReveal === 'typewriter'}
                     onChange={() => onStreamRevealChange('typewriter')}
                   />
-                  ⌨️ 打字机（逐字直出）
+                  <Keyboard size={14} strokeWidth={1.8} aria-hidden="true" /> 打字机（逐字直出）
                 </label>
               </div>
 
@@ -5164,11 +5693,11 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
                 <div className="set-desc">「最小化到托盘」时，关闭窗口不会退出程序，AI 任务在后台继续运行；点击托盘图标恢复窗口，右键托盘菜单可退出。</div>
                 <label className="set-radio">
                   <input type="radio" name="closeAction" checked={(data.closeAction || 'quit') === 'quit'} onChange={() => onCloseActionChange('quit')} />
-                  ❌ 关闭程序
+                  <XCircle size={14} strokeWidth={1.8} aria-hidden="true" /> 关闭程序
                 </label>
                 <label className="set-radio">
                   <input type="radio" name="closeAction" checked={(data.closeAction || 'quit') === 'tray'} onChange={() => onCloseActionChange('tray')} />
-                  🚩 最小化到系统托盘
+                  <Flag size={14} strokeWidth={1.8} aria-hidden="true" /> 最小化到系统托盘
                 </label>
               </div>
 
@@ -5184,17 +5713,19 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
             </>
           )}
           </div>
+        </div>
+      </div>
 
-          {/* 面板级底部按钮：始终显示「取消」「保存」；模型设置另需「保存并生效」 */}
-          <div className="settings-footer">
-            <button onClick={onClose}>取消</button>
-            <button onClick={handleSave}>保存</button>
-            {tab === 'model' && (
-              <button className="primary" disabled={busy} onClick={() => onSave(form, true)}>
-                保存并生效
-              </button>
-            )}
-          </div>
+      {/* 底部操作栏：横跨整页，内容与设置版心对齐 */}
+      <div className="settings-footer">
+        <div className="settings-footer-inner">
+          <button onClick={onClose}>取消</button>
+          <button onClick={handleSave}>保存</button>
+          {tab === 'model' && (
+            <button className="primary" disabled={busy} onClick={() => onSave(form, true)}>
+              保存并生效
+            </button>
+          )}
         </div>
       </div>
 
@@ -5205,10 +5736,17 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
           style={{ top: bubble.top, bottom: bubble.bottom, right: bubble.right }}
           role="status"
         >
-          <span>{bubble.status === 'ok' ? '✓ ' + (bubble.text || '连接正常') : '✗ ' + (bubble.error || '连接失败')}</span>
+          <span>
+            {bubble.status === 'ok' ? (
+              <CheckCircle2 size={13} strokeWidth={2} aria-hidden="true" />
+            ) : (
+              <XCircle size={13} strokeWidth={2} aria-hidden="true" />
+            )}
+            {bubble.status === 'ok' ? bubble.text || '连接正常' : bubble.error || '连接失败'}
+          </span>
           {bubble.status === 'fail' && (
             <button className="test-bubble-close" onClick={() => setBubble(null)} title="关闭">
-              ✕
+              <X size={12} strokeWidth={1.8} aria-hidden="true" />
             </button>
           )}
         </div>
@@ -5369,7 +5907,9 @@ function AgentPicker({ value, onPick, options, loading }) {
         ) : (
           <>
             <span className="mp-label">{curLabel}</span>
-            <span className="mp-arrow">{open ? '▴' : '▾'}</span>
+            <span className="mp-arrow">
+          {open ? <ChevronUp size={10} strokeWidth={2} aria-hidden="true" /> : <ChevronDown size={10} strokeWidth={2} aria-hidden="true" />}
+        </span>
           </>
         )}
       </button>
@@ -5469,7 +6009,9 @@ function ModelPicker({ models, value, onPick }) {
         title="本次对话使用的模型（发送后绑定到该对话）"
       >
         <span className="mp-label">{current ? current.label : '选择模型'}</span>
-        <span className="mp-arrow">{open ? '▴' : '▾'}</span>
+        <span className="mp-arrow">
+          {open ? <ChevronUp size={10} strokeWidth={2} aria-hidden="true" /> : <ChevronDown size={10} strokeWidth={2} aria-hidden="true" />}
+        </span>
       </button>
       {open &&
         pos &&
@@ -5554,7 +6096,9 @@ function EffortPicker({ value, onPick, disabled, reason }) {
         title={disabled ? reason || '推理强度不可用' : current.hint}
       >
         <span className="mp-label">{disabled ? '—' : current.label}</span>
-        <span className="mp-arrow">{open ? '▴' : '▾'}</span>
+        <span className="mp-arrow">
+          {open ? <ChevronUp size={10} strokeWidth={2} aria-hidden="true" /> : <ChevronDown size={10} strokeWidth={2} aria-hidden="true" />}
+        </span>
       </button>
       {open &&
         pos &&
@@ -5571,6 +6115,99 @@ function EffortPicker({ value, onPick, disabled, reason }) {
                 }}
               >
                 {o.label}
+              </button>
+            ))}
+          </div>,
+          document.body
+        )}
+    </div>
+  )
+}
+
+// 设置页「新会话默认档」下拉：复用模型下拉的按钮/菜单视觉，全宽、向下弹出
+function SettingsEffortSelect({ value, onChange, disabled }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef(null)
+  const [pos, setPos] = useState(null)
+  useEffect(() => {
+    if (!open) return
+    const close = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false)
+    }
+    window.addEventListener('click', close)
+    window.addEventListener('blur', close)
+    return () => {
+      window.removeEventListener('click', close)
+      window.removeEventListener('blur', close)
+    }
+  }, [open])
+  useEffect(() => {
+    if (disabled) setOpen(false)
+  }, [disabled])
+  useLayoutEffect(() => {
+    if (!open) return
+    const update = () => {
+      const btn = ref.current?.querySelector('.model-pick-btn')
+      if (!btn) return
+      const r = btn.getBoundingClientRect()
+      // 设置页底部空间不足时向上展开，避免菜单落到窗口外
+      const openAbove = r.top > 180 && r.bottom + 180 > window.innerHeight
+      setPos({
+        left: r.left,
+        width: r.width,
+        top: openAbove ? 'auto' : r.bottom + 6,
+        bottom: openAbove ? Math.max(8, window.innerHeight - r.top + 6) : 'auto'
+      })
+    }
+    update()
+    window.addEventListener('resize', update)
+    window.addEventListener('scroll', update, true)
+    return () => {
+      window.removeEventListener('resize', update)
+      window.removeEventListener('scroll', update, true)
+    }
+  }, [open])
+  const current = EFFORT_OPTIONS.find((o) => o.value === value) || EFFORT_OPTIONS[0]
+  return (
+    <div className="model-picker settings-effort-picker" ref={ref}>
+      <button
+        className="model-pick-btn settings-select-btn"
+        disabled={disabled}
+        onClick={() => {
+          if (!disabled) setOpen(!open)
+        }}
+        title="新会话默认推理强度"
+      >
+        <span className="mp-label">{current.label}</span>
+        <span className="mp-arrow">
+          {open ? <ChevronUp size={10} strokeWidth={2} aria-hidden="true" /> : <ChevronDown size={10} strokeWidth={2} aria-hidden="true" />}
+        </span>
+      </button>
+      {open &&
+        pos &&
+        createPortal(
+          <div
+            className="model-pop settings-select-pop"
+            style={{
+              position: 'fixed',
+              left: pos.left,
+              top: pos.top,
+              bottom: pos.bottom,
+              width: pos.width,
+              right: 'auto'
+            }}
+          >
+            {EFFORT_OPTIONS.map((o) => (
+              <button
+                key={o.value}
+                className={`model-opt ${o.value === value ? 'active' : ''}`}
+                title={o.hint}
+                onClick={() => {
+                  onChange(o.value)
+                  setOpen(false)
+                }}
+              >
+                <span className="mp-opt-title">{o.label}</span>
               </button>
             ))}
           </div>,
@@ -5649,7 +6286,9 @@ function WorkspacePicker({ workspaces, value, onPick, onAdd, className }) {
     <div className={'model-picker ' + (className || '')} ref={ref}>
       <button className="model-pick-btn" onClick={() => setOpen(!open)} title="任务执行的工作区">
         <span className="mp-label">{current ? current.name + '（' + current.dir + '）' : '选择工作区'}</span>
-        <span className="mp-arrow">{open ? '▴' : '▾'}</span>
+        <span className="mp-arrow">
+          {open ? <ChevronUp size={10} strokeWidth={2} aria-hidden="true" /> : <ChevronDown size={10} strokeWidth={2} aria-hidden="true" />}
+        </span>
       </button>
       {open &&
         pos &&
@@ -5692,7 +6331,7 @@ function WorkspacePicker({ workspaces, value, onPick, onAdd, className }) {
 // memo：part 为消息 part 引用（delta 只替换变化的 part），未变化的工具卡不重渲染
 // 输入/输出默认截断展示（超过 LIMIT 字显示前段 + "展开全文"按钮），展开后直接渲染完整值，
 // 因此工具执行中展开可实时看到最新输出（每次 part 状态更新本组件会重渲染取到最新 output）
-// 工具调用的输入/输出明细 —— 右侧面板的 <ToolCard> 与对话列表的 <ToolChip> **共用这一份**，
+// 工具调用的输入/输出明细 —— 对话列表的 <ToolChip> 使用这一份，
 // 避免两处实现漂移（800 字截断 + 展开全文 + 执行中占位 + 失败时的错误文案）。
 const ToolIOView = memo(function ToolIOView({ part }) {
   const [expIn, setExpIn] = useState(false)
@@ -5748,34 +6387,6 @@ const ToolIOView = memo(function ToolIOView({ part }) {
   )
 })
 
-const ToolCard = memo(function ToolCard({ part }) {
-  const [open, setOpen] = useState(false)
-  const st = part.state?.status || 'pending'
-  // 引擎为每个工具调用记录 state.time = { start, end }（epoch 毫秒）。
-  // 引擎的 end 指「产生响应」的时刻；_tEnd 为渲染层记录的工具最后一次状态更新时间，
-  // 更能反映「结果完全输出结束」。进行中 _tEnd 随每次输出刷新，耗时会实时增长。
-  const t = part.state?.time || {}
-  const clock = fmtClock(t.start)
-  const dur = fmtDur(t.start, t._tEnd || t.end)
-  return (
-    <div className={`tool-card ${st}`}>
-      <div className="tool-head" onClick={() => setOpen(!open)}>
-        <span className={`tool-dot ${st}`} />
-        <span className="tool-name">{part.tool}</span>
-        {clock && (
-          <span className="tool-time" title={`开始 ${clock}${dur ? ' · 耗时 ' + dur : ''}`}>
-            {clock}
-            {dur ? ` · ${dur}` : ''}
-          </span>
-        )}
-        <span className={`tool-status ${st}`}>{STATUS_LABEL[st] || st}</span>
-        <span className="tool-arrow">{open ? '▾' : '▸'}</span>
-      </div>
-      {open && <ToolIOView part={part} />}
-    </div>
-  )
-})
-
 // 对话列表里的工具调用：`[工具] read · 完成` 芯片，点击展开输入/输出（用户 2026-10-19 要求）。
 // 展开/收起动画与「思考过程」「子智能体卡片」同款：grid 行 0fr→1fr（0.28s），
 // 收起时延迟 300ms 卸载内容，否则 1fr→0fr 会因内容被立刻移除而"啪"地消失。
@@ -5791,15 +6402,49 @@ const ToolChip = memo(function ToolChip({ part }) {
     return () => clearTimeout(timer)
   }, [open])
   const st = part.state?.status || ''
+  const input = part.state?.input || {}
+  const time = part.state?.time || {}
+  const target =
+    input.filePath || input.path || input.command || input.pattern || input.query || input.description || ''
+  const dur = fmtDur(time.start, time._tEnd || time.end)
+  const icon =
+    part.tool === 'bash' || part.tool === 'shell' ? (
+      <Terminal size={13} strokeWidth={1.8} aria-hidden="true" />
+    ) : part.tool === 'write' || part.tool === 'edit' ? (
+      <Pencil size={13} strokeWidth={1.8} aria-hidden="true" />
+    ) : part.tool === 'read' ? (
+      <FileText size={13} strokeWidth={1.8} aria-hidden="true" />
+    ) : part.tool === 'grep' || part.tool === 'glob' ? (
+      <Search size={13} strokeWidth={1.8} aria-hidden="true" />
+    ) : part.tool === 'todowrite' ? (
+      <ListChecks size={13} strokeWidth={1.8} aria-hidden="true" />
+    ) : (
+      <Wrench size={13} strokeWidth={1.8} aria-hidden="true" />
+    )
+  const mark =
+    st === 'completed' ? (
+      <Check size={12} strokeWidth={2} aria-hidden="true" />
+    ) : st === 'error' ? (
+      <X size={12} strokeWidth={2} aria-hidden="true" />
+    ) : st === 'running' ? (
+      <Loader2 className="icon-spin" size={12} strokeWidth={2} aria-hidden="true" />
+    ) : null
   return (
-    <div className="tool-chip-wrap">
+    <div className="tool-row-wrap">
       <button
-        className={`tool-chip ${st}${open ? ' open' : ''}`}
+        className={`tool-row ${st}${open ? ' open' : ''}`}
         onClick={() => setOpen((o) => !o)}
         title={open ? '收起输入/输出' : '查看输入/输出'}
       >
-        <span className="tool-chip-caret">▶</span>
-        [工具] {part.tool} {st && `· ${STATUS_LABEL[st] || st}`}
+        <span className="tool-ic">{icon}</span>
+        <span className="tool-name">{part.tool}</span>
+        {target ? (
+          <span className="tool-target" title={String(target)}>
+            {target}
+          </span>
+        ) : null}
+        {dur ? <span className="tool-time">{dur}</span> : null}
+        <span className={`tool-check ${st}`}>{mark}</span>
       </button>
       <div className={`tool-chip-expand${open ? ' open' : ''}`}>
         <div className="tool-chip-expand-inner">{renderBody ? <ToolIOView part={part} /> : null}</div>
@@ -5823,7 +6468,7 @@ function ReasoningBlock({ text, streaming }) {
   return (
     <div className="reasoning">
       <button className={`reasoning-summary${isOpen ? ' open' : ''}`} onClick={() => setOpen((o) => !o)}>
-        <span className="reasoning-caret">▶</span>
+        <ChevronRight className="reasoning-caret" size={11} strokeWidth={2} aria-hidden="true" />
         思考过程
       </button>
       <div className={`reasoning-body${isOpen ? ' open' : ''}`}>
@@ -5862,7 +6507,7 @@ function SubagentNoticeRow({ m }) {
     return (
       <div className="row assistant">
         <div className="bubble assistant">
-          <div className="tool-chip completed">🤖 后台完成通知已并入上方子智能体卡片</div>
+          <div className="tool-chip completed"><Bot size={13} strokeWidth={1.8} aria-hidden="true" /> 后台完成通知已并入上方子智能体卡片</div>
         </div>
       </div>
     )
@@ -5871,7 +6516,7 @@ function SubagentNoticeRow({ m }) {
     <div className="row assistant">
       <div className="bubble assistant">
         <div className="tool-chip completed">
-          🤖 子智能体{notice?.agent ? ` · ${notice.agent}` : ''} · 后台{label}
+          <Bot size={13} strokeWidth={1.8} aria-hidden="true" /> 子智能体{notice?.agent ? ` · ${notice.agent}` : ''} · 后台{label}
           {notice?.description ? ` · ${notice.description}` : ''}
         </div>
         {body ? <div style={{ whiteSpace: 'pre-wrap' }}>{body}</div> : null}
@@ -5894,11 +6539,7 @@ function SubagentChildMsg({ m }) {
       )}
       {md.trim() ? <div className="md-body" dangerouslySetInnerHTML={{ __html: marked.parse(md) }} /> : null}
       {(m.parts || []).map((p, i) =>
-        p.type === 'tool' ? (
-          <div key={'t' + i} className={`tool-chip ${p.state?.status || ''}`}>
-            [工具] {p.tool} {p.state?.status ? `· ${STATUS_LABEL[p.state.status] || p.state.status}` : ''}
-          </div>
-        ) : null
+        p.type === 'tool' ? <ToolChip key={'t' + i} part={p} /> : null
       )}
     </div>
   )
@@ -5906,7 +6547,7 @@ function SubagentChildMsg({ m }) {
 
 // 展开态：子会话全过程（就地时间线）
 //   基线 = messageList 快照；增量 = 事件镜像（subagentStream）；兜底 = 仅断流时轮询（设计 §5.7 / S-6）
-const SubagentChildView = memo(function SubagentChildView({ childSid, agent, onShowPanel }) {
+const SubagentChildView = memo(function SubagentChildView({ childSid, agent }) {
   const sub = useCallback((cb) => subagentStream.subscriber(childSid)(cb), [childSid])
   const snap = useCallback(() => subagentStream.get(childSid), [childSid])
   const messages = useSyncExternalStore(sub, snap, () => null)
@@ -5981,11 +6622,9 @@ const SubagentChildView = memo(function SubagentChildView({ childSid, agent, onS
   return (
     <div className="subagent-child">
       <div className="subagent-child-meta">
-        <span>
-          子会话 {String(childSid).slice(0, 8)}… · agent={agent || '—'}
-        </span>
+        <span title={childSid}>子智能体过程{agent ? ` · ${agent}` : ''}</span>
         <button className="tool-expand" onClick={() => window.xwork.copyText(childSid)}>
-          复制完整 id
+          复制会话 ID
         </button>
       </div>
       {visible < list.length && (
@@ -6003,34 +6642,21 @@ const SubagentChildView = memo(function SubagentChildView({ childSid, agent, onS
         <button className="tool-expand" onClick={() => window.xwork.copyText(report)} disabled={!report}>
           复制报告
         </button>
-        {onShowPanel ? (
-          <button className="tool-expand" onClick={onShowPanel}>
-            在右侧面板查看原始输入/输出
-          </button>
-        ) : null}
       </div>
     </div>
   )
 })
 
-// ── 子智能体卡片（对话列表 L1 / 右侧执行面板 L2 共用同一实现）────────────────
-// 为什么面板也复用这一个组件（2026-10-19 用户要求）：面板里的子智能体条目必须与对话列表里
-// 完全一致 —— 同样的摘要、同样的「展开 / 收起」按钮与动画。此前面板用的是另一份
-// `SubagentToolCard`（任务说明 + 报告 + 原始区常显），两处实现会各自漂移。
-// `variant="panel"` 只多一个**默认折叠**的「原始输入/输出」入口，不改变摘要区。
-// props 刻意只有【稳定的 part 引用】+ 一个稳定回调：摘要经 store 自订阅进入，否则 memo 化的
+// ── 子智能体卡片（对话列表内联）────────────────
+// props 刻意只有【稳定的 part 引用】：摘要经 store 自订阅进入，否则 memo 化的
 // MessageView 会因每次节流 setState 而全部失效（v2-B-4）。
-const SubagentCard = memo(function SubagentCard({ part, onShowPanel, variant, parentSid }) {
+const SubagentCard = memo(function SubagentCard({ part, parentSid }) {
   const st = part.state || {}
   const childSid = childSessionId(st)
   const sub = useCallback((cb) => (childSid ? subagentLive.subscriber(childSid)(cb) : () => {}), [childSid])
   const snap = useCallback(() => (childSid ? subagentLive.get(childSid) : null), [childSid])
   const live = useSyncExternalStore(sub, snap, snap)
   const [open, setOpen] = useState(false)
-  // 面板独有：原始输入/输出（默认折叠，避免摘要区被长文本冲淡）
-  const [showRaw, setShowRaw] = useState(false)
-  const [expIn, setExpIn] = useState(false)
-  const [expOut, setExpOut] = useState(false)
   // 收起动画的延迟卸载：CSS 过渡（grid 0fr↔1fr，0.28s）需要内容在过渡期间仍然存在，
   // 否则 React 一撤内容，"1fr→0fr" 就没有主体、看起来是瞬间消失（展开方向不受影响）
   const [renderContent, setRenderContent] = useState(false)
@@ -6067,13 +6693,6 @@ const SubagentCard = memo(function SubagentCard({ part, onShowPanel, variant, pa
   const errText =
     phase === PHASE.failed || phase === PHASE.cancelled ? (live && live.errorText) || String(st.error || '') : ''
   const counts = live && (live.steps || live.toolCount) ? `第 ${live.steps || 0} 步 · ${live.toolCount || 0} 次工具调用` : ''
-  // 面板变体专用：原始输入/输出的截断展示（沿用既有 800 字 + 展开全文交互）
-  const LIMIT = 800
-  const toStr = (v) => (typeof v === 'string' ? v : JSON.stringify(v, null, 2))
-  const fmtRaw = (v, full) => {
-    const s = toStr(v)
-    return full || s.length <= LIMIT ? s : s.slice(0, LIMIT) + '\n…（已截断）'
-  }
   // 头像底色：来自名册的 agent.color（§5.6 / v2-S-1 白名单校验；无值回落 CSS 的 color-mix 主题色）
   const avatarColor = safeAgentColor((subagentLive.agentRosterOf(name) || {}).color)
   const onAbort = () => {
@@ -6101,7 +6720,7 @@ const SubagentCard = memo(function SubagentCard({ part, onShowPanel, variant, pa
       <div className="subagent-head">
         {phase === PHASE.running ? <span className="subagent-dot" /> : null}
         <span className="subagent-avatar" style={avatarColor ? { background: avatarColor } : undefined}>
-          🤖
+          <Bot size={14} strokeWidth={1.8} aria-hidden="true" />
         </span>
         <span className="subagent-name">子智能体{name ? ` · ${name}` : ''}</span>
         <span className={`tool-status ${statusClassOf(phase)}`}>{phaseLabel(phase)}</span>
@@ -6117,7 +6736,7 @@ const SubagentCard = memo(function SubagentCard({ part, onShowPanel, variant, pa
           onClick={() => setOpen((o) => !o)}
           title={open ? '收起子智能体过程' : '展开子智能体过程'}
         >
-          <span className="subagent-caret">▶</span>
+          <ChevronRight className="subagent-caret" size={11} strokeWidth={2} aria-hidden="true" />
           {open ? '收起' : '展开'}
           {counts ? `（${counts}）` : ''}
         </button>
@@ -6145,11 +6764,7 @@ const SubagentCard = memo(function SubagentCard({ part, onShowPanel, variant, pa
           {renderContent
             ? level === 1 && childSid
               ? (
-                  <SubagentChildView
-                    childSid={childSid}
-                    agent={name}
-                    onShowPanel={variant === 'panel' ? undefined : onShowPanel}
-                  />
+                  <SubagentChildView childSid={childSid} agent={name} />
                 )
               : // 二级降级：连子会话 id 都没有 ⇒ 展开为原始输入/输出（不猜测、不编造过程）
                 <pre className="subagent-raw">
@@ -6158,65 +6773,11 @@ const SubagentCard = memo(function SubagentCard({ part, onShowPanel, variant, pa
             : null}
         </div>
       </div>
-      {/* 面板变体独有的入口：原始输入/输出（默认折叠）——对话列表里不需要，故按 variant 渲染 */}
-      {variant === 'panel' ? (
-        <>
-          <div className="subagent-actions">
-            <button className="tool-expand" onClick={() => setShowRaw((v) => !v)}>
-              {showRaw ? '收起原始数据' : '原始输入/输出'}
-            </button>
-          </div>
-          {showRaw ? (
-            <div className="tool-body">
-              <div className="tool-field">
-                <div className="field-label">输入</div>
-                <pre>{fmtRaw(st.input, expIn)}</pre>
-                {toStr(st.input).length > LIMIT ? (
-                  <button className="tool-expand" onClick={() => setExpIn((v) => !v)}>
-                    {expIn ? '收起' : '展开全文'}
-                  </button>
-                ) : null}
-              </div>
-              <div className="tool-field">
-                <div className="field-label">输出原文</div>
-                <pre>{fmtRaw(st.output, expOut)}</pre>
-                {toStr(st.output).length > LIMIT ? (
-                  <button className="tool-expand" onClick={() => setExpOut((v) => !v)}>
-                    {expOut ? '收起' : '展开全文'}
-                  </button>
-                ) : null}
-              </div>
-            </div>
-          ) : null}
-        </>
-      ) : null}
     </div>
   )
 })
 
-// 统一的 phase 取值（L1 卡片 / L2 面板卡 / 面板置顶判定共用；渲染期重算以纳入时间推进）
-function subagentPhaseOf(part) {
-  const st = (part && part.state) || {}
-  const childSid = childSessionId(st)
-  const t = subagentLive.timings() || {}
-  return judgePhase({
-    partState: st,
-    live: childSid ? subagentLive.get(childSid) : null,
-    generation: subagentLive.getGeneration(),
-    outcome: childSid ? subagentLive.outcomeOf(childSid) : '',
-    graceMs: t.subagentOutcomeGraceMs,
-    unknownAfterMs: t.subagentUnknownAfterMs
-  })
-}
-
-/** 面板置顶判定（设计 §5.3 第 7 点 / D10）：运行中/后台/收尾中的子智能体卡常驻最上方 */
-function isPinnedSubagentPart(part) {
-  if (!part || part.tool !== 'subagent') return false
-  const ph = subagentPhaseOf(part)
-  return ph === PHASE.running || ph === PHASE.background || ph === PHASE.finalizing
-}
-
-const MessageView = memo(function MessageView({ m, onCopy, onUndo, canUndo, gitAvailable, busy, readOnly, onShowSubagentInPanel, parentSid }) {
+const MessageView = memo(function MessageView({ m, showName = true, onCopy, onUndo, canUndo, gitAvailable, busy, readOnly, parentSid }) {
   const mdText = m.parts.filter((p) => p.type === 'text').map((p) => p.text || '').join('\n')
   // 子智能体通知条必须在 user/assistant 分支【之前】返回：否则 role='system' 会落进 assistant 分支，
   // 由于它没有 text part（mdText 为空）而渲染成一个空白气泡（设计 §5.4(d) 第 2 点 / v3-B-3）
@@ -6240,7 +6801,7 @@ const MessageView = memo(function MessageView({ m, onCopy, onUndo, canUndo, gitA
         ? '此条之后没有可撤销的变更'
         : '回退至此（撤销此条及之后的全部 AI 变更）'
     return (
-      <div className="row user">
+      <div className="row user" data-user-msg={m.id}>
         {/* 只读视图（子会话下钻）不渲染「回退至此」——用户拍板：子会话只读 */}
         {readOnly ? null : (
           <button
@@ -6259,8 +6820,14 @@ const MessageView = memo(function MessageView({ m, onCopy, onUndo, canUndo, gitA
     )
   }
   return (
-    <div className="row assistant">
+    <div className={'row assistant' + (showName ? '' : ' no-name')}>
       <div className="bubble assistant">
+        {showName ? (
+          <div className="msg-name">
+            <span className="mini-mark"><Sparkles size={10} strokeWidth={2} aria-hidden="true" /></span>
+            XWORK
+          </div>
+        ) : null}
         {m.aborted && <div className="aborted-badge">已停止（输出不完整）</div>}
         {m.error && !m.aborted && <div className="msg-error">回复失败：{m.error}</div>}
         {m.parts.map((p, i) => {
@@ -6271,7 +6838,7 @@ const MessageView = memo(function MessageView({ m, onCopy, onUndo, canUndo, gitA
           if (p.type === 'tool') {
             // 子智能体（L1）：改渲染 <SubagentCard>（取代 [工具] subagent · 完成 的灰 chip）
             if (p.tool === 'subagent')
-              return <SubagentCard key={i} part={p} onShowPanel={onShowSubagentInPanel} parentSid={parentSid} />
+              return <SubagentCard key={i} part={p} parentSid={parentSid} />
             // 普通工具：`[工具] read · 完成` 芯片，点击展开输入/输出（与面板同一份 ToolIOView）
             return <ToolChip key={i} part={p} />
           }
@@ -6282,10 +6849,7 @@ const MessageView = memo(function MessageView({ m, onCopy, onUndo, canUndo, gitA
       {/* 只读视图（子会话下钻）不提供复制按钮 —— 用户拍板：子会话只读，去掉「回退至此」「复制」 */}
       {mdText.trim() && !m.streaming && !m.aborted && !readOnly && (
         <button className="copy-btn" title="复制" onClick={() => onCopy(mdText)}>
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-          </svg>
+          <Copy size={14} strokeWidth={2} aria-hidden="true" />
         </button>
       )}
     </div>

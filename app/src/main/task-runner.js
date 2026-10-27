@@ -429,8 +429,6 @@ class TaskRunner {
 
   // 系统通知（任务通知开关 + 仅窗口不在前台时弹，由 index.js 注入的 notify 函数决策，这里直接调用）
   notifyResult(task, result) {
-    const ok = result.status === 'completed'
-    const prefix = ok ? '✅' : result.status === 'timeout' ? '⏱' : '❌'
     const statusText = { completed: '已完成', failed: '执行失败', timeout: '执行超时' }[result.status] || result.status
     const summary = result.summary ? '\n' + String(result.summary).slice(0, 120) : ''
     this.notify(`定时任务「${task.name}」${statusText}${summary}`)

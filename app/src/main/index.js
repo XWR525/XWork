@@ -1686,6 +1686,73 @@ ipcMain.handle('tasks:history', (_e, id) => {
   return t ? [...(t.history || [])].reverse() : []
 })
 
+// 任务页聚合：统计、下次执行、近 7 天执行/成功率、最近历史。
+// 一次主进程计算，避免渲染层逐任务拉 history；历史仍受每任务 100 条上限约束。
+function taskNextAt(t, now) {
+  if (!t.enabled) return null
+  if (t.schedule === '@startup') return -1
+  try {
+    const at = taskScheduler.computeNextRunAt(t, new Date(now))
+    return Number.isFinite(at) && at > 0 ? at : null
+  } catch {
+    return null
+  }
+}
+
+ipcMain.handle('tasks:overview', () => {
+  const now = Date.now()
+  const tasks = taskStore.list()
+  const dayStart = new Date(now)
+  dayStart.setHours(0, 0, 0, 0)
+  const dayEnd = new Date(dayStart)
+  dayEnd.setDate(dayEnd.getDate() + 1)
+  const weekStart = now - 7 * 24 * 60 * 60 * 1000
+
+  const nextItems = []
+  const nextByTask = {}
+  for (const t of tasks) {
+    const at = taskNextAt(t, now)
+    if (at && at > 0) {
+      nextItems.push({ id: t.id, name: t.name, at })
+      nextByTask[t.id] = at
+    }
+  }
+  nextItems.sort((a, b) => a.at - b.at)
+
+  const histories = []
+  for (const t of tasks) {
+    for (const h of t.history || []) {
+      if (!Number.isFinite(h.runAt)) continue
+      histories.push({ ...h, taskId: t.id, taskName: t.name })
+    }
+  }
+  histories.sort((a, b) => b.runAt - a.runAt)
+
+  const week = histories.filter((h) => h.runAt >= weekStart)
+  const weekCompleted = week.filter((h) => h.status === 'completed').length
+  const weekFailed = week.filter((h) => h.status === 'failed' || h.status === 'timeout').length
+  const todayPending = nextItems.filter((n) => n.at >= dayStart.getTime() && n.at < dayEnd.getTime()).length
+
+  return {
+    total: tasks.length,
+    enabled: tasks.filter((t) => t.enabled).length,
+    disabled: tasks.filter((t) => !t.enabled).length,
+    failed: tasks.filter(
+      (t) => t.lastResult && (t.lastResult.status === 'failed' || t.lastResult.status === 'timeout')
+    ).length,
+    todayPending,
+    nextAt: nextItems[0]?.at ?? null,
+    nextName: nextItems[0]?.name ?? null,
+    nextByTask,
+    weekRuns: week.length,
+    weekCompleted,
+    weekFailed,
+    successRate: week.length ? Math.round((weekCompleted / week.length) * 100) : null,
+    recent: histories.slice(0, 6),
+    generatedAt: now
+  }
+})
+
 // 计算 cron 接下来 N 次运行时间点（构造器预览用；无效表达式返回空数组）
 ipcMain.handle('tasks:next-runs', (_e, expr, count) => {
   const n = Number.isInteger(count) && count > 0 ? count : 5
