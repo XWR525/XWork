@@ -1,8 +1,8 @@
 {
   "skillApiBase": "http://localhost:4321",
   "updateSource": {
-    "latestApi": "http://192.168.99.201:8418/api/v1/repos/xuwr/XWork/releases/latest",
-    "downloadBase": "http://192.168.99.201:8418/xuwr/XWork/releases/download"
+    "latestApi": "http://192.168.102.11:3004/api/v1/repos/xuwenrui/XWork/releases/latest",
+    "downloadBase": "http://192.168.102.11:3004/xuwenrui/XWork/releases/download"
   },
   "window": {
     "width": 1180,

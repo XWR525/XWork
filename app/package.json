@@ -1,7 +1,7 @@
 {
   "name": "xwork",
   "productName": "XWork",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "description": "XWork - 基于 opencode 的可视化 AI 工作台",
   "main": "out/main/index.js",
   "author": "XWork",
@@ -23,7 +23,7 @@
     "publish": [
       {
         "provider": "generic",
-        "url": "http://192.168.99.201:8418/xuwr/XWork/releases/latest/download/",
+        "url": "http://192.168.102.11:3004/xuwenrui/XWork/releases/latest/download/",
         "useMultipleRangeRequest": false
       }
     ],

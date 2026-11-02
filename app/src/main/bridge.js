@@ -124,14 +124,14 @@ class Bridge {
   // 的形状是 {data, cursor}，cursor 是分页游标：一旦被拆掉，分页就永远只能取到第一页
   // opts.timeoutMs：仅对本次调用生效的 AbortSignal 超时（默认不设，见 RELOAD_TIMEOUT_MS 的说明）
   async _reqRaw(method, p, body, opts = {}) {
-    const { timeoutMs } = opts
+    const { timeoutMs, signal } = opts
     let res
     try {
       res = await fetch(this.base + p, {
         method,
         headers: this._headers(body !== undefined),
         body: body !== undefined ? JSON.stringify(body) : undefined,
-        ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {})
+        ...(signal ? { signal } : timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {})
       })
     } catch (e) {
       // 超时必须与普通失败区分（调用方的降级策略不同：超时 = 结果未知，不能判定业务失败）
@@ -192,6 +192,16 @@ class Bridge {
   // 兼容入口：返回形状不变（session:list IPC 直接把数组交给渲染层，改形状会波及所有调用点）
   async listSessions() {
     return (await this.listSessionsWithMeta()).rows
+  }
+
+  // 会话统计（引擎实验接口）：区间聚合 tokens / prompts / steps / tools / activity / models。
+  // tools: none | summary | detail；detail 才返回逐工具 usage。
+  // signal 由 stats:get / stats:heatmap 的总 deadline 提供，贯穿降级重试。
+  async getSessionStats({ from, to, timezone, tools = 'detail', signal } = {}) {
+    const q = new URLSearchParams({ timezone, tools })
+    if (Number.isFinite(from)) q.set('from', String(from))
+    if (Number.isFinite(to)) q.set('to', String(to))
+    return await this._req('GET', '/api/experimental/session/stats?' + q.toString(), undefined, { signal })
   }
 
   // 已加载的模型提供商列表（{location, data} 原样返回；渲染层模型下拉实际来自设置模型组，此接口为遗留保留）
@@ -772,7 +782,12 @@ class Bridge {
           properties: {
             sessionID: d.sessionID,
             messageID: d.assistantMessageID,
-            part: { id: 'r' + (d.ordinal ?? 0), type: 'reasoning', text: full }
+            part: {
+              id: 'r' + (d.ordinal ?? 0),
+              type: 'reasoning',
+              text: full,
+              streaming: type !== 'session.reasoning.ended'
+            }
           }
         })
         break

@@ -234,7 +234,7 @@ export function judgePhase({
 // 为什么单独成函数：`normalize()`、`settleApply()`、`applyPartUpdated()` 的占位分支
 // 各自维护了一份"字段白名单"，任何新增字段（如 subagentNotice）漏掉一处就会
 // 只在 SSE 路径存在、GET 路径全丢，并被 streamCacheRef 缓存整个会话生命周期。
-const PART_KEYS = ['id', 'callID', 'type', 'text', 'tool', 'state', 'subagentNotice']
+const PART_KEYS = ['id', 'callID', 'type', 'text', 'tool', 'state', 'subagentNotice', 'streaming']
 
 /** 工具/文本/思考/通知 part 的整形（三处共用） */
 export function normalizePart(p) {

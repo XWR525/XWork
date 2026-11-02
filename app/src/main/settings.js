@@ -5,6 +5,81 @@
 const fs = require('node:fs')
 const path = require('node:path')
 
+// OpenCode V2 websearch provider plugin (generated next to opencode.json).
+// Kept inline so electron-vite's main bundle doesn't lose a separately required file.
+const PLUGIN_DIR = 'xwork-deepseek-search'
+const PLUGIN_PACKAGE = JSON.stringify(
+  { name: 'xwork-deepseek-search', private: true, type: 'module', main: 'index.js' },
+  null,
+  2
+)
+const PLUGIN_SOURCE = `export default {
+  id: "xwork-deepseek-search",
+  async setup(ctx) {
+    const base = process.env.XWORK_SEARCH_API_BASE || "https://api.deepseek.com/v1/tools/search";
+    const key = process.env.XWORK_SEARCH_API_KEY || "";
+    const count = Math.max(1, Math.min(50, Number(process.env.XWORK_SEARCH_COUNT) || 5));
+    const needContent = process.env.XWORK_SEARCH_NEED_CONTENT !== "0";
+
+    await ctx.websearch.transform((editor) => {
+      editor.add({
+        id: "xwork-deepseek",
+        name: "DeepSeek Search",
+        async execute(input, context) {
+          if (!key) throw new Error("XWork websearch: API key is not configured");
+          const response = await fetch(base, {
+            method: "POST",
+            headers: {
+              Authorization: "Bearer " + key,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              query: input.query,
+              count,
+              need_content: needContent
+            }),
+            signal: context && context.signal
+          });
+          if (!response.ok) {
+            const body = await response.text().catch(() => "");
+            throw new Error("XWork websearch HTTP " + response.status + (body ? ": " + body.slice(0, 240) : ""));
+          }
+          const payload = await response.json();
+          if (!Array.isArray(payload.results)) throw new Error("XWork websearch: response.results is not an array");
+          return payload.results
+            .filter((item) => item && typeof item.url === "string" && item.url)
+            .map((item) => {
+              const published = Date.parse(item.date || "");
+              return {
+                url: item.url,
+                title: String(item.title || ""),
+                content: String(item.content || item.summary || item.snippet || ""),
+                time: Number.isFinite(published) ? { published } : {}
+              };
+            });
+        }
+      });
+    });
+  }
+};
+`
+
+function writeWebSearchPlugin(configFile) {
+  const dir = path.join(path.dirname(configFile), PLUGIN_DIR)
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(path.join(dir, 'index.js'), PLUGIN_SOURCE, 'utf8')
+  fs.writeFileSync(path.join(dir, 'package.json'), PLUGIN_PACKAGE, 'utf8')
+  return dir
+}
+
+function removeWebSearchPlugin(configFile) {
+  try {
+    fs.rmSync(path.join(path.dirname(configFile), PLUGIN_DIR), { recursive: true, force: true })
+  } catch {
+    /* 删除失败不影响启动；配置中不再引用即可 */
+  }
+}
+
 // safeStorage 依赖 Electron 运行时；纯 Node 环境（测试）下降级为明文
 let safeStorage = null
 try {
@@ -42,6 +117,15 @@ const DEFAULT_SETTINGS = {
     task: 'ask',
     external_directory: 'ask',
     question: 'ask'
+  },
+  // 联网搜索：XWork 专用 DeepSeek 兼容 Search API。apiKey 加密存储；
+  // 未配置 Key 时不注册 provider，OpenCode 的 websearch 保持未配置状态。
+  websearch: {
+    apiBase: 'https://api.deepseek.com/v1/tools/search',
+    apiKey: '',
+    count: 5,
+    needContent: true,
+    valid: false
   },
   // 应用配置的用户覆盖层：设置面板「配置」页保存的字段（skillApiBase/window/hideDirs/hideFiles），
   // 与 app/app.config.json 默认值合并后生效（合并逻辑见 config.js mergeConfig）
@@ -153,6 +237,35 @@ class Settings {
     if (raw.effort !== undefined) s.effort = sanitizeEffort(raw.effort, s.effort)
     // 权限策略：校验归一化后整体替换（11 项齐全，缺失项回退默认）
     if (raw.permission !== undefined) s.permission = sanitizePermission(raw.permission)
+    // 联网搜索专用 API：Key 与其他模型 Key 一样用 safeStorage 加密；掩码值表示保留原 Key。
+    if (raw.websearch && typeof raw.websearch === 'object') {
+      const prev = s.websearch || DEFAULT_SETTINGS.websearch
+      const nextKey = raw.websearch.apiKey
+      s.websearch = {
+        apiBase:
+          typeof raw.websearch.apiBase === 'string' && raw.websearch.apiBase.trim()
+            ? raw.websearch.apiBase.trim()
+            : prev.apiBase || DEFAULT_SETTINGS.websearch.apiBase,
+        apiKey:
+          nextKey === MASK
+            ? prev.apiKey || ''
+            : encrypt(typeof nextKey === 'string' ? nextKey.trim() : ''),
+        count: Number.isFinite(Number(raw.websearch.count))
+          ? Math.min(50, Math.max(1, Math.round(Number(raw.websearch.count))))
+          : prev.count || DEFAULT_SETTINGS.websearch.count,
+        needContent:
+          typeof raw.websearch.needContent === 'boolean'
+            ? raw.websearch.needContent
+            : prev.needContent !== false,
+        // 只有主进程验证通过才允许注册 provider；无 Key/验证失败一律关闭 websearch。
+        valid:
+          nextKey === '' || nextKey === MASK
+            ? nextKey === MASK && prev.apiKey
+              ? prev.valid === true
+              : false
+            : raw.websearch.valid === true
+      }
+    }
     // 应用配置用户覆盖层：整体替换（配置内容已由主进程 config:save 校验）
     if (raw.config && typeof raw.config === 'object') s.config = raw.config
     // .agents 桥接开关：只接受布尔；其余形态忽略（保持原值）
@@ -206,6 +319,13 @@ class Settings {
       notifyTask: s.notifyTask,
       effort: { ...s.effort },
       permission: s.permission,
+      websearch: {
+        apiBase: s.websearch?.apiBase || DEFAULT_SETTINGS.websearch.apiBase,
+        apiKey: s.websearch?.apiKey ? MASK : '',
+        count: s.websearch?.count || DEFAULT_SETTINGS.websearch.count,
+        needContent: s.websearch?.needContent !== false,
+        valid: s.websearch?.valid === true
+      },
       agentsBridge: { enabled: s.agentsBridge?.enabled !== false },
       modelGroups: (s.modelGroups || []).map((g) => ({
         id: g.id,
@@ -223,6 +343,12 @@ class Settings {
     const env = {}
     for (const g of s.modelGroups || []) {
       if (g.apiKey) env[envVarOf(g.id)] = decrypt(g.apiKey)
+    }
+    if (s.websearch?.apiKey) {
+      env.XWORK_SEARCH_API_BASE = s.websearch.apiBase || DEFAULT_SETTINGS.websearch.apiBase
+      env.XWORK_SEARCH_API_KEY = decrypt(s.websearch.apiKey)
+      env.XWORK_SEARCH_COUNT = String(s.websearch.count || DEFAULT_SETTINGS.websearch.count)
+      env.XWORK_SEARCH_NEED_CONTENT = s.websearch.needContent === false ? '0' : '1'
     }
     return env
   }
@@ -316,6 +442,24 @@ function applyToOpencode(configFile, settings, opts = {}) {
     }
   }
   cfg.permissions = buildPermissionRules(s, opts)
+  // 联网搜索：有 Key 才注册 XWork 的 DeepSeek provider；每次 apply 都重写插件，
+  // 保证升级后插件代码同步，且旧配置中残留的 provider 选择会被清理。
+  if (s.websearch?.apiKey && s.websearch.valid === true) {
+    const pluginFile = writeWebSearchPlugin(configFile)
+    cfg.websearch = { provider: 'xwork-deepseek' }
+    const plugins = Array.isArray(cfg.plugins) ? cfg.plugins.slice() : []
+    if (!plugins.includes(pluginFile)) plugins.push(pluginFile)
+    cfg.plugins = plugins
+  } else {
+    // 未配置/验证失败：关闭整个 websearch，而不是回退到内置 provider。
+    cfg.websearch = false
+    removeWebSearchPlugin(configFile)
+    if (Array.isArray(cfg.plugins)) {
+      const stale = path.join(path.dirname(configFile), PLUGIN_DIR)
+      cfg.plugins = cfg.plugins.filter((p) => p !== stale)
+      if (!cfg.plugins.length) delete cfg.plugins
+    }
+  }
   fs.mkdirSync(path.dirname(configFile), { recursive: true })
   fs.writeFileSync(configFile, JSON.stringify(cfg, null, 2))
   // 注入 AI 身份指令：写入同目录的全局 AGENTS.md，opencode 启动时自动加载，无需改动 opencode.json

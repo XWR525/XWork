@@ -22,8 +22,9 @@ const DEFAULTS = {
   // 而 Gitea 的 API 是 /api/v1 → 实测 404。故拆成两步：latestApi 解析最新 release 的 tag，
   // downloadBase + tag 拼出该 release 的资产目录（latest.yml / 安装包 / 差分块三份都在那里）。
   updateSource: {
-    latestApi: 'http://192.168.99.201:8418/api/v1/repos/xuwr/XWork/releases/latest',
-    downloadBase: 'http://192.168.99.201:8418/xuwr/XWork/releases/download'
+    // 发布仓库：http://192.168.102.11:3004/xuwenrui/XWork/releases
+    latestApi: 'http://192.168.102.11:3004/api/v1/repos/xuwenrui/XWork/releases/latest',
+    downloadBase: 'http://192.168.102.11:3004/xuwenrui/XWork/releases/download'
   },
   window: { width: 1180, height: 780, minWidth: 900, minHeight: 600, backgroundColor: '#f2f4f8' },
   hideDirs: ['node_modules', '.git', '.svn', '.next', 'dist', 'build', 'out', '.venv', 'venv', '__pycache__', '.idea', '.vscode'],

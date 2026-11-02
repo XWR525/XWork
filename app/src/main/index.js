@@ -25,6 +25,18 @@ const { Settings, applyToOpencode, MASK, EFFORT_VARIANTS } = require('./settings
 const { restoreMissingFiles, restoreWorkspaceToSnapshot, collectUndoImpact } = require('./undo')
 const { TaskStore, Scheduler, isValidCron, nextRunAfter, normalizeTask, describeCron } = require('./tasks')
 const { TaskRunner } = require('./task-runner')
+const { StatsCounters } = require('./stats-counters')
+const {
+  isRange,
+  rangeToBounds,
+  heatmapBounds,
+  systemTimezone,
+  normalizeStats,
+  normalizeHeatmap,
+  basicStatsFromSessions,
+  isNotFound,
+  classifyStatsError
+} = require('./stats-core')
 const { ensureAgentsBridge, removeAgentsBridge } = require('./agents-bridge')
 const { statusWithGeneration } = require('./engine-status')
 const logger = require('./logger')
@@ -153,13 +165,15 @@ const opencodeConfig = path.join(xdgHome, 'config', 'opencode2', 'opencode.json'
 // 定时任务：任务存储 / 执行器 / 调度器
 // 调度器启动/停止随应用生命周期（仅应用运行时任务执行）；任务引擎惰性拉起，空闲 5 分钟回收
 const taskStore = new TaskStore(path.join(xdgHome, 'xwork-tasks.json'))
+const statsCounters = new StatsCounters(path.join(xdgHome, 'xwork-counters.json'))
 const taskRunner = new TaskRunner({
   store: taskStore,
   notify: taskNotify, // 任务通知：任务通知开关 + 仅窗口不在前台时弹（与 maybeNotify 同决策）
   settings,
   effectiveConfig,
   ensureGit: (dir, opts) => ensureWorkdirGit(dir, opts),
-  mainXdgHome: xdgHome
+  mainXdgHome: xdgHome,
+  onStatusChange: () => statsCounters.increment('taskRuns')
 })
 const taskScheduler = new Scheduler(taskStore, {
   // 命中回调：任务执行（定时与立即执行共用 taskRunner）；finally 释放调度器运行锁（防重入）
@@ -895,6 +909,112 @@ ipcMain.handle('file:show-in-folder', (_e, abs) => {
 
 ipcMain.handle('session:list', () => bridge.listSessions())
 
+// ---- 统计页（引擎实验接口 + 本地计数器）----
+// 总 deadline 贯穿 detail/summary/none；热力图独立 IPC，不阻塞首屏主统计。
+const STATS_DEADLINE_MS = 10000
+
+function statsEngineOff() {
+  return { ok: false, reason: 'engine_off', counters: statsCounters.all() }
+}
+
+async function fetchStatsWithFallback({ from, to, timezone, signal }) {
+  try {
+    return await bridge.getSessionStats({ from, to, timezone, tools: 'detail', signal })
+  } catch (e) {
+    if (isNotFound(e) || signal.aborted) throw e
+    try {
+      return await bridge.getSessionStats({ from, to, timezone, tools: 'summary', signal })
+    } catch (e2) {
+      if (signal.aborted) throw e2
+      return await bridge.getSessionStats({ from, to, timezone, tools: 'none', signal })
+    }
+  }
+}
+
+ipcMain.handle('stats:get', async (_e, opts = {}) => {
+  if (!bridge) return statsEngineOff()
+  const rangeKey = isRange(opts.range) ? opts.range : 'year'
+  const timezone = systemTimezone()
+  const { from, to } = rangeToBounds(rangeKey)
+  const controller = new AbortController()
+  const deadline = setTimeout(() => controller.abort(), STATS_DEADLINE_MS)
+  try {
+    const raw = await fetchStatsWithFallback({ from, to, timezone, signal: controller.signal })
+    return {
+      ok: true,
+      data: {
+        mode: 'full',
+        rangeKey,
+        from: from ?? null,
+        to,
+        stats: normalizeStats(raw),
+        counters: statsCounters.all(),
+        fetchedAt: Date.now()
+      }
+    }
+  } catch (e) {
+    if (isNotFound(e)) {
+      try {
+        const { rows, truncated } = await bridge.listSessionsWithMeta()
+        return {
+          ok: true,
+          data: {
+            mode: 'basic',
+            rangeKey,
+            from: from ?? null,
+            to,
+            stats: basicStatsFromSessions(rows),
+            basicTruncated: !!truncated,
+            counters: statsCounters.all(),
+            fetchedAt: Date.now()
+          }
+        }
+      } catch (e2) {
+        console.warn('[stats] basic fallback failed:', e2.message)
+        return { ok: false, reason: 'unsupported', counters: statsCounters.all() }
+      }
+    }
+    return {
+      ok: false,
+      reason: classifyStatsError(e),
+      message: e && e.message,
+      counters: statsCounters.all()
+    }
+  } finally {
+    clearTimeout(deadline)
+  }
+})
+
+ipcMain.handle('stats:heatmap', async () => {
+  if (!bridge) return statsEngineOff()
+  const timezone = systemTimezone()
+  const { from, to } = heatmapBounds()
+  const controller = new AbortController()
+  const deadline = setTimeout(() => controller.abort(), STATS_DEADLINE_MS)
+  try {
+    const raw = await bridge.getSessionStats({ from, to, timezone, tools: 'none', signal: controller.signal })
+    return {
+      ok: true,
+      data: {
+        heatmap: normalizeHeatmap(raw),
+        from,
+        to,
+        counters: statsCounters.all(),
+        fetchedAt: Date.now()
+      }
+    }
+  } catch (e) {
+    return {
+      ok: false,
+      reason: classifyStatsError(e),
+      message: e && e.message,
+      counters: statsCounters.all()
+    }
+  } finally {
+    clearTimeout(deadline)
+  }
+})
+
 ipcMain.handle('session:create', (_e, { title, permission }) =>
   // 显式带上当前工作区作为 location：V2 单进程可服务多目录，会话按 location 归属（切换工作区不再换进程）
   bridge.createSession(title, permission, engine.workspace())
@@ -980,6 +1100,7 @@ ipcMain.handle('session:undo-to', async (_e, sessionID, messageID) => {
       '[session:undo-to] impact:',
       imp.ok ? imp.impact.map((i) => `${i.type}:${i.path}`).join(' | ') || '(none)' : `skip (${imp.reason})`
     )
+    statsCounters.increment('undo')
     return {
       ok: true,
       restored: fb.ok ? [...fb.restored, ...fb.removed.map((p) => p + ' (删除)')] : [],
@@ -1313,6 +1434,43 @@ async function tryHotReload() {
   }
 }
 
+// 联网搜索验证：保存配置前做一次最小 DeepSeek 兼容搜索请求。
+// 只有返回 2xx 且 results 为数组才允许把 websearch 固定到该 provider；
+// 网络错误、401/403、非兼容响应都会让配置落为 websearch:false（失败即关闭）。
+async function validateWebSearch(apiBase, apiKey) {
+  const base = String(apiBase || 'https://api.deepseek.com/v1/tools/search').trim()
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 12000)
+  try {
+    const response = await fetch(base, {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer ' + apiKey,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        query: 'XWork search API validation',
+        count: 1,
+        need_content: false
+      }),
+      signal: controller.signal
+    })
+    if (!response.ok) {
+      const body = await response.text().catch(() => '')
+      return { ok: false, error: `HTTP ${response.status}` + (body ? `: ${body.slice(0, 160)}` : '') }
+    }
+    const data = await response.json().catch(() => null)
+    if (!data || !Array.isArray(data.results)) {
+      return { ok: false, error: '响应不是 DeepSeek 兼容格式（缺少 results 数组）' }
+    }
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, error: e?.name === 'AbortError' ? '验证请求超时' : e?.message || String(e) }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 // 保存设置：写入存储 + 应用 opencode.json。
 // restart=true 时**优先热重载**（V2 的 POST /api/location/reload：实测可热生效 provider/模型目录与权限规则，
 // 且不打断正在运行的任务），并用「引擎读回的配置 == 刚写入的文件」做校验；校验不过再回退为重启引擎。
@@ -1330,7 +1488,33 @@ ipcMain.handle('settings:save', async (_e, raw, restart = true) => {
   // （save 之后 load() 读到的已是新值，无法判断方向）
   const bridgeWasEnabled = settings.load().agentsBridge?.enabled !== false
   const portBefore = effectiveConfig().enginePort
+  // 联网搜索的 API/Key 通过引擎环境变量和本地插件生效；热重载不会重载插件文件，
+  // 因此只要这组配置变化就强制重启引擎，确保下一次 websearch 使用新配置。
+  const oldSearch = settings.load().websearch || {}
+  const searchBefore = JSON.stringify(settings.load().websearch || null)
+  let searchValidationError = null
+  if (raw?.websearch && typeof raw.websearch === 'object') {
+    const rawKey = typeof raw.websearch.apiKey === 'string' ? raw.websearch.apiKey : ''
+    const nextBase = String(raw.websearch.apiBase || 'https://api.deepseek.com/v1/tools/search').trim()
+    if (!rawKey) {
+      raw.websearch.valid = false
+    } else {
+      const key = rawKey === MASK ? settings.env().XWORK_SEARCH_API_KEY || '' : rawKey.trim()
+      const keyChanged = rawKey !== MASK
+      const baseChanged = nextBase !== (oldSearch.apiBase || 'https://api.deepseek.com/v1/tools/search')
+      // 权限页保存时即使 Key 未变，也重新验证一次（覆盖旧版本未验证/已失效状态）。
+      if (key && (keyChanged || baseChanged || (restart && oldSearch.valid !== true))) {
+        const result = await validateWebSearch(nextBase, key)
+        raw.websearch.valid = result.ok
+        if (!result.ok) {
+          searchValidationError = '联网搜索 Key 验证失败，已禁用联网搜索：' + result.error
+          console.warn('[settings] websearch validation failed:', result.error)
+        }
+      }
+    }
+  }
   settings.save(raw)
+  const searchAfter = JSON.stringify(settings.load().websearch || null)
   const bridgeNowEnabled = settings.load().agentsBridge?.enabled !== false
   if (bridgeWasEnabled && !bridgeNowEnabled) {
     // 遍历注册表摘链（设计 §5.5，评审 M-1）：只处理当前工作区会留下其它工作区的空壳
@@ -1341,7 +1525,9 @@ ipcMain.handle('settings:save', async (_e, raw, restart = true) => {
     }
   }
   applyToOpencode(opencodeConfig, settings)
-  if (!restart) return { ok: true, applied: 'none' }
+  if (!restart) {
+    return searchValidationError ? { ok: false, error: searchValidationError, applied: 'none' } : { ok: true, applied: 'none' }
+  }
   // 进程级配置（引擎端口）无法热重载，必须重启进程：命中则直接走重启分支
   const portAfter = effectiveConfig().enginePort
   if (portAfter !== portBefore) {
@@ -1356,7 +1542,25 @@ ipcMain.handle('settings:save', async (_e, raw, restart = true) => {
       console.error('[settings] 端口变更重启失败:', e.message)
       return { ok: false, error: '配置已保存，但引擎重启失败：' + (e.message || e) }
     }
-    return { ok: true, applied: 'restart', reason: 'engine_port_changed' }
+    return searchValidationError
+      ? { ok: false, error: searchValidationError, applied: 'restart', reason: 'engine_port_changed' }
+      : { ok: true, applied: 'restart', reason: 'engine_port_changed' }
+  }
+  if (searchBefore !== searchAfter) {
+    console.log('[settings] 联网搜索配置变更，重启引擎以加载插件/环境变量')
+    try {
+      await engine.stop()
+      await startEngineWithBridge({ force: true })
+    } catch (e) {
+      console.error('[settings] 联网搜索配置重启失败:', e.message)
+      return { ok: false, error: '联网搜索配置已保存，但引擎重启失败：' + (e.message || e) }
+    }
+    return searchValidationError
+      ? { ok: false, error: searchValidationError, applied: 'restart', reason: 'websearch_disabled' }
+      : { ok: true, applied: 'restart', reason: 'websearch_changed' }
+  }
+  if (searchValidationError) {
+    return { ok: false, error: searchValidationError, applied: 'disabled' }
   }
   const hot = await tryHotReload()
   if (hot.ok) {
@@ -1429,6 +1633,7 @@ ipcMain.handle('message:abort', async (_e, sessionID) => {
   try {
     const r = await bridge.abortMessage(sessionID)
     killEngineChildren() // 连带终止引擎为指令派生的子进程（python 等外部程序）
+    statsCounters.increment('abort')
     return r
   } catch (e) {
     // abort 失败也尽力清掉外部子进程，避免残留继续运行
@@ -1445,6 +1650,7 @@ ipcMain.handle('session:compact', async (_e, sessionID, model) => {
   }
   try {
     await bridge.compactSession(sessionID) // V2 compact 无需指定总结模型（引擎配置决定）
+    statsCounters.increment('compact')
     return { ok: true }
   } catch (e) {
     console.error('[session:compact] failed:', e.message)
@@ -1452,9 +1658,11 @@ ipcMain.handle('session:compact', async (_e, sessionID, model) => {
   }
 })
 
-ipcMain.handle('permission:respond', (_e, { sessionID, permissionID, response }) =>
-  bridge.respondPermission(sessionID, permissionID, response)
-)
+ipcMain.handle('permission:respond', async (_e, { sessionID, permissionID, response, source }) => {
+  const ok = await bridge.respondPermission(sessionID, permissionID, response)
+  if (ok && response === 'reject' && source === 'user') statsCounters.increment('permissionDeny')
+  return ok
+})
 
 // 回答 AI 的提问（ask 工具）：answers 为每题答案的字符串数组
 ipcMain.handle('question:reply', async (_e, requestID, answers) => {

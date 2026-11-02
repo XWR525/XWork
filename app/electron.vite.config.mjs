@@ -25,7 +25,9 @@ export default defineConfig({
           'agents-bridge': resolve(dir, 'src/main/agents-bridge.js'),
           'agents-selfcheck': resolve(dir, 'src/main/agents-selfcheck.js'),
           'agents-list': resolve(dir, 'src/main/agents-list.js'),
-          'engine-status': resolve(dir, 'src/main/engine-status.js')
+          'engine-status': resolve(dir, 'src/main/engine-status.js'),
+          'stats-core': resolve(dir, 'src/main/stats-core.js'),
+          'stats-counters': resolve(dir, 'src/main/stats-counters.js')
         }
       }
     }

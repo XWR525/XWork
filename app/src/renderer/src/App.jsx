@@ -34,6 +34,7 @@ import {
   FileText,
   FileVideo,
   Flag,
+  Flame,
   Folder,
   FolderOpen,
   Globe,
@@ -70,7 +71,8 @@ import {
   TrendingUp,
   Wrench,
   X,
-  XCircle
+  XCircle,
+  Zap
 } from 'lucide-react'
 import { __iconData as copyIconData } from 'lucide-react/dist/esm/icons/copy.mjs'
 import { sampleTotal, unwrapEmerge, wrapEmerge } from './emergeDom.mjs'
@@ -109,6 +111,25 @@ import {
   childSessionLabel,
   shortSid
 } from './sessionList.mjs'
+import {
+  RANGE_OPTIONS,
+  fmtInt,
+  fmtTokenCompact,
+  fmtPct,
+  fmtDuration,
+  fmtDateMD,
+  tokenTotal,
+  tokenSegments,
+  cacheHitRate,
+  currentStreak,
+  buildHeatmap,
+  percentShares,
+  topTools,
+  pickPersona,
+  bookEquiv,
+  fmtCharsWan,
+  nextHalfHourAt
+} from './stats.mjs'
 // ===== 渲染层跨组件上下文 =====
 // ⚠ 必须放在下方「marked 配置块」【之前】：验收脚本（Part B）会把该配置块整段塞进 Function 求值，
 // 那段里不能出现 createContext 之类的外部引用。
@@ -119,6 +140,11 @@ const RevealModeContext = createContext('emerge')
 // 贴底跟随的「内容长高」通知：揭示动画每帧只改组件本地 shown，消息数组不变 ⇒ App 的滚动 effect 不触发，
 // 视口会自己往上漂（"输出快结束时就不贴底"）。揭示层在 layout effect 里调它，滚动跟**真实高度**走。
 const ScrollFollowContext = createContext(null)
+const ScrollFollowControlContext = createContext(null)
+
+// 揭示进度按「会话/消息」持久化：主会话 ↔ 子会话、Work ↔ 其它页面切换时
+// TextBlock 会卸载重挂，不能只依赖组件内 useRef，否则会从 0 重播。
+const revealProgressByMessage = new Map()
 
 // 聊天内容列宽度（消息列表 + 输入框共用）
 const CHAT_COL_DEFAULT = 840
@@ -474,6 +500,53 @@ function normalize(list) {
   })
 }
 
+// 切走 Work 时 Work 整页会卸载，TextBlock 的本地揭示进度随之丢失。
+// 用当前已累积的正文长度写入 revealTo，重新挂载时直接从这里继续，避免整段重播。
+function markStreamedTextRevealed(ms) {
+  if (!Array.isArray(ms)) return ms
+  let changed = false
+  const next = ms.map((m) => {
+    if (!m.streaming && !m.streamed) return m
+    const md = (m.parts || [])
+      .filter((p) => p.type === 'text')
+      .map((p) => p.text || '')
+      .join('\n')
+    if (!md || (m.revealTo ?? 0) >= md.length) return m
+    changed = true
+    return { ...m, revealTo: md.length }
+  })
+  return changed ? next : ms
+}
+
+function childMessageText(m) {
+  return (m.parts || [])
+    .filter((p) => p.type === 'text')
+    .map((p) => p.text || '')
+    .join('\n')
+}
+
+// 子会话 GET 快照与实时镜像合并：保留镜像中已累积的更长正文，
+// 同时补入 GET 才有的用户提示/更早消息，避免点进子会话时从中间开始。
+function mergeChildSnapshot(live, snapshot) {
+  const liveById = new Map((live || []).map((m) => [m.id, m]))
+  const used = new Set()
+  const merged = []
+  for (const m of snapshot || []) {
+    const current = liveById.get(m.id)
+    if (!current) {
+      merged.push(m)
+    } else {
+      // 用户提示以快照为准；assistant 正文取更长的一份，兼容流式 GET 半截快照。
+      merged.push(
+        m.role === 'user' || childMessageText(current).length >= childMessageText(m).length ? current : m
+      )
+    }
+    used.add(m.id)
+  }
+  for (const m of live || []) if (!used.has(m.id)) merged.push(m)
+  return merged
+}
+
 // ---- 流式增量纯函数（事件处理与会话级流式缓存共用，不依赖组件状态） ----
 
 // 文本增量追加（message.part.delta）：优先按 partID 归属 reasoning，其次 text
@@ -519,14 +592,33 @@ function applyPartUpdated(ms, part, mid) {
   if (part.type === 'reasoning') {
     const i = ms.findIndex((m) => m.id === mid)
     if (i < 0) {
-      return [...ms, { id: mid, role: 'assistant', streaming: true, streamed: true, parts: [{ id: part.id, type: 'reasoning', text: part.text || '' }] }]
+      return [
+        ...ms,
+        {
+          id: mid,
+          role: 'assistant',
+          streaming: true,
+          streamed: true,
+          parts: [{ id: part.id, type: 'reasoning', text: part.text || '', streaming: part.streaming === true }]
+        }
+      ]
     }
     const clone = ms.slice()
     const m = clone[i]
     const parts = m.parts.slice()
-    const ri = parts.findIndex((x) => x.type === 'reasoning')
-    if (ri >= 0) parts[ri] = { ...parts[ri], id: part.id, text: part.text }
-    else parts.unshift({ id: part.id, type: 'reasoning', text: part.text || '' })
+    // 同一消息可能有多段 reasoning（r0/r1…）：必须按 id 定位，不能总更新第一个。
+    const ri = parts.findIndex((x) => x.type === 'reasoning' && x.id === part.id)
+    if (ri >= 0) {
+      parts[ri] = {
+        ...parts[ri],
+        id: part.id,
+        text: part.text,
+        // 事件未带状态时保留旧值，避免普通 part 更新提前关闭当前思考段。
+        streaming: part.streaming !== undefined ? part.streaming === true : parts[ri].streaming
+      }
+    } else {
+      parts.unshift({ id: part.id, type: 'reasoning', text: part.text || '', streaming: part.streaming === true })
+    }
     clone[i] = { ...m, parts, streaming: true, streamed: true }
     return clone
   }
@@ -575,6 +667,10 @@ function settleApply(ms, result) {
   }
   const idx = ms.findIndex((m) => m.id === result.info.id)
   const clone = ms.slice()
+  // 用户已切离 Work 时，页切离标记的 revealTo 必须跨 settle 保留，
+  // 否则最终结果替换消息后会再次从 0 开始揭示。
+  const prior = idx >= 0 ? clone[idx] : null
+  if (prior && prior.revealTo != null) final.revealTo = prior.revealTo
   if (idx >= 0) clone[idx] = final
   else clone.push(final)
   return clone
@@ -594,6 +690,9 @@ function digestSubagentPart(part, props) {
   const st = part.state || {}
   const childSid = childSessionId(st)
   if (!childSid) return // 一级降级：拿不到子会话 id 时不建摘要（卡片仍用 input 显示身份）
+  // 子代理工具一开始执行就建立空镜像，确保之后打开子会话时能拿到从第一步开始的增量，
+  // 而不是只从点击那一刻开始接收。
+  if (!subagentStream.has(childSid)) subagentStream.seed(childSid, [])
   const prev = subagentLive.get(childSid)
   const { patch } = livePatchFromSubagentPart(part, {
     prev,
@@ -611,6 +710,7 @@ function digestChildEvent(props, type) {
   if (!sid) return
   const prev = subagentLive.get(sid)
   if (!prev) return
+  if (!subagentStream.has(sid)) subagentStream.seed(sid, [])
   const { state, patch } = reduceChildEvent(prev._childState, type, props)
   patch._childState = state
   subagentLive.digest(sid, patch)
@@ -940,9 +1040,14 @@ export default function App() {
   const chatAreaRef = useRef(null)
   const listStickRef = useRef(true) // 对话区是否贴底：上滑即 false，滚回底部自动恢复
   const lastScrollTopRef = useRef(0) // 上一次 scrollTop：判定「用户是否真的往上滚」（见 onListScroll）
+  // 命令卡片展开/收起期间暂停程序化贴底：高度过渡只改变 scrollHeight，不移动 scrollTop。
+  const scrollSuppressUntilRef = useRef(0)
+  const scrollResumeTimerRef = useRef(null)
   const [showNewHint, setShowNewHint] = useState(false) // 上滑停止跟随期间有新内容时，显示「↓ 新消息」提示
   const currentRef = useRef(currentID)
   currentRef.current = currentID
+  const messagesRef = useRef(messages)
+  messagesRef.current = messages
   const compactingSidRef = useRef(null) // 正在压缩的会话 id：其 idle/error 事件到达时复位 compacting（压缩中切走也会复位，避免永久卡死）
   // 会话级流式消息缓存 { [sessionID]: 渲染结构消息数组 }：事件流增量始终写入缓存（不因切走丢弃），
   // 切回任务仍在跑的会话时用缓存恢复，避免引擎「流式中 GET 快照文本为空」导致正文截断
@@ -953,6 +1058,23 @@ export default function App() {
   expandedRef.current = expandedDirs
   const wsTimer = useRef(null) // 遮罩「已切换到」提示的收起定时器
   const wsPollBusy = useRef(false) // 文件树轮询防重入（上次未完成时跳过本次）
+
+  // 离开 Work 时对话树会卸载；先把当前已到达的流式正文标记为已揭示。
+  // 返回时 TextBlock 从该长度继续，而不是从 0 重播整段输出。
+  useEffect(() => {
+    if (page === 'chat') return
+    const sid = currentRef.current
+    if (!sid) return
+    const cached = streamCacheRef.current[sid]
+    const base = cached || messagesRef.current
+    if (!base) return
+    // 离页期间消息仍在增长：每次增量都把 revealTo 推到当前正文末尾。
+    // 这样返回时不会从离开点开始补打，而是直接从最新位置继续。
+    const revealed = markStreamedTextRevealed(base)
+    if (revealed === base) return
+    streamCacheRef.current[sid] = revealed
+    setMessages(revealed)
+  }, [page, messages])
 
   // 用户消息点状目录：只用于 Work 主会话；以 user 消息为跳转锚点
   const [outlineActive, setOutlineActive] = useState(null)
@@ -1084,14 +1206,7 @@ export default function App() {
         // 恢复时刻已累积的文本视为已揭示（revealTo）：直接显示全文，后续增量从该位置继续打字机
         // 口径必须与 MessageView 的 mdText 完全一致（join('\n')）：多 text part 时若用 join('')，
         // revealTo 会少 (parts-1) 个字符 ⇒ 恢复后会重打尾部几个字（设计 §5.9）
-        const restored = streamCacheRef.current[sid].map((m) => {
-          if (!m.streaming && !m.streamed) return m
-          const md = (m.parts || [])
-            .filter((p) => p.type === 'text')
-            .map((p) => p.text || '')
-            .join('\n')
-          return md ? { ...m, revealTo: md.length } : m
-        })
+        const restored = markStreamedTextRevealed(streamCacheRef.current[sid])
         streamCacheRef.current[sid] = restored // 同步缓存引用，保证后续增量基于同一份数组
         setMessages(restored)
       } else {
@@ -1485,12 +1600,12 @@ export default function App() {
           const action = globalPermAction(p.permission, permCfgRef.current)
           if (action === 'allow') {
             console.log('[perm.asked] global allow, auto-approving', p.id)
-            api.permissionRespond(p.sessionID, p.id, 'once')
+            api.permissionRespond(p.sessionID, p.id, 'once', 'auto')
               .then((ok) => console.log('[perm.asked] respond result:', ok))
               .catch((e) => console.error('[perm.asked] respond failed:', e.message))
           } else if (action === 'deny') {
             console.log('[perm.asked] global deny, auto-rejecting', p.id)
-            api.permissionRespond(p.sessionID, p.id, 'reject')
+            api.permissionRespond(p.sessionID, p.id, 'reject', 'auto')
               .then((ok) => console.log('[perm.asked] respond result:', ok))
               .catch((e) => console.error('[perm.asked] respond failed:', e.message))
           } else {
@@ -1655,7 +1770,8 @@ export default function App() {
     }
   }, [childPopOpen])
 
-  // 子会话下钻视图：进入时 seed 一次快照，之后由事件镜像驱动；离开即回收镜像（§5.7 同款语义）
+  // 子会话下钻视图：首次进入 seed 快照，之后由事件镜像驱动。
+  // 运行中离开时保留镜像，继续接收增量；否则重新进入会丢失离开期间的流式内容（半截消息）。
   useEffect(() => {
     if (!childViewSid) return
     let alive = true
@@ -1666,7 +1782,13 @@ export default function App() {
     window.xwork
       .messageList(childViewSid)
       .then((rows) => {
-        if (alive) subagentStream.seed(childViewSid, normalize(rows))
+        if (!alive) return
+        const snapshot = normalize(rows)
+        const current = subagentStream.get(childViewSid) || []
+        subagentStream.seed(
+          childViewSid,
+          current.length ? mergeChildSnapshot(current, snapshot) : snapshot
+        )
       })
       .catch((e) => {
         if (alive) setChildErr('加载子会话失败：' + ((e && e.message) || String(e)))
@@ -1694,7 +1816,13 @@ export default function App() {
       try {
         const rows = await window.xwork.messageList(childViewSid)
         failCount = 0
-        if (alive) subagentStream.seed(childViewSid, normalize(rows))
+        if (!alive) return
+        const snapshot = normalize(rows)
+        const current = subagentStream.get(childViewSid) || []
+        subagentStream.seed(
+          childViewSid,
+          current.length ? mergeChildSnapshot(current, snapshot) : snapshot
+        )
       } catch {
         failCount++
       }
@@ -1702,7 +1830,12 @@ export default function App() {
     return () => {
       alive = false
       clearInterval(timer)
-      subagentStream.drop(childViewSid)
+      // 仅终态回收；运行中保留镜像，保证切出期间的增量不丢。
+      const live = subagentLive.get(childViewSid)
+      const terminal = !!(
+        live && (live.phase === PHASE.completed || live.phase === PHASE.failed || live.phase === PHASE.cancelled)
+      )
+      if (terminal) subagentStream.drop(childViewSid)
     }
   }, [childViewSid])
 
@@ -1748,6 +1881,8 @@ export default function App() {
   // 上滑中且有新内容（viewMessages/busy 变化）时显示「↓ 新消息」提示；滚回底部自动隐藏并恢复跟随。
   // 依赖用 viewMessages 而不是 messages：子会话下钻视图里渲染的是子会话镜像（含进入时的一次 seed）
   useEffect(() => {
+    // 命令卡片高度过渡期间不跟随；否则会把卡片上方内容一起推走。
+    if (scrollSuppressUntilRef.current > performance.now()) return
     const el = listRef.current
     if (!el) return
     if (listStickRef.current) {
@@ -1809,13 +1944,34 @@ export default function App() {
   const nudgeScroll = useCallback(() => {
     const el = listRef.current
     if (!el || !listStickRef.current) return
+    if (scrollSuppressUntilRef.current > performance.now()) return
     el.scrollTop = el.scrollHeight
     lastScrollTopRef.current = el.scrollTop
   }, [])
 
-  // 卸载时取消滚动动画，避免 rAF 操作已销毁的列表
+  // 用户主动展开/收起命令卡片：暂停程序化贴底。结束后如果仍在底部才恢复跟随；
+  // 展开后通常已不在底部，必须保持 false，否则流式下一帧又会把上方内容顶走。
+  const pauseScrollFollow = useCallback((ms = 520) => {
+    if (scrollResumeTimerRef.current) clearTimeout(scrollResumeTimerRef.current)
+    scrollSuppressUntilRef.current = performance.now() + ms
+    scrollResumeTimerRef.current = setTimeout(() => {
+      scrollResumeTimerRef.current = null
+      scrollSuppressUntilRef.current = 0
+      const el = listRef.current
+      if (!el) return
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30
+      listStickRef.current = atBottom
+      if (atBottom) {
+        lastScrollTopRef.current = el.scrollTop
+        setShowNewHint(false)
+      }
+    }, ms + 20)
+  }, [])
+
+  // 卸载时取消滚动动画/恢复计时器，避免操作已销毁的列表
   useEffect(() => () => {
     if (scrollAnimRef.current != null) cancelAnimationFrame(scrollAnimRef.current)
+    if (scrollResumeTimerRef.current) clearTimeout(scrollResumeTimerRef.current)
   }, [])
 
   // 操作提示自动消失
@@ -1963,7 +2119,7 @@ export default function App() {
     if (!perm) return
     const { sessionID, id } = perm
     try {
-      await api.permissionRespond(sessionID, id, response)
+      await api.permissionRespond(sessionID, id, response, 'user')
     } catch (e) {
       console.error('permission respond failed', e)
     }
@@ -2110,13 +2266,25 @@ export default function App() {
   // （子树 childList 覆盖消息/详情新增，class 变化覆盖流式打字结束的时刻；rAF 合帧节流）
   useEffect(() => {
     let scheduled = false
-    const schedule = () => {
+    // 只有 Mermaid 区域的变化才需要后处理和补贴底；工具卡片展开/收起的普通 DOM 变化直接忽略。
+    const touchesMermaid = (m) => {
+      const target = m.target?.nodeType === 1 ? m.target : m.target?.parentElement
+      if (target?.closest?.('.md-mermaid')) return true
+      if (m.type === 'attributes' && target?.classList?.contains('md-body')) return true
+      for (const node of m.addedNodes || []) {
+        if (node.nodeType !== 1) continue
+        if (node.matches?.('.md-mermaid') || node.querySelector?.('.md-mermaid')) return true
+      }
+      return false
+    }
+    const schedule = (records) => {
+      if (records && !Array.from(records).some(touchesMermaid)) return
       if (scheduled) return
       scheduled = true
       requestAnimationFrame(() => {
         scheduled = false
         scanMermaid(document.body)
-        nudgeScroll() // mermaid 补渲染会改变高度：贴底时就地跟一下（否则视口被撑开）
+        nudgeScroll() // 仅 Mermaid 变化后补贴底；贴底跟随期间也会被暂停
       })
     }
     const observer = new MutationObserver(schedule)
@@ -2542,6 +2710,9 @@ export default function App() {
       const r = await api.saveSettings(form, restart)
       if (r && r.ok === false) {
         setToast(r.error || '保存失败')
+        // 保存失败时主进程可能已把联网搜索落为 false；重新拉取设置，
+        // 让权限页立即显示“禁止”，而不是保留旧的“允许”档位。
+        await loadModels()
         return
       }
       const applied = r && r.applied
@@ -2931,6 +3102,7 @@ export default function App() {
   return (
     // 揭示档位经 context 下发：穿透 MessageView 的 memo，切换即时生效（§5.6 / D9）
     <RevealModeContext.Provider value={streamReveal}>
+    <ScrollFollowControlContext.Provider value={pauseScrollFollow}>
     <ScrollFollowContext.Provider value={nudgeScroll}>
     <div className="app">
       {/* 最左侧窄导航栏：Work / 定时任务 / Hub / 设置（设置固定在栏底） */}
@@ -2981,7 +3153,7 @@ export default function App() {
             title={theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'}
             aria-label={theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'}
           >
-            {theme === 'dark' ? <Sun aria-hidden="true" /> : <Moon aria-hidden="true" />}
+            {theme === 'dark' ? <Moon aria-hidden="true" /> : <Sun aria-hidden="true" />}
           </button>
         </div>
       </aside>
@@ -3686,6 +3858,7 @@ export default function App() {
             <SettingsPanel
               key={settingsResetKey}
               data={settingsData}
+              active={page === 'settings'}
               busy={busy}
               theme={theme}
               streamReveal={streamReveal}
@@ -3930,6 +4103,7 @@ export default function App() {
       {toast && <div className="toast">{toast}</div>}
     </div>
     </ScrollFollowContext.Provider>
+    </ScrollFollowControlContext.Provider>
     </RevealModeContext.Provider>
   )
 }
@@ -4233,9 +4407,11 @@ function TasksPage({ notify, setConfirm, settingsData, workspace }) {
           <span className="tasks-title-sub">在指定工作区按时间计划自动执行 Agent 任务，完成后系统通知反馈</span>
           <span className="tasks-title-sub">请勿关闭电脑或退出客户端，否则任务将无法正常执行</span>
         </div>
-        <button className="tasks-create" onClick={openCreate}>
-          ＋ 新建任务
-        </button>
+        <div className="page-actions">
+          <button className="page-btn primary" onClick={openCreate}>
+            新建任务
+          </button>
+        </div>
       </div>
       <div className="tasks-body">
         {loading ? (
@@ -5068,12 +5244,511 @@ function GroupCard({
   )
 }
 
+// ── 统计页组件 ────────────────────────────────────────────────────────────────
+function statsErrorText(reason, message) {
+  if (reason === 'engine_off') return '执行引擎未连接，统计需要引擎启动后读取本地会话库'
+  if (reason === 'unsupported') return '当前引擎版本不支持完整统计'
+  if (reason === 'timeout') return '统计查询超时'
+  return message || '统计加载失败'
+}
+
+const STATS_TOOL_META = {
+  bash: { label: 'Shell', Icon: Terminal },
+  shell: { label: 'Shell', Icon: Terminal },
+  read: { label: '读取文件', Icon: FileText },
+  edit: { label: '编辑文件', Icon: Pencil },
+  write: { label: '编辑文件', Icon: Pencil },
+  grep: { label: '搜索内容', Icon: Search },
+  glob: { label: '查找文件', Icon: Search },
+  websearch: { label: '联网搜索', Icon: Globe },
+  webfetch: { label: '抓取网页', Icon: Globe },
+  subagent: { label: '子智能体', Icon: Bot },
+  task: { label: '子智能体', Icon: Bot },
+  todowrite: { label: '任务清单', Icon: ListChecks },
+  question: { label: '提问', Icon: MessagesSquare }
+}
+
+function StatsRangeSwitch({ value, onChange, disabled }) {
+  return (
+    <div className="stats-range" role="group" aria-label="统计时间范围">
+      {RANGE_OPTIONS.map((r) => (
+        <button
+          key={r.key}
+          type="button"
+          className={`stats-range-btn${value === r.key ? ' active' : ''}`}
+          aria-pressed={value === r.key}
+          disabled={disabled}
+          onClick={() => onChange(r.key)}
+        >
+          {r.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+// 统计数字缓动：区间变化时从旧值滚到新值（与静态预览一致）；首次渲染、减少动态时直接落值
+const animateToken = (v) => fmtTokenCompact(v)
+const animateInt = (v) => fmtInt(Math.round(v))
+const animateDays = (v) => String(Math.round(v))
+
+function AnimatedNumber({ value, format, className }) {
+  const ref = useRef(null)
+  const prevRef = useRef(null)
+  const rafRef = useRef(0)
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const next = Number(value) || 0
+    const prev = prevRef.current
+    prevRef.current = next
+    cancelAnimationFrame(rafRef.current)
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    if (prev === null || reduce || Math.abs(next - prev) < 0.01) {
+      el.textContent = format(next)
+      return
+    }
+    const start = performance.now()
+    const tick = (now) => {
+      const p = Math.min(1, (now - start) / 420)
+      const eased = 1 - Math.pow(1 - p, 3)
+      el.textContent = format(prev + (next - prev) * eased)
+      if (p < 1) rafRef.current = requestAnimationFrame(tick)
+      else el.textContent = format(next)
+    }
+    rafRef.current = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(rafRef.current)
+  }, [value, format])
+  return <span ref={ref} className={className} />
+}
+
+function StatsHero({ stats, heatmap }) {
+  const total = tokenTotal(stats.tokens)
+  const current = heatmap ? currentStreak(heatmap.activity) : 0
+  const longest = heatmap ? heatmap.streak : 0
+  const label = current > 0 ? '连续使用' : '最长连续'
+  const streakValue = heatmap ? (current > 0 ? current : longest) : null
+  const avg = stats.prompts > 0 ? stats.steps / stats.prompts : null
+  const callsAvg = stats.prompts > 0 ? stats.tools.totals.calls / stats.prompts : null
+  const success = stats.tools.totals.succeeded + stats.tools.totals.failed > 0
+    ? (stats.tools.totals.succeeded / (stats.tools.totals.succeeded + stats.tools.totals.failed)) * 100
+    : null
+  return (
+    <div className="stats-hero">
+      <div className="stats-hero-cell">
+        <div className="stats-hero-label"><Database size={13} strokeWidth={1.8} />总 Tokens</div>
+        <div className="stats-hero-value"><AnimatedNumber value={total} format={animateToken} /></div>
+        <div className="stats-hero-note">
+          {fmtTokenCompact(stats.tokens.input)} 输入 · {fmtTokenCompact(stats.tokens.output)} 输出 · {fmtTokenCompact(stats.tokens.reasoning)} 推理 · {fmtTokenCompact(stats.tokens.cacheRead)} 缓存
+          {stats.tokens.cacheWrite > 0 ? ` · 写入 ${fmtTokenCompact(stats.tokens.cacheWrite)}` : ''}
+        </div>
+      </div>
+      <div className="stats-hero-cell">
+        <div className="stats-hero-label"><Zap size={13} strokeWidth={1.8} />AI 请求</div>
+        <div className="stats-hero-value"><AnimatedNumber value={stats.steps} format={animateInt} /></div>
+        <div className="stats-hero-note">{avg === null ? '—' : `平均每条指令 ${avg.toFixed(1)} 轮`}</div>
+      </div>
+      <div className="stats-hero-cell">
+        <div className="stats-hero-label"><Wrench size={13} strokeWidth={1.8} />工具调用</div>
+        <div className="stats-hero-value">{stats.tools.mode === 'none' ? '—' : <AnimatedNumber value={stats.tools.totals.calls} format={animateInt} />}</div>
+        <div className="stats-hero-note">
+          {stats.tools.mode === 'none' || success === null ? '—' : `成功率 ${success.toFixed(1)}%`}
+          {callsAvg === null ? '' : ` · 平均每条指令 ${callsAvg.toFixed(1)} 次`}
+        </div>
+      </div>
+      <div className="stats-hero-cell">
+        <div className="stats-hero-label"><Flame size={13} strokeWidth={1.8} /><span>{label}</span></div>
+        <div className="stats-hero-value">{streakValue === null ? '—' : <><AnimatedNumber value={streakValue} format={animateDays} /><span className="stats-hero-suffix"> 天</span></>}</div>
+        <div className="stats-hero-note">
+          {heatmap ? `最近 52 周活跃 ${heatmap.activeDays} 天 · 最长 ${longest} 天` : '热力数据不可用'}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function StatsBasicHero({ stats }) {
+  return (
+    <div className="stats-hero stats-hero-basic">
+      <div className="stats-hero-cell">
+        <div className="stats-hero-label"><Database size={13} strokeWidth={1.8} />总 Tokens</div>
+        <div className="stats-hero-value">{fmtTokenCompact(tokenTotal(stats.tokens))}</div>
+        <div className="stats-hero-note">基础统计 · 会话生命周期 token</div>
+      </div>
+      <div className="stats-hero-cell">
+        <div className="stats-hero-label"><MessagesSquare size={13} strokeWidth={1.8} />会话</div>
+        <div className="stats-hero-value">{fmtInt(stats.sessions)}</div>
+        <div className="stats-hero-note">当前会话库 · 含空会话</div>
+      </div>
+      <div className="stats-hero-cell">
+        <div className="stats-hero-label"><Bot size={13} strokeWidth={1.8} />子智能体</div>
+        <div className="stats-hero-value">{fmtInt(stats.subagents)}</div>
+        <div className="stats-hero-note">当前会话库可见范围</div>
+      </div>
+    </div>
+  )
+}
+
+function TokenMixBar({ tokens }) {
+  const total = tokenTotal(tokens)
+  const segments = tokenSegments(tokens)
+  if (!total) return null
+  const chars = total * 0.7
+  const equiv = [`≈ ${fmtCharsWan(chars)}`, bookEquiv(chars)].filter(Boolean).join(' · ')
+  return (
+    <div className="stats-mix">
+      <div className="stats-mix-bar" aria-hidden="true">
+        {segments.map((s) => (
+          <span key={s.key} className={`stats-mix-seg seg-${s.key}`} style={{ width: `${s.pct}%` }} />
+        ))}
+      </div>
+      <div className="stats-mix-legend">
+        {segments.map((s) => (
+          <span key={s.key}><i className={`seg-${s.key}`} />{s.label} <b>{fmtTokenCompact(s.value)}</b></span>
+        ))}
+      </div>
+      <div className="stats-equiv"><Sparkles size={12} strokeWidth={1.8} />{equiv}</div>
+    </div>
+  )
+}
+
+function UsageHeatmap({ heatmap, loading }) {
+  if (!heatmap) {
+    return (
+      <section className="stats-panel stats-heat-panel">
+        <div className="stats-panel-head"><div><div className="stats-panel-title">使用热力</div><div className="stats-panel-sub">最近 52 周</div></div></div>
+        <div className="stats-empty-inline">{loading ? '热力加载中…' : '热力数据暂不可用'}</div>
+      </section>
+    )
+  }
+  const { weeks, cells, months } = buildHeatmap(heatmap.activity)
+  const label = `最近 52 周热力图，${heatmap.activeDays} 天活跃，最长连续 ${heatmap.streak} 天`
+  return (
+    <section className="stats-panel stats-heat-panel">
+      <div className="stats-panel-head">
+        <div>
+          <div className="stats-panel-title">使用热力</div>
+          <div className="stats-panel-sub">过去 52 周 · 颜色越深，当天模型回合越多</div>
+        </div>
+        <div className="stats-heat-legend" aria-hidden="true">
+          少
+          <i className="heat-l1" /><i className="heat-l2" /><i className="heat-l3" /><i className="heat-l4" />
+          多
+        </div>
+      </div>
+      <div className="stats-heat-wrap">
+        <div className="stats-heat">
+          <div className="stats-heat-months" style={{ gridTemplateColumns: `repeat(${weeks}, 14px)` }}>
+            {months.map((m) => (
+              <span key={m.start} style={{ gridColumn: `${m.start + 1} / span ${m.span}` }}>{m.label}</span>
+            ))}
+          </div>
+          <div className="stats-heat-body">
+            <div className="stats-heat-days" aria-hidden="true">
+              <span>一</span><span /><span>三</span><span /><span>五</span><span /><span />
+            </div>
+            <div
+              className="stats-heat-weeks"
+              role="img"
+              tabIndex={0}
+              aria-label={label}
+              style={{ gridTemplateColumns: `repeat(${weeks}, 14px)` }}
+            >
+              {cells.map((c) => (
+                <span
+                  key={c.date}
+                  className={`stats-heat-cell${c.future ? ' future' : ''} heat-l${c.level}`}
+                  title={c.future ? '' : `${c.date} · ${c.steps} 步`}
+                  aria-hidden="true"
+                />
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+      <div className="stats-heat-summary">
+        <span>最近 52 周（全部记录）</span><span className="sep">·</span>
+        <span><b>{fmtInt(heatmap.activeDays)}</b> 天活跃</span><span className="sep">·</span>
+        <span>最长连续 <b>{fmtInt(heatmap.streak)} 天</b></span>
+      </div>
+    </section>
+  )
+}
+
+function ToolLeaderboard({ tools }) {
+  if (!tools || tools.mode === 'none') return null
+  const totals = tools.totals
+  if (tools.mode === 'summary') {
+    return (
+      <section className="stats-panel">
+        <div className="stats-panel-head"><div><div className="stats-panel-title">工具榜</div><div className="stats-panel-sub">当前引擎仅返回工具汇总</div></div></div>
+        <div className="stats-summary-row"><span>调用 <b>{fmtInt(totals.calls)}</b></span><span>成功 <b>{fmtInt(totals.succeeded)}</b></span><span>失败 <b>{fmtInt(totals.failed)}</b></span></div>
+      </section>
+    )
+  }
+  const { rows, rest } = topTools(tools, 6)
+  const max = rows.reduce((a, x) => Math.max(a, x.calls), 1)
+  return (
+    <section className="stats-panel">
+      <div className="stats-panel-head">
+        <div><div className="stats-panel-title">工具榜</div><div className="stats-panel-sub">按调用次数排序 · 含子智能体</div></div>
+        <div className="stats-panel-sub">{fmtInt(totals.calls)} 次</div>
+      </div>
+      <div className="stats-tool-head" aria-hidden="true"><span>工具</span><span>调用</span><span>成功率</span><span>P50</span></div>
+      <div className="stats-tool-list">
+        {rows.map((t, i) => {
+          const meta = STATS_TOOL_META[t.name] || { label: t.name, Icon: Wrench }
+          const Icon = meta.Icon
+          const denom = t.succeeded + t.failed
+          const rate = denom > 0 ? (t.succeeded / denom) * 100 : null
+          return (
+            <div className={`stats-tool-row${i === 0 ? ' top' : ''}`} key={t.name}>
+              <div className="stats-tool-main">
+                <span className="stats-tool-ico"><Icon size={13} strokeWidth={1.8} /></span>
+                <span className="stats-tool-name"><b>{meta.label}</b><small>{t.name}</small></span>
+              </div>
+              <div className="stats-tool-calls">{fmtInt(t.calls)}</div>
+              <div className="stats-tool-rate">{rate === null ? '—' : <span className={`stats-rate ${rate >= 96 ? 'ok' : 'warn'}`}>{rate.toFixed(1)}%</span>}</div>
+              <div className="stats-tool-p50">{fmtDuration(t.durationP50)}</div>
+              <div className="stats-tool-track"><i style={{ width: `${Math.max(2, (t.calls / max) * 100)}%` }} /></div>
+            </div>
+          )
+        })}
+      </div>
+      <div className="stats-panel-foot">
+        <span>横条 = 相对调用量 · 成功率 = 成功 /（成功 + 失败）· P50 为中位数耗时</span>
+        {rest > 0 && <span>其他 {fmtInt(rest)} 次</span>}
+      </div>
+    </section>
+  )
+}
+
+function ModelLeaderboard({ models, modelsTotal }) {
+  if (!models || models.length === 0) return null
+  const top = models.slice(0, 3)
+  const used = top.reduce((a, m) => a + m.steps, 0)
+  const restSteps = Math.max(0, (modelsTotal?.steps || used) - used)
+  const shares = percentShares([...top.map((m) => m.steps), restSteps])
+  const totalSteps = modelsTotal?.steps || top.reduce((a, m) => a + m.steps, 0)
+  return (
+    <section className="stats-panel stats-model-panel">
+      <div className="stats-panel-head">
+        <div><div className="stats-panel-title">模型劳模榜</div><div className="stats-panel-sub">按模型调用次数 · 含子智能体</div></div>
+      </div>
+      <div className="stats-model-stack" aria-hidden="true">
+        {shares.map((pct, i) => (
+          <span key={i} className={`stats-model-seg model-seg-${i % 3}`} style={{ width: `${pct}%` }} />
+        ))}
+      </div>
+      <div className="stats-model-rows">
+        {top.map((m, i) => (
+          <div className="stats-model-row" key={m.providerID + '/' + m.id}>
+            <div className="stats-model-name">
+              <span className={`stats-model-dot model-seg-${i % 3}`} />
+              <b>{m.id}</b>
+              {i === 0 && <span className="stats-model-fav">最勤劳</span>}
+            </div>
+            <div className="stats-model-meta">
+              <b>{Math.round(shares[i])}%</b>
+              <small>{fmtInt(m.steps)} 次 · {fmtTokenCompact(m.tokens)}</small>
+            </div>
+          </div>
+        ))}
+        {restSteps > 0 && (
+          <div className="stats-model-row">
+            <div className="stats-model-name"><span className="stats-model-dot model-seg-2" /><b>其他</b></div>
+            <div className="stats-model-meta"><b>{Math.round(shares[top.length])}%</b><small>{fmtInt(restSteps)} 次</small></div>
+          </div>
+        )}
+      </div>
+      <div className="stats-model-foot">模型调用合计 {fmtInt(totalSteps)} 次 · 含子智能体</div>
+    </section>
+  )
+}
+
+function StatsFacts({ stats, rangeLabel }) {
+  const busiest = (stats.activity || []).reduce((best, x) => (!best || x.steps > best.steps ? x : best), null)
+  const avg = stats.prompts > 0 ? stats.steps / stats.prompts : null
+  const cache = cacheHitRate(stats.tokens)
+  return (
+    <div className="stats-facts">
+      <div className="stats-fact">
+        <div className="stats-fact-icon"><CalendarClock size={14} strokeWidth={1.8} /></div>
+        <div><b>{busiest ? fmtDateMD(busiest.date) : '—'}</b><span>最忙的一天</span><small>{busiest ? `当天 ${fmtInt(busiest.steps)} 步 · ${rangeLabel}` : '暂无记录'}</small></div>
+      </div>
+      <div className="stats-fact">
+        <div className="stats-fact-icon"><MessagesSquare size={14} strokeWidth={1.8} /></div>
+        <div><b>{avg === null ? '—' : `${avg.toFixed(1)} 轮`}</b><span>平均每条指令</span><small>含子智能体回合</small></div>
+      </div>
+      <div className="stats-fact">
+        <div className="stats-fact-icon"><Database size={14} strokeWidth={1.8} /></div>
+        <div><b>{cache === null ? '—' : fmtPct(cache)}</b><span>缓存命中率</span><small>一半上下文靠记忆，不是重新读</small></div>
+      </div>
+      <div className="stats-fact">
+        <div className="stats-fact-icon"><Bot size={14} strokeWidth={1.8} /></div>
+        <div><b>{fmtInt(stats.subagents)} 个</b><span>子智能体</span><small>你叫来的小弟，干活也算它们一份</small></div>
+      </div>
+    </div>
+  )
+}
+
+function StatsRelationship({ counters }) {
+  if (!counters) return null
+  const items = [
+    ['undo', '后悔药', '回退次数'],
+    ['abort', '急刹车', '手动中止'],
+    ['permissionDeny', '拒绝 AI', '权限拒绝'],
+    ['compact', '失忆', '压缩会话'],
+    ['taskRuns', '任务执行', '含立即执行']
+  ]
+  if (items.every(([k]) => !(counters[k] > 0))) return null
+  return (
+    <section className="stats-relationship">
+      <div className="stats-rel-copy"><h3>你和 AI 的相处</h3><p>自安装以来 · 本地计数，不随上方范围变化</p></div>
+      <div className="stats-rel-chips">
+        {items.map(([key, label, hint]) => (
+          <div className="stats-rel-chip" key={key} title={hint}><b>{fmtInt(counters[key])}</b><span>{label}</span></div>
+        ))}
+      </div>
+    </section>
+  )
+}
+
+function StatsSkeleton() {
+  return (
+    <div className="stats-skeleton" aria-hidden="true">
+      <div className="stats-skeleton-hero">{Array.from({ length: 4 }).map((_, i) => <i key={i} />)}</div>
+      <div className="stats-skeleton-block" />
+      <div className="stats-skeleton-panels"><i /><i /></div>
+    </div>
+  )
+}
+
+function StatsPanel({ data, heatmap, heatLoading, counters, loading, refreshing, error, partial, range, onRangeChange, onRefresh }) {
+  const rangeLabel = RANGE_OPTIONS.find((x) => x.key === range)?.label || ''
+  if (loading && !data) return <StatsSkeleton />
+  if (!data) {
+    return (
+      <div className="stats-state">
+        <div className="stats-state-icon"><TrendingUp size={28} strokeWidth={1.5} /></div>
+        <div className="stats-state-title">{error ? '统计加载失败' : '正在加载统计'}</div>
+        <div className="stats-state-sub">{error || '读取当前引擎会话库…'}</div>
+        <button className="stats-state-btn" onClick={onRefresh}>重试</button>
+        <StatsRelationship counters={counters} />
+      </div>
+    )
+  }
+
+  const stats = data.stats
+  const total = tokenTotal(stats.tokens)
+  const basic = data.mode === 'basic'
+  const empty = !basic && total === 0 && stats.steps === 0 && stats.prompts === 0
+  const persona = pickPersona(stats.tools)
+
+  return (
+    <div className={`stats-content${refreshing ? ' refreshing' : ''}`}>
+      <div className="stats-toolbar">
+        <div>
+          <div className="stats-eyebrow">INSIGHTS</div>
+          <div className="stats-title-row">
+            <h2>AI 工位成绩单</h2>
+            {persona && <span className="stats-persona"><Terminal size={11} strokeWidth={1.8} />{persona.name}</span>}
+          </div>
+          <p className="stats-sub">你和它一起干了多少活，以及你平时怎么用它。{persona ? persona.desc : ''}</p>
+        </div>
+        <StatsRangeSwitch value={range} onChange={onRangeChange} disabled={basic} />
+      </div>
+
+      {basic && (
+        <div className="stats-banner">
+          当前引擎版本不支持完整统计 · 当前会话库（可能不完整）{data.basicTruncated ? '（较旧记录可能被截断）' : ''}
+        </div>
+      )}
+      {partial && <div className="stats-banner">部分数据暂不可用，已显示可用部分</div>}
+      {error && <div className="stats-banner danger">{error}（显示上次数据）</div>}
+
+      {basic ? (
+        <>
+          <div className="stats-hero-panel"><StatsBasicHero stats={stats} /></div>
+          <StatsRelationship counters={counters} />
+        </>
+      ) : empty ? (
+        <div className="stats-state">
+          <div className="stats-state-icon"><TrendingUp size={28} strokeWidth={1.5} /></div>
+          <div className="stats-state-title">{range === 'all' ? '还没有可统计的会话' : `${rangeLabel}没有记录`}</div>
+          <div className="stats-state-sub">{range === 'all' ? '去 Work 里聊两句，这里就会有数据。' : '试试「今年」或「全部」，看看更早的记录。'}</div>
+          <StatsRelationship counters={counters} />
+        </div>
+      ) : (
+        <>
+          <div className="stats-hero-panel">
+            <StatsHero stats={stats} heatmap={heatmap} />
+            <TokenMixBar tokens={stats.tokens} />
+            <div className="stats-scope">
+              <span><b>{fmtInt(stats.sessions)}</b> 个会话</span><span className="sep">·</span>
+              <span><b>{fmtInt(stats.subagents)}</b> 个子智能体</span><span className="sep">·</span>
+              <span><b>{fmtInt(stats.prompts)}</b> 句话</span><span className="sep">·</span>
+              <span><b>{fmtInt(stats.activeDays)}</b> 个活跃日</span>
+            </div>
+          </div>
+
+          <UsageHeatmap heatmap={heatmap} loading={heatLoading} />
+
+          <div className="stats-split">
+            <ToolLeaderboard tools={stats.tools} />
+            <ModelLeaderboard models={stats.models} modelsTotal={stats.modelsTotal} />
+          </div>
+
+          <StatsFacts stats={stats} rangeLabel={rangeLabel} />
+          <StatsRelationship counters={counters} />
+        </>
+      )}
+    </div>
+  )
+}
+
+function StatsFooter({ updatedAt, loading, onRefresh }) {
+  const time = updatedAt ? new Date(updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : ''
+  return (
+    <div className="stats-footer-inner">
+      <div className="stats-footer-note"><ShieldCheck size={12} strokeWidth={1.8} />数据只存本地 · 当前引擎会话库（不含定时任务）</div>
+      <div className="stats-footer-right">
+        <span>{time ? `更新于 ${time}` : '—'}</span>
+        <button type="button" className="stats-refresh" disabled={loading} onClick={onRefresh}>
+          <RotateCcw size={12} strokeWidth={1.8} className={loading ? 'icon-spin' : ''} />刷新
+        </button>
+      </div>
+    </div>
+  )
+}
+
 // 设置面板：总览式（左侧导航 + 右侧内容），含「模型设置」「界面设置」「权限设置」「关于」
-function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, onThemeChange, onStreamRevealChange, onCloseActionChange, onNotifyTaskChange, onEffortChange, onClose, onSave, onSaveConfig }) {
-  const [tab, setTab] = useState('model') // model | appearance | permission | config | about
+function SettingsPanel({ data, active, busy, theme, streamReveal, appInfo, appConfig, onThemeChange, onStreamRevealChange, onCloseActionChange, onNotifyTaskChange, onEffortChange, onClose, onSave, onSaveConfig }) {
+  const [tab, setTab] = useState('model') // model | appearance | permission | config | stats | about
+  const [statsRange, setStatsRange] = useState('year')
+  const [statsData, setStatsData] = useState(null)
+  const [statsHeatmap, setStatsHeatmap] = useState(null)
+  const [statsHeatmapLoading, setStatsHeatmapLoading] = useState(false)
+  const [statsCounters, setStatsCounters] = useState({ undo: 0, abort: 0, permissionDeny: 0, compact: 0, taskRuns: 0 })
+  const [statsLoading, setStatsLoading] = useState(false)
+  const [statsRefreshing, setStatsRefreshing] = useState(false)
+  const [statsError, setStatsError] = useState('')
+  const [statsPartial, setStatsPartial] = useState(false)
+  const [statsUpdatedAt, setStatsUpdatedAt] = useState(0)
+  const statsCacheRef = useRef(new Map())
+  const statsInflightRef = useRef(new Map())
+  const statsHeatInflightRef = useRef(null)
+  const statsRangeRef = useRef('year')
+  const statsInitRef = useRef(false)
+  const statsNextTickRef = useRef(0)
   const [form, setForm] = useState(data)
   // effort 是即时保存的：只同步这一项，避免保存 effort 时把本地未提交的模型组编辑重置掉
   useEffect(() => setForm((f) => ({ ...f, effort: data.effort })), [data.effort])
+  // 保存失败后主进程会返回最新的 websearch.valid；同步到草稿，权限行立即反映强制禁用
+  useEffect(() => {
+    if (!data.websearch) return
+    setForm((f) => ({ ...f, websearch: { ...data.websearch } }))
+  }, [data.websearch])
   // 「配置」页表单草稿：由有效配置（默认值 + 用户覆盖层）异步到达后填充；多行字段以文本承载便于编辑
   const [configForm, setConfigForm] = useState(null)
   useEffect(() => {
@@ -5119,6 +5794,147 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
     const r = await window.xwork.updateCheck()
     if (!r.ok) setUpdate({ status: 'error', message: r.disabled ? '开发模式下不可用，请使用安装版验证' : r.error })
   }
+  // ---- 统计页：首屏加载一次；此后仅手动刷新或整点/半点自动更新；切区间不刷新 ----
+  const applyStatsRange = (rangeKey, d) => {
+    statsCacheRef.current.set(rangeKey, d)
+    if (rangeKey !== statsRangeRef.current) return
+    setStatsData(d)
+    setStatsUpdatedAt(d.fetchedAt || Date.now())
+    if (d.counters) setStatsCounters(d.counters)
+    setStatsError('')
+    if (d.mode === 'basic') setStatsPartial(false)
+  }
+
+  const fetchStatsRange = (rangeKey, { force = false } = {}) => {
+    if (!force) {
+      const cached = statsCacheRef.current.get(rangeKey)
+      if (cached) return Promise.resolve(cached)
+    }
+    const pending = statsInflightRef.current.get(rangeKey)
+    if (pending) return pending
+    const p = (async () => {
+      try {
+        const r = await window.xwork.sessionStats({ range: rangeKey })
+        if (!r || !r.ok) {
+          if (r && r.counters && rangeKey === statsRangeRef.current) setStatsCounters(r.counters)
+          if (rangeKey === statsRangeRef.current) setStatsError(statsErrorText(r && r.reason, r && r.message))
+          return null
+        }
+        applyStatsRange(rangeKey, r.data)
+        return r.data
+      } catch (e) {
+        if (rangeKey === statsRangeRef.current) setStatsError(e.message || '统计加载失败')
+        return null
+      } finally {
+        statsInflightRef.current.delete(rangeKey)
+      }
+    })()
+    statsInflightRef.current.set(rangeKey, p)
+    return p
+  }
+
+  const loadStatsHeatmap = () => {
+    if (statsHeatInflightRef.current) return statsHeatInflightRef.current
+    setStatsHeatmapLoading(true)
+    const p = (async () => {
+      try {
+        const r = await window.xwork.sessionHeatmap()
+        if (r && r.ok && r.data && r.data.heatmap) {
+          setStatsHeatmap(r.data.heatmap)
+          setStatsPartial(false)
+          if (r.data.counters) setStatsCounters(r.data.counters)
+        } else {
+          setStatsPartial(true)
+        }
+      } catch {
+        setStatsPartial(true)
+      } finally {
+        setStatsHeatmapLoading(false)
+        statsHeatInflightRef.current = null
+      }
+    })()
+    statsHeatInflightRef.current = p
+    return p
+  }
+
+  // 手动刷新：当前区间 + 热力图先刷新，随后静默刷新已缓存的其他区间
+  // 自动刷新（整点/半点）：只刷新当前区间 + 热力图，避免后台反复扫大库
+  const refreshStats = async ({ auto = false } = {}) => {
+    if (!auto) setStatsRefreshing(true)
+    setStatsError('')
+    const current = statsRangeRef.current
+    await Promise.all([fetchStatsRange(current, { force: true }), loadStatsHeatmap()])
+    if (!auto) setStatsRefreshing(false)
+    if (auto) return
+    for (const opt of RANGE_OPTIONS) {
+      if (opt.key !== current && statsCacheRef.current.has(opt.key)) await fetchStatsRange(opt.key, { force: true })
+    }
+  }
+
+  // 首次进入统计页：拉当前区间 + 热力图；随后后台预取其余区间，切换时直接命中缓存
+  useEffect(() => {
+    if (!active || tab !== 'stats' || statsInitRef.current) return
+    statsInitRef.current = true
+    loadStatsHeatmap()
+    setTimeout(() => {
+      ;(async () => {
+        for (const opt of RANGE_OPTIONS) {
+          if (opt.key === statsRangeRef.current) continue
+          await fetchStatsRange(opt.key)
+        }
+      })()
+    }, 600)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, tab])
+
+  // 切区间：优先用缓存（不请求）；仅当该区间从未加载成功时才做首次加载
+  useEffect(() => {
+    if (!active || tab !== 'stats') return
+    statsRangeRef.current = statsRange
+    const cached = statsCacheRef.current.get(statsRange)
+    if (cached) {
+      setStatsData(cached)
+      setStatsUpdatedAt(cached.fetchedAt || Date.now())
+      if (cached.counters) setStatsCounters(cached.counters)
+      setStatsError('')
+      setStatsLoading(false)
+      return
+    }
+    let alive = true
+    setStatsData(null)
+    setStatsError('')
+    setStatsLoading(true)
+    fetchStatsRange(statsRange).then(() => {
+      if (alive) setStatsLoading(false)
+    })
+    return () => {
+      alive = false
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, tab, statsRange])
+
+  // 自动刷新：只在统计页打开时挂定时器；离开期间跨过刷新点，回到统计页补一次
+  useEffect(() => {
+    if (!active || tab !== 'stats') return
+    let timerId = 0
+    const arm = () => {
+      clearTimeout(timerId)
+      const now = Date.now()
+      const next = nextHalfHourAt(now)
+      statsNextTickRef.current = next
+      timerId = setTimeout(() => {
+        refreshStats({ auto: true })
+        arm()
+      }, Math.max(500, next - now + 50))
+    }
+    if (statsInitRef.current && statsNextTickRef.current > 0 && Date.now() >= statsNextTickRef.current) {
+      refreshStats({ auto: true })
+    }
+    arm()
+    return () => clearTimeout(timerId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, tab])
+
   const resetDraft = () => setDraft({ ...EMPTY_DRAFT })
   const updateGroups = (updater) => setForm((f) => ({ ...f, modelGroups: updater(f.modelGroups || []) }))
   const removeGroup = (gi) => updateGroups((gs) => gs.filter((_, i) => i !== gi))
@@ -5268,8 +6084,11 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
         <div>
           <div className="page-eyebrow">偏好</div>
           <h1 className="page-title">设置</h1>
-          <p className="page-sub">模型、界面、权限与运行配置，修改后即时生效。</p>
+          <p className="page-sub">模型、界面、权限、运行配置与用量统计。修改后即时生效；统计只读，不改任何配置。</p>
         </div>
+        {tab === 'stats' && (
+          <div className="stats-head-meta"><ShieldCheck size={12} strokeWidth={1.8} />本地运行 · 数据不上传</div>
+        )}
       </div>
       <div className="settings-page-main">
         {/* 左侧导航：设置分类 */}
@@ -5286,6 +6105,9 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
           </button>
           <button className={`settings-nav-item ${tab === 'config' ? 'active' : ''}`} onClick={() => setTab('config')}>
             <FileText size={14} strokeWidth={1.8} aria-hidden="true" /> 配置
+          </button>
+          <button className={`settings-nav-item ${tab === 'stats' ? 'active' : ''}`} onClick={() => setTab('stats')}>
+            <TrendingUp size={14} strokeWidth={1.8} aria-hidden="true" /> 统计
           </button>
           <button className={`settings-nav-item ${tab === 'about' ? 'active' : ''}`} onClick={() => setTab('about')}>
             <Info size={14} strokeWidth={1.8} aria-hidden="true" /> 关于
@@ -5466,34 +6288,76 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
                 </div>
               </div>
 
+              {/* 联网搜索：DeepSeek 兼容 Search API（独立于模型组 Key） */}
+              <div className="set-group">
+                <div className="set-label">联网搜索</div>
+                <div className="set-hint">
+                  配置后，AI 的 websearch 工具将固定使用此 DeepSeek 兼容搜索 API，不启用其它搜索 provider。保存时会测试 Key；未配置或验证失败将完全禁用联网搜索。Key 加密保存，保存后自动重启引擎生效。
+                </div>
+                <div className="set-label" style={{ marginTop: 10 }}>搜索 API 地址</div>
+                <input
+                  className="set-input"
+                  type="text"
+                  placeholder="https://api.deepseek.com/v1/tools/search"
+                  value={form.websearch?.apiBase || ''}
+                  onChange={(e) =>
+                    setForm((f) => ({
+                      ...f,
+                      websearch: { ...(f.websearch || {}), apiBase: e.target.value }
+                    }))
+                  }
+                />
+                <div className="set-label" style={{ marginTop: 8 }}>搜索 API Key</div>
+                <input
+                  className="set-input"
+                  type="password"
+                  autoComplete="off"
+                  placeholder={form.websearch?.apiKey ? '已保存（留空修改；清空后保存即删除）' : '输入 DeepSeek API Key'}
+                  value={form.websearch?.apiKey || ''}
+                  onChange={(e) =>
+                    setForm((f) => ({
+                      ...f,
+                      websearch: { ...(f.websearch || {}), apiKey: e.target.value }
+                    }))
+                  }
+                />
+              </div>
+
               {/* 操作清单：每项三档（允许 / 询问 / 禁止） */}
               <div className="perm-list">
-                {PERMISSION_ITEMS.map((it) => (
-                  <div className="perm-item" key={it.key}>
-                    <div className="perm-item-info">
-                      <div className="perm-item-name">{it.label}</div>
-                      <div className="perm-item-desc">{it.desc}</div>
+                {PERMISSION_ITEMS.map((it) => {
+                  // 联网搜索只有 Key 验证通过才可配置权限；未配置/验证失败时强制显示禁止。
+                  const searchBlocked = it.key === 'websearch' && form.websearch?.valid !== true
+                  return (
+                    <div className={'perm-item' + (searchBlocked ? ' disabled' : '')} key={it.key}>
+                      <div className="perm-item-info">
+                        <div className="perm-item-name">{it.label}</div>
+                        <div className="perm-item-desc">
+                          {searchBlocked ? '未配置或 Key 验证失败，已强制禁用' : it.desc}
+                        </div>
+                      </div>
+                      <div className="perm-opts">
+                        {[
+                          ['allow', '允许'],
+                          ['ask', '询问'],
+                          ['deny', '禁止']
+                        ].map(([act, label]) => (
+                          <label key={act} className="perm-opt">
+                            <input
+                              type="radio"
+                              name={`perm-${it.key}`}
+                              data-action={act}
+                              checked={searchBlocked ? act === 'deny' : (form.permission && form.permission[it.key]) === act}
+                              disabled={searchBlocked}
+                              onChange={() => setPermItem(it.key, act)}
+                            />
+                            <span data-action={act}>{label}</span>
+                          </label>
+                        ))}
+                      </div>
                     </div>
-                    <div className="perm-opts">
-                      {[
-                        ['allow', '允许'],
-                        ['ask', '询问'],
-                        ['deny', '禁止']
-                      ].map(([act, label]) => (
-                        <label key={act} className="perm-opt">
-                          <input
-                            type="radio"
-                            name={`perm-${it.key}`}
-                            data-action={act}
-                            checked={(form.permission && form.permission[it.key]) === act}
-                            onChange={() => setPermItem(it.key, act)}
-                          />
-                          <span data-action={act}>{label}</span>
-                        </label>
-                      ))}
-                    </div>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
 
               <div className="set-hint">
@@ -5502,6 +6366,20 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
                 注意：历史会话中曾被设为「禁止」的操作类型仍会直接拒绝，需新建会话才彻底放开。
               </div>
             </>
+          ) : tab === 'stats' ? (
+            <StatsPanel
+              data={statsData}
+              heatmap={statsHeatmap}
+              heatLoading={statsHeatmapLoading}
+              counters={statsCounters}
+              loading={statsLoading}
+              refreshing={statsRefreshing}
+              error={statsError}
+              partial={statsPartial}
+              range={statsRange}
+              onRangeChange={setStatsRange}
+              onRefresh={() => refreshStats()}
+            />
           ) : tab === 'about' ? (
             <>
               <div className="perm-title">关于</div>
@@ -5718,15 +6596,23 @@ function SettingsPanel({ data, busy, theme, streamReveal, appInfo, appConfig, on
 
       {/* 底部操作栏：横跨整页，内容与设置版心对齐 */}
       <div className="settings-footer">
-        <div className="settings-footer-inner">
-          <button onClick={onClose}>取消</button>
-          <button onClick={handleSave}>保存</button>
-          {tab === 'model' && (
-            <button className="primary" disabled={busy} onClick={() => onSave(form, true)}>
-              保存并生效
-            </button>
-          )}
-        </div>
+        {tab === 'stats' ? (
+          <StatsFooter
+            updatedAt={statsUpdatedAt}
+            loading={statsLoading || statsRefreshing}
+            onRefresh={() => refreshStats()}
+          />
+        ) : (
+          <div className="settings-footer-inner">
+            <button onClick={onClose}>取消</button>
+            <button onClick={handleSave}>保存</button>
+            {tab === 'model' && (
+              <button className="primary" disabled={busy} onClick={() => onSave(form, true)}>
+                保存并生效
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       {/* 测试连接结果漂浮气泡：跟随测试按钮弹出；成功自动消失，失败手动关闭 */}
@@ -6393,6 +7279,7 @@ const ToolIOView = memo(function ToolIOView({ part }) {
 const ToolChip = memo(function ToolChip({ part }) {
   const [open, setOpen] = useState(false)
   const [renderBody, setRenderBody] = useState(false)
+  const pauseScrollFollow = useContext(ScrollFollowControlContext)
   useEffect(() => {
     if (open) {
       setRenderBody(true)
@@ -6433,7 +7320,11 @@ const ToolChip = memo(function ToolChip({ part }) {
     <div className="tool-row-wrap">
       <button
         className={`tool-row ${st}${open ? ' open' : ''}`}
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => {
+          // 高度过渡必须只改变布局，不触发贴底滚动；否则上方内容会被顶走并在收起时跳回。
+          pauseScrollFollow?.()
+          setOpen((o) => !o)
+        }}
         title={open ? '收起输入/输出' : '查看输入/输出'}
       >
         <span className="tool-ic">{icon}</span>
@@ -6457,17 +7348,28 @@ const ToolChip = memo(function ToolChip({ part }) {
 // 流式进行中强制展开（与 <details open={streaming}> 行为一致），结束后按用户选择
 // 思考文本内部独立滚动：贴底时跟随最新思考内容，上滑后停止跟随，滚回底部恢复
 function ReasoningBlock({ text, streaming }) {
-  const [open, setOpen] = useState(false)
-  const isOpen = open || streaming
+  const [open, setOpen] = useState(streaming === true)
+  const touchedRef = useRef(false) // 用户点过后，自动开/关不再覆盖用户选择
+  const isOpen = open
   const innerRef = useRef(null)
   const stickRef = useRef(true)
+  useEffect(() => {
+    // 单段思考开始自动展开、结束自动收起；用户手动操作过则保持用户状态。
+    if (!touchedRef.current) setOpen(streaming === true)
+  }, [streaming])
   useEffect(() => {
     const el = innerRef.current
     if (el && stickRef.current) el.scrollTop = el.scrollHeight
   }, [text])
   return (
     <div className="reasoning">
-      <button className={`reasoning-summary${isOpen ? ' open' : ''}`} onClick={() => setOpen((o) => !o)}>
+      <button
+        className={`reasoning-summary${isOpen ? ' open' : ''}`}
+        onClick={() => {
+          touchedRef.current = true
+          setOpen((o) => !o)
+        }}
+      >
         <ChevronRight className="reasoning-caret" size={11} strokeWidth={2} aria-hidden="true" />
         思考过程
       </button>
@@ -6507,7 +7409,7 @@ function SubagentNoticeRow({ m }) {
     return (
       <div className="row assistant">
         <div className="bubble assistant">
-          <div className="tool-chip completed"><Bot size={13} strokeWidth={1.8} aria-hidden="true" /> 后台完成通知已并入上方子智能体卡片</div>
+          <div className="tool-chip completed subagent-notice"><Bot size={13} strokeWidth={1.8} aria-hidden="true" /> 后台完成通知已并入上方子智能体卡片</div>
         </div>
       </div>
     )
@@ -6563,15 +7465,22 @@ const SubagentChildView = memo(function SubagentChildView({ childSid, agent }) {
     window.xwork
       .messageList(childSid)
       .then((rows) => {
-        if (alive) subagentStream.seed(childSid, normalize(rows))
+        if (!alive) return
+        const snapshot = normalize(rows)
+        const current = subagentStream.get(childSid) || []
+        subagentStream.seed(childSid, current.length ? mergeChildSnapshot(current, snapshot) : snapshot)
       })
       .catch((e) => {
         if (alive) setErr('加载子会话失败：' + ((e && e.message) || String(e)))
       })
-    // 收起即回收（设计 §5.7：收起/终态/切会话即停止并释放）
+    // 仅终态回收；运行中收起后保留镜像，保证再次展开不出现半截正文。
     return () => {
       alive = false
-      subagentStream.drop(childSid)
+      const live = subagentLive.get(childSid)
+      const terminal = !!(
+        live && (live.phase === PHASE.completed || live.phase === PHASE.failed || live.phase === PHASE.cancelled)
+      )
+      if (terminal) subagentStream.drop(childSid)
     }
   }, [childSid])
 
@@ -6602,7 +7511,9 @@ const SubagentChildView = memo(function SubagentChildView({ childSid, agent }) {
       try {
         const rows = await window.xwork.messageList(childSid)
         failRef.current = 0
-        subagentStream.seed(childSid, normalize(rows))
+        const snapshot = normalize(rows)
+        const current = subagentStream.get(childSid) || []
+        subagentStream.seed(childSid, current.length ? mergeChildSnapshot(current, snapshot) : snapshot)
         setPollErr('')
       } catch (e) {
         failRef.current++
@@ -6828,12 +7739,17 @@ const MessageView = memo(function MessageView({ m, showName = true, onCopy, onUn
             XWORK
           </div>
         ) : null}
-        {m.aborted && <div className="aborted-badge">已停止（输出不完整）</div>}
         {m.error && !m.aborted && <div className="msg-error">回复失败：{m.error}</div>}
         {m.parts.map((p, i) => {
           if (p.type === 'text') return null // 文本统一由下方 TextBlock 渲染
           if (p.type === 'reasoning') {
-            return <ReasoningBlock key={i} text={p.text} streaming={m.streaming} />
+            return (
+              <ReasoningBlock
+                key={i}
+                text={p.text}
+                streaming={p.streaming === true && m.streaming === true}
+              />
+            )
           }
           if (p.type === 'tool') {
             // 子智能体（L1）：改渲染 <SubagentCard>（取代 [工具] subagent · 完成 的灰 chip）
@@ -6844,7 +7760,18 @@ const MessageView = memo(function MessageView({ m, showName = true, onCopy, onUn
           }
           return null
         })}
-        {mdText.trim() && <TextBlock key="text" text={mdText} streamed={m.streamed} revealTo={m.revealTo} streaming={m.streaming} />}
+        {mdText.trim() && (
+          <TextBlock
+            key="text"
+            revealKey={(parentSid || 'local') + ':' + m.id}
+            text={mdText}
+            streamed={m.streamed}
+            revealTo={m.revealTo}
+            streaming={m.streaming}
+          />
+        )}
+        {/* 中止标记放在所有内容之后，提示这是本条输出的结尾。 */}
+        {m.aborted && <div className="aborted-badge">已停止（输出不完整）</div>}
       </div>
       {/* 只读视图（子会话下钻）不提供复制按钮 —— 用户拍板：子会话只读，去掉「回退至此」「复制」 */}
       {mdText.trim() && !m.streaming && !m.aborted && !readOnly && (
@@ -6862,13 +7789,31 @@ const MessageView = memo(function MessageView({ m, showName = true, onCopy, onUn
 //   只跟 shown 会让 mermaid 用截断围栏源码渲染，并让光标在追平空档熄灭
 // progress：揭示进度 { shown, carry, rateCps, samples, seeded, seededAt }，**在 TextBlock 持有**。
 //   切档只换子组件、不换状态所有者 ⇒ 进度不重置（P1：否则从 revealTo 重打一遍）
-function TextBlock({ text, streamed, revealTo, streaming }) {
+function TextBlock({ revealKey, text, streamed, revealTo, streaming }) {
   const mode = useContext(RevealModeContext)
   const progressRef = useRef(null)
   if (!progressRef.current) {
-    progressRef.current = { shown: revealTo ?? 0, carry: 0, rateCps: 0, samples: [], seeded: false, seededAt: 0 }
+    // 先恢复上次卸载时的进度；若离页期间 revealTo 已推进到最新正文，
+    // 取两者较大值，避免返回时又从离开点补打。
+    const saved = revealKey ? revealProgressByMessage.get(revealKey) : null
+    progressRef.current = saved
+      ? { ...saved, shown: Math.max(saved.shown || 0, revealTo ?? 0) }
+      : {
+          shown: revealTo ?? 0,
+          carry: 0,
+          rateCps: 0,
+          samples: [],
+          seeded: false,
+          seededAt: 0
+        }
   }
   const progress = progressRef.current
+  // 视图切换会卸载 TextBlock；保存最新进度，重新挂载时从该位置继续。
+  useEffect(() => {
+    return () => {
+      if (revealKey) revealProgressByMessage.set(revealKey, progressRef.current)
+    }
+  }, [revealKey])
   // 换档后重新播种水位环：打字机档期间到达的文字不该在切回浮现时再浮一次
   // （播种帧不包裹，见 emergeDom.sampleTotal；shown/carry 保持不动 ⇒ 进度不倒退）
   const modeRef = useRef(mode)
