@@ -93,7 +93,7 @@ const DEFAULT_SETTINGS = {
   modelGroups: [],
   // 模型使用统计：providerID/modelID → 消息发送计数（新对话默认最常用模型）
   modelUsage: {},
-  workspace: '', // 当前工作区目录（空 = 默认启动目录）
+  workspace: '', // 当前工作区目录（空 = 尚未选择；不启动引擎，也不回退安装目录）
   theme: 'light', // 界面主题：dark | light（仅影响渲染层，不参与引擎配置）
   // 流式正文揭示效果：emerge = 浮现（默认，模糊→清晰）| typewriter = 打字机（逐字直出，改造前的行为）
   // 纯渲染层偏好，切换即时生效、不重启引擎（设计 §5.6）

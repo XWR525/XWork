@@ -8,6 +8,7 @@ import { advanceTypewriterBurst, TW_TICK_MS } from './typewriter.mjs'
 import { easeInOutCubic, iconSize, MORPH_MS, rotateDeg, shapePoints, SIZE_SEND } from './sendButtonMorph.mjs'
 import {
   Bot,
+  Brain,
   CalendarClock,
   Check,
   CheckCircle2,
@@ -184,8 +185,13 @@ marked.use({
         return `<div class="md-mermaid"><pre><code class="hljs language-plaintext">${escapeHtml(text)}</code></pre></div>`
       }
       const name = language && hljs.getLanguage(language) ? language : 'plaintext'
+      // 代码语言与复制按钮同处底栏：保留作者在围栏上声明的语言名；未声明时不显示，
+      // 避免所有无语言代码块都出现无意义的 text 标签。
+      const langTag = language
+        ? `<span class="code-lang">${escapeHtml(language)}</span>`
+        : ''
       const copyBtn = `<button type="button" class="code-copy" title="复制代码" aria-label="复制代码">${lucideSvg(copyIconData, 12, 1.8)}<span class="code-copy-label">复制</span></button>`
-      return `<div class="code-block">${copyBtn}<pre><code class="hljs language-${name}">${hljs.highlight(text, { language: name }).value}</code></pre></div>`
+      return `<div class="code-block">${langTag}${copyBtn}<pre><code class="hljs language-${name}">${hljs.highlight(text, { language: name }).value}</code></pre></div>`
     }
   }
 })
@@ -863,6 +869,53 @@ const effortVariantOf = (level, enabled) => (enabled && EFFORT_VARIANTS.includes
 // 会话 model.variant → 档位：default/缺失/未知值 → default
 const effortFromSession = (variant, enabled) => (enabled && EFFORT_VARIANTS.includes(variant) ? variant : 'default')
 
+// 首次启动 / 工作区被删除后的强制入口：未选择工作区时不渲染对话区与输入框。
+// 安装目录绝不再作为兜底工作区，用户必须先明确选择 AI 可以读写的目录。
+function WorkspaceGate({ onPick, onOpen, recent, switching }) {
+  return (
+    <div className="workspace-gate">
+      <section className="workspace-gate-card" aria-labelledby="workspace-gate-title">
+        <div className="workspace-gate-icon" aria-hidden="true">
+          <FolderOpen size={25} strokeWidth={1.7} />
+        </div>
+        <div className="workspace-gate-eyebrow">WORKSPACE</div>
+        <h1 className="workspace-gate-title" id="workspace-gate-title">选择一个工作区开始</h1>
+        <p className="workspace-gate-sub">
+          XWork 只会在这个文件夹内读取和修改文件。安装目录不会再被自动当作工作区。
+        </p>
+        <button className="workspace-gate-pick" type="button" onClick={onPick} disabled={switching}>
+          {switching ? <span className="workspace-gate-spinner" /> : <FolderOpen size={15} strokeWidth={1.8} />}
+          <span>{switching ? '正在打开工作区…' : '选择工作区文件夹'}</span>
+          {!switching && <ChevronRight size={15} strokeWidth={1.8} />}
+        </button>
+        {recent.length > 0 && (
+          <div className="workspace-gate-recent">
+            <div className="workspace-gate-recent-label">最近使用</div>
+            {recent.map((w) => (
+              <button
+                key={w.dir}
+                type="button"
+                className="workspace-gate-recent-item"
+                onClick={() => onOpen(w.dir)}
+                disabled={switching}
+                title={w.dir}
+              >
+                <FolderOpen size={14} strokeWidth={1.8} />
+                <span className="workspace-gate-recent-main">
+                  <b>{w.name || w.dir.split(/[\\/]/).pop() || w.dir}</b>
+                  <small>{w.dir}</small>
+                </span>
+                <ChevronRight size={13} strokeWidth={1.8} />
+              </button>
+            ))}
+          </div>
+        )}
+        <div className="workspace-gate-note">选择后会在该目录初始化 Git，并启动本地 AI 引擎。</div>
+      </section>
+    </div>
+  )
+}
+
 export default function App() {
   const [engine, setEngine] = useState({ running: false, version: null, port: 4096 })
   const [engineError, setEngineError] = useState('')
@@ -912,6 +965,8 @@ export default function App() {
   runningRef.current = runningSessions
   // 当前会话视角的 busy：保持既有语义，所有调用点（输入区、停止、禁用态）无需改动
   const busy = !!currentID && runningSessions.has(currentID)
+  // 工作区任意会话执行中：所有可能导致引擎重启的主动操作都必须被限制。
+  const engineBusy = runningSessions.size > 0
   // 运行中会话的计时展示：每秒刷新一次「运行中 · mm:ss」（没有运行中会话时不挂定时器）
   const [nowTs, setNowTs] = useState(Date.now())
   useEffect(() => {
@@ -1011,6 +1066,9 @@ export default function App() {
 
   // 工作区：当前目录 + 文件树（懒加载）+ 已添加文件（相对路径清单）
   const [workspace, setWorkspace] = useState('')
+  // 首次同步完成前不显示「选择工作区」页，避免已有工作区的用户看到闪屏
+  const [workspaceReady, setWorkspaceReady] = useState(false)
+  const [gateWs, setGateWs] = useState([]) // 选择工作区页的最近使用（最多 3 个）
   const [wsChildren, setWsChildren] = useState({}) // 目录绝对路径 -> [{name,type}]
   const [expandedDirs, setExpandedDirs] = useState({}) // 已展开目录绝对路径 -> true
   const [addedFiles, setAddedFiles] = useState([]) // 已添加文件（相对工作区路径，发送时注入）
@@ -1079,6 +1137,7 @@ export default function App() {
   // 用户消息点状目录：只用于 Work 主会话；以 user 消息为跳转锚点
   const [outlineActive, setOutlineActive] = useState(null)
   const [outlineHover, setOutlineHover] = useState(null)
+  const outlineHideTimerRef = useRef(null)
   const scrollAnimRef = useRef(null)
 
   // 500ms 自定义滚动动画：目标位置每帧实时计算，动态内容不会留旧坐标
@@ -1136,10 +1195,19 @@ export default function App() {
           .join('\n')
           .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '')
           .trim()
-        return { id: m.id, index, full: full || '（附件消息）' }
+        return { id: m.id, index, full: full || '（附件消息）', time: m.time || null }
       })
       .filter(Boolean)
   }, [messages, isChildView])
+
+  const dismissOutlineTip = useCallback(() => {
+    if (outlineHideTimerRef.current) clearTimeout(outlineHideTimerRef.current)
+    setOutlineHover((h) => (h ? { ...h, visible: false } : h))
+    outlineHideTimerRef.current = setTimeout(() => {
+      outlineHideTimerRef.current = null
+      setOutlineHover(null)
+    }, 180)
+  }, [])
 
   const jumpToUser = useCallback((id) => {
     const list = listRef.current
@@ -1149,23 +1217,29 @@ export default function App() {
     listStickRef.current = false
     setShowNewHint(false)
     setOutlineActive(id)
-    setOutlineHover(null)
+    dismissOutlineTip()
     animateScrollTop(list, () => {
       const target = list.querySelector(selector)
       if (!target) return list.scrollTop
       return list.scrollTop + target.getBoundingClientRect().top - list.getBoundingClientRect().top - 10
     })
-  }, [animateScrollTop])
+  }, [animateScrollTop, dismissOutlineTip])
 
   const showOutlineTip = (item, event) => {
     const list = listRef.current
     if (!list) return
+    if (outlineHideTimerRef.current) clearTimeout(outlineHideTimerRef.current)
+    outlineHideTimerRef.current = null
     const r = event.currentTarget.getBoundingClientRect()
     const lr = list.getBoundingClientRect()
     const rawTop = r.top - lr.top + r.height / 2
-    const top = Math.max(48, Math.min(lr.height - 48, rawTop))
-    setOutlineHover({ id: item.id, full: item.full, top })
+    const top = Math.max(42, Math.min(lr.height - 42, rawTop))
+    setOutlineHover({ id: item.id, full: item.full, time: item.time, top, visible: true })
   }
+
+  useEffect(() => () => {
+    if (outlineHideTimerRef.current) clearTimeout(outlineHideTimerRef.current)
+  }, [])
 
   const api = window.xwork
 
@@ -1247,6 +1321,8 @@ export default function App() {
       }
     } catch (e) {
       console.error('load workspace failed', e)
+    } finally {
+      setWorkspaceReady(true)
     }
   }
 
@@ -1345,6 +1421,10 @@ export default function App() {
         return
       }
       const ws = r.status?.workspace || dir
+      // 首次选择工作区时引擎由这次 workspaceSwitch 拉起：必须同步运行状态，
+      // 否则顶栏会一直「未连接」，推理强度等依赖 engine.running 的控件也保持禁用。
+      if (r.status) setEngine((prev) => ({ ...prev, ...r.status }))
+      setEngineError('')
       setWorkspace(ws)
       setCurrentID(null)
       setChildViewSid(null) // 切工作区 ⇒ 退出子会话视图
@@ -1386,6 +1466,7 @@ export default function App() {
 
   // 选择并切换到新工作区（系统目录选择对话框）
   const openWorkspace = async () => {
+    if (wsSwitching) return
     try {
       const dir = await api.workspacePick()
       if (dir) await switchTo(dir)
@@ -1393,6 +1474,23 @@ export default function App() {
       setToast('选择工作区失败: ' + e.message)
     }
   }
+
+  // 无工作区时加载最近使用（只展示仍存在的目录），给老用户一个快速入口
+  useEffect(() => {
+    if (!workspaceReady || workspace) return
+    let alive = true
+    api
+      .workspaceList()
+      .then((list) => {
+        if (!alive) return
+        const usable = (list || []).filter((w) => w && w.dir && w.exists !== false)
+        setGateWs(usable.slice(0, 3))
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [workspaceReady, workspace])
 
   // 「所有工作区」折叠列表：展开时从会话数据聚合各工作区（目录名 + 会话数 + 最近使用）
   const [wsAllOpen, setWsAllOpen] = useState(false)
@@ -1672,12 +1770,24 @@ export default function App() {
           break
       }
     })
-    // 启动引擎
-    api.engineStart().then((st) => {
-      setEngine(st)
-      if (st.running) refreshSessions()
-      loadWorkspace()
-    })
+    // 启动引擎；未选择工作区时主进程只返回 needsWorkspace，不拉起安装目录引擎
+    api
+      .engineStart()
+      .then((st) => {
+        setEngine(st)
+        if (st.running) refreshSessions()
+        if (st.needsWorkspace) {
+          setWorkspace('')
+          setWorkspaceReady(true)
+        } else {
+          loadWorkspace()
+        }
+      })
+      .catch((e) => {
+        console.error('engine start failed', e)
+        setEngineError('引擎启动失败: ' + e.message)
+        setWorkspaceReady(true)
+      })
     // 清理事件监听（onEvent 返回 unsubscribe），避免 HMR 重挂载时累积监听器
     return off
   }, [])
@@ -1918,7 +2028,7 @@ export default function App() {
     } else if (cur < prev) {
       listStickRef.current = false
     }
-    setOutlineHover((h) => (h ? null : h))
+    dismissOutlineTip()
     updateOutlineActive()
   }
 
@@ -2019,6 +2129,10 @@ export default function App() {
   const send = async () => {
     const text = input.trim()
     if (!text || busy || compacting) return // 压缩进行中禁止发送
+    if (!workspace) {
+      setToast('请先选择工作区')
+      return
+    }
     // 已添加的工作区文件以 opencode @引用语法注入提示词（与引擎原生「@文件名」交互方式一致）
     let finalText = text
     if (addedFiles.length) {
@@ -2612,11 +2726,21 @@ export default function App() {
     })
   }
 
+  // 引擎重启/保存生效的统一拦截：工作期间禁止主动打断，并明确告知原因。
+  const blockEngineOperation = (label) => {
+    if (!engineBusy) return false
+    setToast(
+      `XWork 正在工作：当前有 ${runningSessions.size} 个会话正在执行，暂不能${label}。请等待当前任务结束或先停止任务。`
+    )
+    return true
+  }
+
   // 重启引擎：保留为显式手动操作（V2 下技能会被自动热发现，通常无需重启），经主进程 stop → 强制新进程
   const restartEngine = async () => {
+    if (blockEngineOperation('重启引擎')) return
     try {
       const r = await api.engineRestart()
-      setToast(r.ok ? '引擎已重启' : '引擎重启失败: ' + (r.error || '未知错误'))
+      setToast(r.ok ? '引擎已重启' : (r.error || '引擎重启失败'))
     } catch (e) {
       setToast('引擎重启失败: ' + e.message)
     }
@@ -2706,6 +2830,9 @@ export default function App() {
 
   // 保存设置（主进程加密存储 + 写配置；restart=true 时优先热重载生效、失败自动回退重启引擎；note 可覆盖提示文案）
   const saveSettings = async (form, restart = true, note = '') => {
+    if (restart && blockEngineOperation('保存并应用设置')) {
+      return { ok: false, blocked: true }
+    }
     try {
       const r = await api.saveSettings(form, restart)
       if (r && r.ok === false) {
@@ -3092,6 +3219,8 @@ export default function App() {
         ? 'Build'
         : (agentList || []).find((a) => a.id === agent)?.label || agent
 
+  const needsWorkspace = workspaceReady && !workspace
+
   // 下拉值 → 模型对象（格式 providerID/modelID）
   const applyModelSel = (key) => {
     if (!key) return setModelSel(null)
@@ -3167,10 +3296,16 @@ export default function App() {
           </div>
           <div
             className="engine-status"
-            title={engine.running ? `引擎已连接 v${engine.version}（端口 ${engine.port}）` : '引擎未启动'}
+            title={
+              needsWorkspace
+                ? '请先选择工作区，再启动执行引擎'
+                : engine.running
+                  ? `引擎已连接 v${engine.version}（端口 ${engine.port}）`
+                  : '引擎未启动'
+            }
           >
-            <span className={`dot ${engine.running ? 'ok' : 'bad'}`} />
-            <span>{engine.running ? '就绪' : '未连接'}</span>
+            <span className={`dot ${needsWorkspace ? 'idle' : engine.running ? 'ok' : 'bad'}`} />
+            <span>{needsWorkspace ? '待选择工作区' : engine.running ? '就绪' : '未连接'}</span>
           </div>
           {engineError && (
             <div className="engine-error" title={engineError}>
@@ -3193,6 +3328,21 @@ export default function App() {
 
         <div className="body">
         {page === 'chat' ? (
+          !workspaceReady ? (
+            <div className="workspace-gate is-booting">
+              <div className="workspace-gate-boot">
+                <span className="ws-spinner" />
+                <span>正在载入工作区…</span>
+              </div>
+            </div>
+          ) : !workspace ? (
+            <WorkspaceGate
+              onPick={openWorkspace}
+              onOpen={switchTo}
+              recent={gateWs}
+              switching={!!wsSwitching}
+            />
+          ) : (
         <>
         <aside className="sidebar" style={{ width: dragW ?? sidebarW }}>
           <div
@@ -3630,30 +3780,36 @@ export default function App() {
               </div>
             )}
             {!isChildView && outlineItems.length > 0 && (
-              <nav
-                className="chat-outline"
-                aria-label="用户消息目录"
-                onScroll={() => setOutlineHover((h) => (h ? null : h))}
-              >
+              <nav className="chat-outline" aria-label="用户消息目录">
                 {outlineItems.map((item, i) => (
                   <button
                     key={item.id || item.index}
                     type="button"
                     className={'chat-outline-dot' + (outlineActive === item.id ? ' active' : '')}
-                    title={item.full}
-                    aria-label={`跳转到第 ${i + 1} 条用户消息：${item.full.slice(0, 80)}`}
+                    aria-label={`第 ${i + 1} 条用户消息：${item.full.slice(0, 80)}`}
                     onClick={() => jumpToUser(item.id)}
                     onMouseEnter={(e) => showOutlineTip(item, e)}
-                    onMouseLeave={() => setOutlineHover((h) => (h && h.id === item.id ? null : h))}
+                    onMouseLeave={dismissOutlineTip}
                     onFocus={(e) => showOutlineTip(item, e)}
-                    onBlur={() => setOutlineHover((h) => (h && h.id === item.id ? null : h))}
+                    onBlur={dismissOutlineTip}
                   />
                 ))}
               </nav>
             )}
-            {outlineHover && (
-              <div className="chat-outline-tip-float" style={{ top: outlineHover.top }} aria-hidden="true">
-                {outlineHover.full}
+            {!isChildView && outlineItems.length > 0 && (
+              <div
+                className={'chat-outline-preview' + (outlineHover?.visible ? ' visible' : '')}
+                style={{ top: outlineHover?.top || 0 }}
+                aria-hidden="true"
+              >
+                {outlineHover ? (
+                  <>
+                    <div className="chat-outline-preview-text">{outlineHover.full}</div>
+                    {outlineHover.time ? (
+                      <div className="chat-outline-preview-time">{fmtDateTime(outlineHover.time)}</div>
+                    ) : null}
+                  </>
+                ) : null}
               </div>
             )}
             {showNewHint && (
@@ -3771,6 +3927,7 @@ export default function App() {
           )}
         </main>
         </>
+          )
         ) : page === 'tasks' ? (
           <TasksPage notify={setToast} setConfirm={setConfirm} settingsData={settingsData} workspace={workspace} />
         ) : page === 'hub' ? (
@@ -3785,7 +3942,12 @@ export default function App() {
                 <button className="page-btn" onClick={openSkillHub} disabled={skillLoading}>
                   刷新
                 </button>
-                <button className="page-btn primary" onClick={restartEngine}>
+                <button
+                  className="page-btn primary"
+                  aria-disabled={engineBusy}
+                  title={engineBusy ? 'XWork 正在工作，暂不能重启引擎' : undefined}
+                  onClick={restartEngine}
+                >
                   重启引擎
                 </button>
               </div>
@@ -3859,7 +4021,7 @@ export default function App() {
               key={settingsResetKey}
               data={settingsData}
               active={page === 'settings'}
-              busy={busy}
+              engineBusy={engineBusy}
               theme={theme}
               streamReveal={streamReveal}
               appInfo={appInfo}
@@ -5413,6 +5575,40 @@ function TokenMixBar({ tokens }) {
 }
 
 function UsageHeatmap({ heatmap, loading }) {
+  const [tip, setTip] = useState(null)
+  const tipHideTimerRef = useRef(null)
+
+  const hideHeatTip = useCallback(() => {
+    if (tipHideTimerRef.current) clearTimeout(tipHideTimerRef.current)
+    setTip((t) => (t ? { ...t, visible: false } : t))
+    tipHideTimerRef.current = setTimeout(() => {
+      tipHideTimerRef.current = null
+      setTip(null)
+    }, 180)
+  }, [])
+
+  const showHeatTip = useCallback((c, event) => {
+    if (c.future) return
+    if (tipHideTimerRef.current) clearTimeout(tipHideTimerRef.current)
+    tipHideTimerRef.current = null
+    const r = event.currentTarget.getBoundingClientRect()
+    const width = 180
+    const left = Math.max(8, Math.min(window.innerWidth - width - 8, r.left + r.width / 2 - width / 2))
+    const above = r.top > 80
+    setTip({
+      date: c.date,
+      steps: c.steps,
+      left,
+      top: above ? r.top - 8 : r.bottom + 8,
+      above,
+      visible: true
+    })
+  }, [])
+
+  useEffect(() => () => {
+    if (tipHideTimerRef.current) clearTimeout(tipHideTimerRef.current)
+  }, [])
+
   if (!heatmap) {
     return (
       <section className="stats-panel stats-heat-panel">
@@ -5436,7 +5632,7 @@ function UsageHeatmap({ heatmap, loading }) {
           多
         </div>
       </div>
-      <div className="stats-heat-wrap">
+      <div className="stats-heat-wrap" onScroll={hideHeatTip}>
         <div className="stats-heat">
           <div className="stats-heat-months" style={{ gridTemplateColumns: `repeat(${weeks}, 14px)` }}>
             {months.map((m) => (
@@ -5458,7 +5654,8 @@ function UsageHeatmap({ heatmap, loading }) {
                 <span
                   key={c.date}
                   className={`stats-heat-cell${c.future ? ' future' : ''} heat-l${c.level}`}
-                  title={c.future ? '' : `${c.date} · ${c.steps} 步`}
+                  onMouseEnter={c.future ? undefined : (e) => showHeatTip(c, e)}
+                  onMouseLeave={hideHeatTip}
                   aria-hidden="true"
                 />
               ))}
@@ -5471,6 +5668,25 @@ function UsageHeatmap({ heatmap, loading }) {
         <span><b>{fmtInt(heatmap.activeDays)}</b> 天活跃</span><span className="sep">·</span>
         <span>最长连续 <b>{fmtInt(heatmap.streak)} 天</b></span>
       </div>
+      {createPortal(
+        <div
+          className={
+            'stats-heat-tip' +
+            (tip?.above ? ' above' : ' below') +
+            (tip?.visible ? ' visible' : '')
+          }
+          style={{ left: tip?.left ?? 0, top: tip?.top ?? 0 }}
+          aria-hidden="true"
+        >
+          {tip ? (
+            <>
+              <div className="stats-heat-tip-date">{tip.date}</div>
+              <div className="stats-heat-tip-value"><b>{fmtInt(tip.steps)}</b> 步</div>
+            </>
+          ) : null}
+        </div>,
+        document.body
+      )}
     </section>
   )
 }
@@ -5525,7 +5741,7 @@ function ToolLeaderboard({ tools }) {
 
 function ModelLeaderboard({ models, modelsTotal }) {
   if (!models || models.length === 0) return null
-  const top = models.slice(0, 3)
+  const top = models.slice(0, 5)
   const used = top.reduce((a, m) => a + m.steps, 0)
   const restSteps = Math.max(0, (modelsTotal?.steps || used) - used)
   const shares = percentShares([...top.map((m) => m.steps), restSteps])
@@ -5723,7 +5939,7 @@ function StatsFooter({ updatedAt, loading, onRefresh }) {
 }
 
 // 设置面板：总览式（左侧导航 + 右侧内容），含「模型设置」「界面设置」「权限设置」「关于」
-function SettingsPanel({ data, active, busy, theme, streamReveal, appInfo, appConfig, onThemeChange, onStreamRevealChange, onCloseActionChange, onNotifyTaskChange, onEffortChange, onClose, onSave, onSaveConfig }) {
+function SettingsPanel({ data, active, engineBusy, theme, streamReveal, appInfo, appConfig, onThemeChange, onStreamRevealChange, onCloseActionChange, onNotifyTaskChange, onEffortChange, onClose, onSave, onSaveConfig }) {
   const [tab, setTab] = useState('model') // model | appearance | permission | config | stats | about
   const [statsRange, setStatsRange] = useState('year')
   const [statsData, setStatsData] = useState(null)
@@ -6095,7 +6311,7 @@ function SettingsPanel({ data, active, busy, theme, streamReveal, appInfo, appCo
         <div className="settings-nav">
           <div className="settings-nav-title">设置</div>
           <button className={`settings-nav-item ${tab === 'model' ? 'active' : ''}`} onClick={() => setTab('model')}>
-            <Settings size={14} strokeWidth={1.8} aria-hidden="true" /> 模型设置
+            <Brain size={14} strokeWidth={1.8} aria-hidden="true" /> 模型设置
           </button>
           <button className={`settings-nav-item ${tab === 'appearance' ? 'active' : ''}`} onClick={() => setTab('appearance')}>
             <Palette size={14} strokeWidth={1.8} aria-hidden="true" /> 界面设置
@@ -6417,7 +6633,16 @@ function SettingsPanel({ data, active, busy, theme, streamReveal, appInfo, appCo
                     {update.status === 'downloaded' && (
                       <button
                         className="about-update-btn accent"
+                        aria-disabled={engineBusy}
+                        title={engineBusy ? 'XWork 正在工作，暂不能安装更新' : undefined}
                         onClick={async () => {
+                          if (engineBusy) {
+                            setUpdate({
+                              status: 'error',
+                              message: 'XWork 正在工作，暂不能安装更新。请等待当前任务结束或先停止任务。'
+                            })
+                            return
+                          }
                           const r = await window.xwork.updateInstall()
                           if (!r.ok) setUpdate({ status: 'error', message: r.error })
                         }}
@@ -6426,9 +6651,12 @@ function SettingsPanel({ data, active, busy, theme, streamReveal, appInfo, appCo
                       </button>
                     )}
                     {update.status === 'error' && (
-                      <button className="about-update-btn" onClick={doCheckUpdate}>
-                        重试
-                      </button>
+                      <>
+                        <span className="about-update-hint" title={update.message}>{update.message}</span>
+                        <button className="about-update-btn" onClick={doCheckUpdate}>
+                          重试
+                        </button>
+                      </>
                     )}
                   </div>
                 </div>
@@ -6553,7 +6781,7 @@ function SettingsPanel({ data, active, busy, theme, streamReveal, appInfo, appCo
                     checked={(streamReveal || 'emerge') === 'emerge'}
                     onChange={() => onStreamRevealChange('emerge')}
                   />
-                  <Sparkles size={14} strokeWidth={1.8} aria-hidden="true" /> 浮现（模糊 → 清晰）
+                  <Sparkles size={14} strokeWidth={1.8} aria-hidden="true" /> 浮现
                 </label>
                 <label className="set-radio">
                   <input
@@ -6562,7 +6790,7 @@ function SettingsPanel({ data, active, busy, theme, streamReveal, appInfo, appCo
                     checked={streamReveal === 'typewriter'}
                     onChange={() => onStreamRevealChange('typewriter')}
                   />
-                  <Keyboard size={14} strokeWidth={1.8} aria-hidden="true" /> 打字机（逐字直出）
+                  <Keyboard size={14} strokeWidth={1.8} aria-hidden="true" /> 打字机
                 </label>
               </div>
 
@@ -6607,7 +6835,12 @@ function SettingsPanel({ data, active, busy, theme, streamReveal, appInfo, appCo
             <button onClick={onClose}>取消</button>
             <button onClick={handleSave}>保存</button>
             {tab === 'model' && (
-              <button className="primary" disabled={busy} onClick={() => onSave(form, true)}>
+              <button
+                className="primary"
+                aria-disabled={engineBusy}
+                title={engineBusy ? 'XWork 正在工作，暂不能保存并重启引擎' : undefined}
+                onClick={() => onSave(form, true)}
+              >
                 保存并生效
               </button>
             )}
@@ -7735,7 +7968,7 @@ const MessageView = memo(function MessageView({ m, showName = true, onCopy, onUn
       <div className="bubble assistant">
         {showName ? (
           <div className="msg-name">
-            <span className="mini-mark"><Sparkles size={10} strokeWidth={2} aria-hidden="true" /></span>
+            <span className="mini-mark"><Bot size={10} strokeWidth={2} aria-hidden="true" /></span>
             XWORK
           </div>
         ) : null}

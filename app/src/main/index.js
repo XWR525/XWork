@@ -157,6 +157,10 @@ function createTray() {
 const xdgHome =
   process.env.XWORK_OPCODE_HOME || path.join(app.getPath('userData'), 'opencode')
 
+// 主引擎当前执行中的会话：由全局 SSE 的 session.status / session.idle 维护。
+// 任何主动重启引擎/安装更新的操作都必须先确认这里为空（另有 taskRunner 检查）。
+const activeEngineSessions = new Set()
+
 // 设置存储与 opencode 配置文件
 const settings = new Settings(path.join(xdgHome, 'xwork-settings.json'))
 // V2 引擎配置文件路径：config 目录名改为 opencode2（V1 为 config/opencode），由 applyToOpencode 写入
@@ -175,6 +179,21 @@ const taskRunner = new TaskRunner({
   mainXdgHome: xdgHome,
   onStatusChange: () => statsCounters.increment('taskRuns')
 })
+// 主动重启引擎前的统一忙碌检查：主引擎会话 + 定时任务执行器/等待队列。
+// 返回可直接透传给渲染层的错误对象；空闲时返回 null。
+function engineWorkBlocked(action) {
+  const reasons = []
+  if (activeEngineSessions.size > 0) reasons.push(`当前有 ${activeEngineSessions.size} 个会话正在执行`)
+  const taskName = taskRunner?.current?.task?.name
+  if (taskName) reasons.push(`定时任务「${taskName}」正在执行`)
+  else if (taskRunner?.queue?.length) reasons.push(`${taskRunner.queue.length} 个定时任务正在等待执行`)
+  if (!reasons.length) return null
+  return {
+    ok: false,
+    error: `XWork 正在工作（${reasons.join('；')}），暂不能${action}。请等待当前任务结束或先停止任务。`
+  }
+}
+
 const taskScheduler = new Scheduler(taskStore, {
   // 命中回调：任务执行（定时与立即执行共用 taskRunner）；finally 释放调度器运行锁（防重入）
   onFire: async (task) => {
@@ -356,14 +375,27 @@ function removeAgentsBridgeEverywhere(reason) {
 // 顺序是硬约束：ensureAgentsBridge 必须在 engine.start() 【之前】，
 // 因为引擎只在 Location 激活时扫描 .opencode —— 先起引擎再建链会白跑一轮。
 async function startEngineWithBridge(opts) {
-  // 工作区以设置为准：engine.workspace() 在 cwd 未设置时会回退 process.cwd()（Electron 下是应用目录），
-  // 那样会在应用目录里建 .opencode —— 必须显式排除
+  // 工作区以设置为准：engine.workspace() 在未选择时返回 null（不再回退 process.cwd()），
+  // 这里仍显式排除应用启动目录，避免历史调用把安装目录设成 cwd 后继续沿用。
   const cwdFallback = process.cwd()
   const fromEngine = engine && engine.workspace ? engine.workspace() : null
   const ws =
     settings.load().workspace ||
     (fromEngine && path.resolve(fromEngine) !== path.resolve(cwdFallback) ? fromEngine : null)
-  if (ws && agentsBridgeEnabled()) {
+  // 无工作区：延迟启动，绝不能以 process.cwd()（打包后为安装目录）兜底。
+  // 直接返回静态状态：不再做健康检查，避免首屏等待一个本就不该存在的引擎。
+  if (!ws) {
+    console.log('[engine] 尚未选择工作区，引擎启动已延迟')
+    return {
+      running: false,
+      version: null,
+      port: engine.port,
+      owned: false,
+      workspace: null,
+      needsWorkspace: true
+    }
+  }
+  if (agentsBridgeEnabled()) {
     try {
       const r = ensureAgentsBridge(ws)
       if (r.linked.length) console.log('[agents-bridge] 已建立联接:', r.linked.join(', '))
@@ -474,6 +506,16 @@ function startGlobalWatch() {
         console.log('[sse] connecting...')
         await bridge.watchGlobal((evt) => {
           console.log('[sse] event:', evt.type)
+          // 维护主引擎忙碌会话集合：主动重启/保存设置/安装更新时据此 fail-closed。
+          const evtSid = evt?.properties?.sessionID
+          if (evtSid) {
+            if (evt.type === 'session.status') {
+              if (evt.properties.status?.type === 'busy') activeEngineSessions.add(evtSid)
+              else activeEngineSessions.delete(evtSid)
+            } else if (evt.type === 'session.idle') {
+              activeEngineSessions.delete(evtSid)
+            }
+          }
           // 世代号透出（设计 §5.7 / v3-B-1）：server.connected 是渲染层判断"是否换了进程"的
           // 唯一实时入口（同进程断流重连时世代号不变 ⇒ 不得把卡片误标为状态未知）
           const payload =
@@ -514,6 +556,7 @@ app.whenReady().then(async () => {
     onExit: (code) => {
       // 引擎退出 ⇒ 立刻推进世代号：渲染层据此把该世代未终态的子智能体卡降级为「状态未知」
       // （设计 §5.7 ①：不能靠"改写消息"实现 —— 随后的 loadSession 快照会把 part 写回 running）
+      activeEngineSessions.clear()
       lastEnginePid = null
       bumpEngineGeneration('engine.exited')
       if (win && !win.isDestroyed()) {
@@ -529,11 +572,16 @@ app.whenReady().then(async () => {
   createTray()
   try {
     applyToOpencode(opencodeConfig, settings) // 保证 provider 段与设置一致
-    // 工作区建立时静默 git init：引擎快照每轮对话前写入，事后 init 无法追溯此前轮次（见 ensureWorkdirGit）
-    // 注意顺序：git init 必须在 startEngineWithBridge 之前 —— 桥接的 git 防污染需要仓库已存在
-    ensureWorkdirGit(ws, { init: true })
-    await startEngineWithBridge()
-    startGlobalWatch()
+    if (!ws) {
+      // 首次启动/工作区被删除：不拉引擎、不建链、不启动 SSE，等用户在界面里选择工作区
+      console.log('[ws] 尚未选择工作区，等待用户选择后再启动引擎')
+    } else {
+      // 工作区建立时静默 git init：引擎快照每轮对话前写入，事后 init 无法追溯此前轮次（见 ensureWorkdirGit）
+      // 注意顺序：git init 必须在 startEngineWithBridge 之前 —— 桥接的 git 防污染需要仓库已存在
+      ensureWorkdirGit(ws, { init: true })
+      await startEngineWithBridge()
+      startGlobalWatch()
+    }
   } catch (e) {
     console.error('engine start failed:', e.message)
     win.webContents.send('engine:event', {
@@ -551,7 +599,7 @@ app.whenReady().then(async () => {
 
 ipcMain.handle('engine:start', async () => {
   const st = await startEngineWithBridge()
-  startGlobalWatch()
+  if (st.running) startGlobalWatch()
   return st
 })
 
@@ -562,6 +610,9 @@ ipcMain.handle('engine:status', () => statusWithGeneration(engine, engineGenerat
 
 // 重启引擎：安装技能后需重启才能识别新技能（stop → 强制新进程，保留当前工作区）
 ipcMain.handle('engine:restart', async () => {
+  if (!settings.load().workspace) return { ok: false, error: '请先选择工作区' }
+  const blocked = engineWorkBlocked('重启引擎')
+  if (blocked) return blocked
   try {
     await engine.stop()
     const st = await startEngineWithBridge({ force: true })
@@ -723,6 +774,8 @@ ipcMain.handle('update:download', async () => {
 
 ipcMain.handle('update:install', () => {
   if (!updater) return { ok: false, disabled: true }
+  const blocked = engineWorkBlocked('安装更新并重启应用')
+  if (blocked) return blocked
   updater.quitAndInstall()
   return { ok: true }
 })
@@ -790,6 +843,8 @@ ipcMain.handle('workspace:switch', async (_e, dir) => {
   if (!st0.running) {
     // 引擎不在运行：常规启动（新进程启动目录 = 新工作区，天然一致）
     const st = await startEngineWithBridge()
+    // 首次选择工作区时全局 SSE 尚未启动；引擎起来后立即接上
+    if (st.running) startGlobalWatch()
     console.log('[ws] engine was down, started with new workspace; running=', st.running)
     return { ok: true, status: st, mode: 'started' }
   }
@@ -801,6 +856,7 @@ ipcMain.handle('workspace:switch', async (_e, dir) => {
     mode = 'noop'
   }
   const st = await engine.status()
+  startGlobalWatch()
   console.log('[ws] switch done (no restart), mode=', mode, 'workspace=', dir)
   return { ok: true, status: { ...st, workspace: dir }, mode }
 })
@@ -1015,10 +1071,13 @@ ipcMain.handle('stats:heatmap', async () => {
   }
 })
 
-ipcMain.handle('session:create', (_e, { title, permission }) =>
+ipcMain.handle('session:create', (_e, { title, permission } = {}) => {
+  const ws = settings.load().workspace
+  // 无工作区时 fail-closed：不能依赖引擎默认 location（那会是安装目录）
+  if (!ws) throw new Error('请先选择工作区')
   // 显式带上当前工作区作为 location：V2 单进程可服务多目录，会话按 location 归属（切换工作区不再换进程）
-  bridge.createSession(title, permission, engine.workspace())
-)
+  return bridge.createSession(title, permission, ws)
+})
 
 ipcMain.handle('session:delete', (_e, sessionID) => bridge.deleteSession(sessionID))
 
@@ -1484,6 +1543,11 @@ ipcMain.handle('settings:save', async (_e, raw, restart = true) => {
       : []
   }
   console.log('[settings] save: restart=', restart, 'keyStatus=', JSON.stringify(keyStatus))
+  // 设置保存可能热更新失败后回退重启引擎；只要本次请求允许重启，就必须先确认没有工作在进行。
+  if (restart) {
+    const blocked = engineWorkBlocked('保存并应用设置')
+    if (blocked) return blocked
+  }
   // .agents 桥接开关的 true→false 跃迁：必须在 settings.save() 之前取"旧值"
   // （save 之后 load() 读到的已是新值，无法判断方向）
   const bridgeWasEnabled = settings.load().agentsBridge?.enabled !== false

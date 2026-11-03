@@ -167,7 +167,7 @@ class Engine {
     this.xdgHome = opts.xdgHome
     this.exe = opts.exePath || findOpencodeExe()
     this.extraEnv = opts.extraEnv || null // 额外环境变量（模型 API Key 等）
-    this.cwd = opts.cwd || null // 工作区目录（null = 继承主进程启动目录）
+    this.cwd = opts.cwd || null // 工作区目录（null = 尚未选择工作区，禁止启动引擎）
     this.password = opts.serverPassword || serverPasswordFor(opts.xdgHome || '') // Basic Auth 密码（确定性派生，见 serverPasswordFor）
     this.child = null
     this.owned = false
@@ -182,8 +182,10 @@ class Engine {
   }
 
   // 当前工作区（会话归属目录；可能不等于引擎进程的启动目录）
+  // 未选择时必须返回 null：绝不能回退 process.cwd()（打包后即安装目录），
+  // 否则会话会以安装目录为 location，AI 可直接改写程序文件。
   workspace() {
-    return this.cwd || process.cwd()
+    return this.cwd || null
   }
 
   async status() {
@@ -212,6 +214,9 @@ class Engine {
 
   async doStart(force) {
     console.log('[engine] start() force=', force, 'cwd=', this.cwd, 'child=', this.child?.pid || null)
+    // 无工作区不拉起引擎：spawn 的 cwd 会继承主进程目录（安装目录），
+    // 引擎默认 location 随之指向安装目录，后续所有无 location 的操作都可能写坏程序文件。
+    if (!this.cwd) throw new Error('请先选择工作区')
     if (!force) {
       const existing = await healthCheck(this.port, 2000, this.password)
       if (existing && existing.healthy) {
@@ -259,7 +264,7 @@ class Engine {
       this.exe,
       ['serve', '--port', String(this.port), '--hostname', '127.0.0.1'],
       {
-        cwd: this.cwd || undefined, // 工作区 = 引擎启动目录（opencode 项目根）
+        cwd: this.cwd, // 工作区 = 引擎启动目录（opencode 项目根）；doStart 已保证非空
         env: {
           ...xdgEnv(this.xdgHome),
           // V2 强制 Basic Auth：固定密码（与 bridge 共用，见 serverPasswordFor）

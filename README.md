@@ -4,7 +4,7 @@
 
 **本地优先的可视化 AI 工作台**
 
-`Windows x64` · `Electron 33` · `opencode V2` · `v0.6.5` · `MIT`
+`Windows x64` · `Electron 33` · `opencode V2` · `v0.7.0` · `MIT`
 
 ---
 
@@ -73,6 +73,7 @@ XWork 是一个基于 **Electron + React** 的桌面 AI 工作台，以本地 **
 - 多个权限请求按队列逐个处理
 - AI 提问支持选项、补充输入和拒绝
 - 权限修改即时热更新，无需重启引擎
+- **工作保护**：有会话或定时任务正在执行时，重启引擎、保存并生效、安装更新等可能中断引擎的操作会被拒绝，并提示等待或先停止任务
 
 ### 联网搜索：严格受控
 
@@ -91,6 +92,8 @@ XWork 是一个基于 **Electron + React** 的桌面 AI 工作台，以本地 **
 
 ### 工作区与文件
 
+- **首次启动不设默认工作区**：安装目录永远不会被自动当作工作区，必须先明确选择
+- 选择工作区后才会启动执行引擎，入口页同时提供最近使用的工作区
 - 打开 / 切换本地文件夹作为工作区
 - 引擎以工作区为当前目录，AI 的文件操作都发生在这里
 - 文件树懒加载，默认隐藏 `.git`、`node_modules`、`.opencode`、`.agents` 等目录
@@ -228,7 +231,7 @@ opencode V2 使用异步收件箱：
 
 当前构建产物：
 
-- 安装包：`app/release/XWork-Installer-0.6.5.exe`
+- 安装包：`app/release/XWork-Installer-0.7.0.exe`
 - 免安装版：`app/release/win-unpacked/XWork.exe`
 
 安装包已包含：
@@ -302,7 +305,7 @@ npm run build:dist
 
 输出：
 
-- `app/release/XWork-Installer-0.6.5.exe`
+- `app/release/XWork-Installer-0.7.0.exe`
 - `app/release/win-unpacked/`
 
 可选环境变量：
