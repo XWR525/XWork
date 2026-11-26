@@ -4,7 +4,7 @@
 
 **本地优先的可视化 AI 工作台**
 
-`Windows x64` · `Electron 33` · `opencode V2` · `v0.7.0` · `MIT`
+`Windows x64` · `Electron 33` · `opencode V2` · `v0.7.1` · `MIT`
 
 </div>
 
@@ -415,7 +415,7 @@ V2 引擎的 `revert` **只裁剪会话，不恢复文件**，因此文件回滚
 
 当前构建产物：
 
-- 安装包：`app/release/XWork-Installer-0.7.0.exe`（约 207 MB）
+- 安装包：`app/release/XWork-Installer-0.7.1.exe`（约 207 MB）
 - 免安装版：`app/release/win-unpacked/XWork.exe`
 
 安装包已包含：
@@ -528,8 +528,8 @@ npm run build:dist
 
 输出：
 
-- `app/release/XWork-Installer-0.7.0.exe`
-- `app/release/XWork-Installer-0.7.0.exe.blockmap`
+- `app/release/XWork-Installer-0.7.1.exe`
+- `app/release/XWork-Installer-0.7.1.exe.blockmap`
 - `app/release/latest.yml`
 - `app/release/win-unpacked/`
 
