@@ -403,6 +403,10 @@ const XWORK_IDENTITY = `# XWork 身份声明
 
 // 将设置应用到 opencode.json（V2 原生格式：providers 映射 + permissions 有序规则数组）
 // opts.allPermissions=true：任务引擎配置（无人值守，一条通配 allow 规则，不弹确认框；question 由事件流自动应答）
+// opts.snapshots=false：关闭引擎的文件系统快照（任务引擎用）。
+//   引擎配置键为 snapshots（布尔，默认 true），其 schema 描述：“When false, filesystem snapshots
+//   are not recorded and undoing or reverting will not undo/redo file changes”。
+//   定时任务没有回退入口（会话即用即弃、历史只存摘要），快照只会白白占磁盘，故关闭。
 function applyToOpencode(configFile, settings, opts = {}) {
   const s = settings.load()
   let cfg = { $schema: 'https://opencode.ai/config.json' }
@@ -442,6 +446,8 @@ function applyToOpencode(configFile, settings, opts = {}) {
     }
   }
   cfg.permissions = buildPermissionRules(s, opts)
+  // 快照开关：仅任务引擎显式关闭；主引擎依赖快照实现「回退至此」，不写该键（保持引擎默认 true）。
+  if (opts.snapshots === false) cfg.snapshots = false
   // 联网搜索：有 Key 才注册 XWork 的 DeepSeek provider；每次 apply 都重写插件，
   // 保证升级后插件代码同步，且旧配置中残留的 provider 选择会被清理。
   if (s.websearch?.apiKey && s.websearch.valid === true) {

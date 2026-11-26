@@ -70,12 +70,11 @@ class TaskRun {
 }
 
 class TaskRunner {
-  constructor({ store, notify, settings, effectiveConfig, ensureGit, mainXdgHome, onStatusChange }) {
+  constructor({ store, notify, settings, effectiveConfig, mainXdgHome, onStatusChange }) {
     this.store = store // TaskStore
     this.notify = notify // (body) => void（系统通知）
     this.settings = settings // Settings 实例
     this.effectiveConfig = effectiveConfig // () => 有效配置（含 enginePort）
-    this.ensureGit = ensureGit || (() => ({ ok: true })) // ensureWorkdirGit(dir, {init})
     this.mainXdgHome = mainXdgHome // 主引擎数据目录（任务引擎在其下建 tasks/ 子目录）
     this.onStatusChange = onStatusChange || null // 可选：任务状态变更回调（渲染层实时刷新用）
 
@@ -116,15 +115,20 @@ class TaskRunner {
     if (!workspace || !fs.existsSync(workspace)) {
       throw new TaskExecutionError('任务工作区不存在: ' + workspace, 'no_workspace')
     }
-    // git 保证：任务文件变更留有快照、可回退
-    try {
-      this.ensureGit(workspace, { init: true })
-    } catch (e) {
-      console.warn('[task-engine] git ensure failed:', e.message)
-    }
+    // 不再为任务工作区做 git init，也不再依赖引擎快照：
+    // 定时任务没有回退入口（会话即用即弃、执行历史只存摘要），快照只会白白占磁盘，
+    // 因此下面写配置时显式 snapshots:false 关掉引擎的文件系统快照。
     // 端口 + spawn（force 强制新进程，绝不复用端口上其他健康服务）
     const port = await this.pickFreePort()
+    // 每次执行前重写配置：provider 最新 + 全部 allow（无人值守，V2 通配规则）+ 关闭快照。
+    // **必须在 engine.start 之前**：引擎只在启动时读 opencode.json，改配置文件不会自动重载
+    // （主引擎也是靠显式 POST /api/location/reload 才生效）。写在 start 之后会让本次进程
+    // 仍按旧配置运行——快照开关、provider、权限都会晚一代。
     const xdgHome = path.join(this.mainXdgHome, 'tasks')
+    applyToOpencode(path.join(xdgHome, 'config', 'opencode2', 'opencode.json'), this.settings, {
+      allPermissions: true,
+      snapshots: false
+    })
     const engine = new Engine({
       port,
       xdgHome,
@@ -142,8 +146,6 @@ class TaskRunner {
       console.warn('[task-engine] agents-bridge ensure 失败（已忽略）:', e.message)
     }
     await engine.start({ force: true })
-    // 每次执行前重写配置：provider 最新 + 全部 allow（无人值守，V2 通配规则）
-    applyToOpencode(path.join(xdgHome, 'config', 'opencode2', 'opencode.json'), this.settings, { allPermissions: true })
     this.taskEngine = engine
     this.taskBridge = new Bridge(port, { password: engine.password }) // 与引擎共用派生密码（Basic Auth）
     this.enginePort = port

@@ -270,6 +270,32 @@ body {
   overflow: hidden;
 }
 
+/* Work 整页容器：常驻挂载，切页只切换可见性。
+   - 用 visibility 而不是 display:none：元素仍参与布局，切回时无需重新布局整棵消息树
+     （display:none 会丢弃布局，重新显示要重排约 3 万像素的会话，实测约 250ms 停顿）。
+   - 绝对定位铺满 .body：隐藏时不影响定时任务 / Hub / 设置页的正常 flex 布局。
+   - 隐藏时同时关掉指针事件，避免点穿到不可见的聊天区。 */
+.chat-pane {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.chat-pane.active {
+  visibility: visible;
+  pointer-events: auto;
+}
+
+/* 子元素可能显式声明 visibility:visible（.side-view、.chat-head-pop.visible 等），
+   会覆盖祖先的 hidden 并“透”到定时任务 / Hub / 设置页上；隐藏时必须强制整棵子树不可见。 */
+.chat-pane:not(.active) * {
+  visibility: hidden !important;
+}
+
 /* ---------- 侧栏边缘拖拽调整大小 ---------- */
 .resize-handle {
   position: absolute;
@@ -1308,7 +1334,31 @@ body.resizing-left .sidebar {
   border-radius: 8px;
   background: var(--panel);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(-4px) scale(0.98);
+  transform-origin: top left;
+  transition: opacity 140ms ease, transform 160ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    visibility 0s linear 180ms;
+  will-change: opacity, transform;
 }
+
+.chat-head-pop.visible {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translateY(0) scale(1);
+  transition: opacity 140ms ease, transform 160ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    visibility 0s linear 0s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-head-pop {
+    transition: none;
+  }
+}
+
 .chat-head-item {
   padding: 6px 8px;
   border-radius: 6px;
@@ -1936,6 +1986,16 @@ body.resizing-left .sidebar {
   word-break: break-all;
 }
 
+/* 错误内的补充提示（例如「当前模型可能不支持图片输入」，设计 §10.2） */
+.msg-error-hint {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px dashed rgba(255, 107, 107, 0.35);
+  color: var(--text);
+  font-size: 11.5px;
+  word-break: break-word;
+}
+
 .busy-hint {
   text-align: center;
   color: var(--text-dim);
@@ -2094,6 +2154,183 @@ body.resizing-left .sidebar {
 .cf-chip button:hover {
   color: var(--danger);
 }
+
+/* ---------- 对话框图片粘贴（设计文档 §6.4） ---------- */
+/* 缩略图区：位于 textarea 之上，与 .composer-files 同族但用方形缩略图 */
+.composer-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 4px 0 2px;
+}
+
+.ci-thumb {
+  position: relative;
+  width: 56px;
+  height: 56px;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.ci-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* 删除按钮：平时隐藏，hover 才显形，避免视觉噪音 */
+.ci-del {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 17px;
+  height: 17px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.62);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transform: scale(0.9);
+  transition: opacity 0.14s, transform 0.14s, background 0.14s;
+}
+
+.ci-thumb:hover .ci-del {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.ci-del:hover {
+  background: var(--danger);
+}
+
+/* 压缩中：虚线边框 + 骨架流光 + 转圈 */
+.ci-thumb.compressing {
+  border-style: dashed;
+  cursor: progress;
+}
+
+.ci-thumb .ci-skeleton {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, var(--panel) 30%, var(--border) 50%, var(--panel) 70%);
+  background-size: 220% 100%;
+  animation: ci-shimmer 1.1s linear infinite;
+}
+
+.ci-thumb .ci-spinner {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(63, 120, 224, 0.3);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: ci-spin 0.8s linear infinite;
+}
+
+@keyframes ci-shimmer {
+  from { background-position: 140% 0; }
+  to { background-position: -40% 0; }
+}
+
+@keyframes ci-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* 处理失败：红框 + 底图压暗 + 感叹号徽标 */
+.ci-thumb.error {
+  border-color: var(--danger);
+  cursor: help;
+}
+
+.ci-thumb.error img {
+  opacity: 0.45;
+  filter: grayscale(0.6);
+}
+
+.ci-badge {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--danger);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+/* 消息气泡内的图片（历史消息与乐观消息共用） */
+.bubble-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.bubble-image {
+  max-width: 240px;
+  max-height: 240px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  background: var(--panel2);
+  display: block;
+  cursor: zoom-in;
+}
+
+.bubble-image:hover {
+  filter: brightness(1.06);
+}
+
+/* 大图预览遮罩 */
+.img-preview-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  background: rgba(4, 6, 10, 0.82);
+  cursor: zoom-out;
+}
+
+.img-preview-img {
+  max-width: 100%;
+  max-height: calc(100% - 36px);
+  border-radius: 10px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+  cursor: default;
+}
+
+.img-preview-cap {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 14px;
+  text-align: center;
+  font-size: 12px;
+  color: #cfd6e4;
+}
+
 
 /* 模型选择：按钮 + 向上弹出的选项菜单（位于发送按钮左侧） */
 .model-picker {

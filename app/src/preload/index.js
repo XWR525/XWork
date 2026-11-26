@@ -61,7 +61,9 @@ contextBridge.exposeInMainWorld('xwork', {
   applyStreamReveal: (mode) => ipcRenderer.invoke('settings:apply-stream-reveal', mode),
   applyCloseAction: (action) => ipcRenderer.invoke('settings:apply-close-action', action),
   applyNotifyTask: (on) => ipcRenderer.invoke('settings:apply-notify-task', on),
-  messageSend: (sessionID, text, model, agent) => ipcRenderer.invoke('message:send', sessionID, text, model, agent),
+  // images：图片附件 [{ uri: dataURL, name }]，仅图片粘贴使用（见设计文档 §7.2）
+  messageSend: (sessionID, text, model, agent, images) =>
+    ipcRenderer.invoke('message:send', sessionID, text, model, agent, images),
   messageList: (sessionID) => ipcRenderer.invoke('message:list', sessionID),
   messageAbort: (sessionID) => ipcRenderer.invoke('message:abort', sessionID),
   // 统计页：主统计与 52 周热力图分开请求，避免热力图阻塞首屏

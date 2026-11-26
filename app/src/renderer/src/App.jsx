@@ -5,6 +5,24 @@ import hljs from 'highlight.js/lib/common'
 import markedKatex from 'marked-katex-extension'
 import ABOUT_LOGO from './assets/logo.svg'
 import { advanceTypewriterBurst, TW_TICK_MS } from './typewriter.mjs'
+import {
+  DOWNSCALE_FACTOR,
+  DOWNSCALE_STEPS,
+  JPEG_QUALITIES,
+  MAX_EDGE,
+  MAX_IMAGES,
+  MAX_ONE_BYTES,
+  checkLimits,
+  describeLimitError,
+  fitSize,
+  formatBytes,
+  hasPending,
+  isAllowedMime,
+  normalizeMime,
+  suggestName,
+  buildPayload,
+  countFailed
+} from './imageAttach.mjs'
 import { easeInOutCubic, iconSize, MORPH_MS, rotateDeg, shapePoints, SIZE_SEND } from './sendButtonMorph.mjs'
 import {
   Bot,
@@ -485,6 +503,64 @@ function extractError(info) {
   return typeof msg === 'string' ? msg : JSON.stringify(msg)
 }
 
+// 某些模式的技能会把自己的说明以 `<system-reminder>…</system-reminder>` 形式
+// 拼在用户消息末尾（如 implement/deploy）。这是给模型看的内部提示，不应出现在
+// 对话气泡、复制文本或消息目录预览里；发送链路保持原文不动，只在展示层剥离。
+function stripSystemReminders(text) {
+  // 只移除消息末尾的内部提醒；用户在正文中间引用/讨论该标签时保持原样。
+  return String(text || '').replace(
+    /(?:\s*<system-reminder>[\s\S]*?<\/system-reminder>)+\s*$/i,
+    ''
+  )
+}
+
+// ── 图片附件：DOM 侧（压缩 / 降质 / 缩边）。纯计算部分在 imageAttach.mjs ──────────
+// 为什么不用主进程原生图像库：XWork 未引入图像处理依赖；Canvas 在渲染层零依赖，
+// 且引擎自身还有 media.image.auto_resize 兜底（设计文档 §6.3）。
+function drawDataUrl(bitmap, width, height, type, quality) {
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  canvas.getContext('2d').drawImage(bitmap, 0, 0, width, height)
+  return canvas.toDataURL(type, quality)
+}
+
+/**
+ * 把剪贴板里的图片压到「单张 data URL ≤ MAX_ONE_BYTES」。
+ * 顺序：先 PNG（截图保真）→ 超限转 JPEG 逐级降质 → 仍超限按比例缩边再来。
+ * @returns {Promise<{dataUrl:string,mime:string,width:number,height:number}>}
+ */
+async function compressImageFile(file) {
+  const bitmap = await createImageBitmap(file)
+  try {
+    const fit = fitSize(bitmap.width, bitmap.height, MAX_EDGE)
+    let { width, height } = fit
+    let dataUrl = drawDataUrl(bitmap, width, height, 'image/png')
+    if (dataUrl.length <= MAX_ONE_BYTES) {
+      return { dataUrl, mime: 'image/png', width, height }
+    }
+    for (const q of JPEG_QUALITIES) {
+      dataUrl = drawDataUrl(bitmap, width, height, 'image/jpeg', q)
+      if (dataUrl.length <= MAX_ONE_BYTES) {
+        return { dataUrl, mime: 'image/jpeg', width, height }
+      }
+    }
+    for (let i = 0; i < DOWNSCALE_STEPS; i++) {
+      width = Math.max(1, Math.round(width * DOWNSCALE_FACTOR))
+      height = Math.max(1, Math.round(height * DOWNSCALE_FACTOR))
+      for (const q of JPEG_QUALITIES) {
+        dataUrl = drawDataUrl(bitmap, width, height, 'image/jpeg', q)
+        if (dataUrl.length <= MAX_ONE_BYTES) {
+          return { dataUrl, mime: 'image/jpeg', width, height }
+        }
+      }
+    }
+    throw new Error('图片过大，请先裁剪')
+  } finally {
+    bitmap.close?.()
+  }
+}
+
 // 将引擎返回的消息数组规范化为渲染结构
 // 从引擎加载的消息均为完整内容：直接渲染全文，不再走打字机逐字揭示
 function normalize(list) {
@@ -499,6 +575,11 @@ function normalize(list) {
       // 此前 normalize()/settleApply() 各有一份白名单，任何新增字段（如 subagentNotice）
       // 漏掉一处就会"只在 SSE 路径存在、GET 路径全丢"，并被 streamCacheRef 缓存整个会话
       parts: (m.parts || []).map(normalizePart)
+    }
+    if (out.role === 'user') {
+      out.parts = out.parts.map((p) =>
+        p.type === 'text' ? { ...p, text: stripSystemReminders(p.text) } : p
+      )
     }
     // 子智能体通知条（bridge 由 synthetic 映射而来）的 info 级字段必须显式透传
     if (m.info.subagentNotice) out.subagentNotice = m.info.subagentNotice
@@ -1072,6 +1153,12 @@ export default function App() {
   const [wsChildren, setWsChildren] = useState({}) // 目录绝对路径 -> [{name,type}]
   const [expandedDirs, setExpandedDirs] = useState({}) // 已展开目录绝对路径 -> true
   const [addedFiles, setAddedFiles] = useState([]) // 已添加文件（相对工作区路径，发送时注入）
+  // 待发送的图片附件（剪贴板粘贴）。每项：{id,name,mime,bytes,width,height,dataUrl,status}
+  // status: 'compressing' | 'ready' | 'error'。与 addedFiles（@引用）相互独立。
+  const [composerImages, setComposerImages] = useState([])
+  const [previewImage, setPreviewImage] = useState(null) // 大图预览（缩略图/消息图片共用）
+  // 是否有「可直接发送」的图片：允许只发图不发文字（设计 §6.5），发送按钮的禁用条件要用到它
+  const canSendImage = composerImages.some((x) => x.status === 'ready' && x.dataUrl)
   const [ctxMenu, setCtxMenu] = useState(null) // 文件右键菜单 {x, y, abs, rel, type, name}
   const [sideTab, setSideTab] = useState('chat') // 侧栏分段：chat（对话历史）| files（工作区文件）
   const [sidebarW, setSidebarW] = useState(256) // 左边栏宽度（拖动边缘调整）
@@ -1096,11 +1183,16 @@ export default function App() {
 
   const listRef = useRef(null)
   const chatAreaRef = useRef(null)
+  const chatPaneRef = useRef(null) // Work 整页容器（常驻挂载，切页只切换可见性）
   const listStickRef = useRef(true) // 对话区是否贴底：上滑即 false，滚回底部自动恢复
   const lastScrollTopRef = useRef(0) // 上一次 scrollTop：判定「用户是否真的往上滚」（见 onListScroll）
   // 命令卡片展开/收起期间暂停程序化贴底：高度过渡只改变 scrollHeight，不移动 scrollTop。
   const scrollSuppressUntilRef = useRef(0)
   const scrollResumeTimerRef = useRef(null)
+  // 平滑贴底的 rAF 句柄（0/null = 未在跟随）。详见 followScrollToBottom 的注释。
+  const followRafRef = useRef(0)
+  // 下一次跟随直接「瞬时到底」：切会话 / 新建会话时内容整块替换，缓动反而像在空转
+  const snapFollowRef = useRef(false)
   const [showNewHint, setShowNewHint] = useState(false) // 上滑停止跟随期间有新内容时，显示「↓ 新消息」提示
   const currentRef = useRef(currentID)
   currentRef.current = currentID
@@ -1134,6 +1226,14 @@ export default function App() {
     setMessages(revealed)
   }, [page, messages])
 
+  // 离开 Work 时把焦点从聊天区移走：Work 改为常驻挂载后，输入框虽被 visibility:hidden
+  // 隐藏，但浏览器可能保留其焦点，键盘事件仍会落到不可见的输入区（如直接 Enter 发送）。
+  useEffect(() => {
+    if (page === 'chat') return
+    const active = document.activeElement
+    if (active && chatPaneRef.current && chatPaneRef.current.contains(active)) active.blur()
+  }, [page])
+
   // 用户消息点状目录：只用于 Work 主会话；以 user 消息为跳转锚点
   const [outlineActive, setOutlineActive] = useState(null)
   const [outlineHover, setOutlineHover] = useState(null)
@@ -1143,6 +1243,11 @@ export default function App() {
   // 500ms 自定义滚动动画：目标位置每帧实时计算，动态内容不会留旧坐标
   const animateScrollTop = useCallback((el, getTarget, onDone) => {
     if (!el) return
+    // 主动动画（点目录跳转 / 「↓ 新消息」）优先级高于平滑跟随，先停掉跟随帧，避免两者互相拉扯
+    if (followRafRef.current) {
+      cancelAnimationFrame(followRafRef.current)
+      followRafRef.current = 0
+    }
     if (scrollAnimRef.current != null) cancelAnimationFrame(scrollAnimRef.current)
     const from = el.scrollTop
     const start = performance.now()
@@ -1162,6 +1267,67 @@ export default function App() {
     }
     scrollAnimRef.current = requestAnimationFrame(step)
   }, [])
+
+  // ── 平滑贴底 ────────────────────────────────────────────────────────────────
+  // 为什么不是直接 `el.scrollTop = el.scrollHeight`：
+  // 流式输出每换一行，内容高度就增加约一个行高；立刻赋到底会让整块正文「瞬移」一行，
+  // 视觉上就是"新的一行出现时前面的内容整体上跳一下"。
+  // 这里改成逐帧缓动：每帧只走剩余距离的 35%，约 5~8 帧（≈80~130ms）收敛，
+  // 目标每帧重算，所以流式期间会以很小的滞后持续跟随（滞后 ≈ 2~3 帧的增量），
+  // 肉眼是"滑上去"而不是"跳上去"。
+  // 约束：
+  //   · 用户上滑（listStickRef=false）立刻停；
+  //   · 命令卡片展开期间（scrollSuppressUntil）跳过，避免把卡片上方内容推走；
+  //   · 系统开启「减少动态效果」时退化为直接到底（无障碍优先）；
+  //   · 已在跟随中不重复排帧（目标每帧重算，一次循环即可持续跟随）。
+  const followScrollToBottom = useCallback((el) => {
+    if (!el) return
+    if (scrollSuppressUntilRef.current > performance.now()) return
+    // 切会话 / 新建会话后的第一次跟随：内容整块换掉，直接到底（缓动只会像在空转）
+    if (snapFollowRef.current) {
+      snapFollowRef.current = false
+      if (followRafRef.current) {
+        cancelAnimationFrame(followRafRef.current)
+        followRafRef.current = 0
+      }
+      el.scrollTop = el.scrollHeight
+      lastScrollTopRef.current = el.scrollTop
+      return
+    }
+    if (followRafRef.current) return
+    const reduceMotion =
+      typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    if (reduceMotion) {
+      el.scrollTop = el.scrollHeight
+      lastScrollTopRef.current = el.scrollTop
+      return
+    }
+    const step = () => {
+      followRafRef.current = 0
+      if (listRef.current !== el) return // 列表已重挂（切会话/切页）
+      if (!listStickRef.current) return // 用户上滑：立刻停止跟随
+      if (scrollSuppressUntilRef.current > performance.now()) return // 卡片高度过渡中
+      const target = el.scrollHeight - el.clientHeight
+      const cur = el.scrollTop
+      const diff = target - cur
+      if (diff <= 0.5) {
+        el.scrollTop = target
+        lastScrollTopRef.current = el.scrollTop
+        return
+      }
+      // 每帧位移 = min(剩余距离 × 35%, 10px)。
+      // 只看比例的话，遇到「一次长高 80px」（整段/代码块插入、mermaid 补渲染）第一帧仍会走 26px，
+      // 依旧像跳；加 10px 上限后任何增长都被摊成多帧，单帧位移不会超过半行。
+      const move = Math.max(1, Math.min(diff * 0.35, 10))
+      el.scrollTop = cur + move
+      lastScrollTopRef.current = el.scrollTop
+      followRafRef.current = requestAnimationFrame(step)
+    }
+    followRafRef.current = requestAnimationFrame(step)
+  }, [])
+
   const updateOutlineActive = useCallback(() => {
     if (isChildView) {
       setOutlineActive(null)
@@ -1189,12 +1355,12 @@ export default function App() {
       .map((m, index) => {
         if (m.role !== 'user') return null
         if ((m.parts || []).some((p) => p.type === 'compaction')) return null
-        const full = (m.parts || [])
-          .filter((p) => p.type === 'text')
-          .map((p) => p.text || '')
-          .join('\n')
-          .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '')
-          .trim()
+        const full = stripSystemReminders(
+          (m.parts || [])
+            .filter((p) => p.type === 'text')
+            .map((p) => p.text || '')
+            .join('\n')
+        ).trim()
         return { id: m.id, index, full: full || '（附件消息）', time: m.time || null }
       })
       .filter(Boolean)
@@ -1262,6 +1428,7 @@ export default function App() {
     // 该会话仍在执行就继续显示「执行中」，已结束就自然显示空闲。
     // 切换会话：重置对话区贴底状态并隐藏「↓ 新消息」气泡（避免上个会话的上滑残留）
     listStickRef.current = true
+    snapFollowRef.current = true // 内容整块替换：下一次跟随直接到底，不做缓动
     setShowNewHint(false)
     // 恢复该会话绑定的模型（opencode 将模型持久化在会话 model 字段）
     const s = sessions.find((x) => x.id === sid)
@@ -1437,8 +1604,10 @@ export default function App() {
       // 但 runningSessions / 流式缓存**保留**（切回该会话时仍能正确显示执行中状态）
       // 切换工作区同样重置对话区贴底状态与「↓ 新消息」气泡
       listStickRef.current = true
+      snapFollowRef.current = true
       setShowNewHint(false)
       setAddedFiles([])
+      setComposerImages([]) // 图片附件属于会话草稿，不跨会话携带（设计 §7.1）
       setExpandedDirs({})
       setCtxMenu(null)
       refreshSessions()
@@ -1531,6 +1700,100 @@ export default function App() {
   const toggleAdd = (rel) => {
     setAddedFiles((cur) => (cur.includes(rel) ? cur.filter((x) => x !== rel) : [...cur, rel]))
   }
+
+  // 图片附件：加入（异步压缩）/ 移除
+  const imagesRef = useRef(composerImages)
+  imagesRef.current = composerImages
+  const imageSeqRef = useRef(0)
+  const addImages = useCallback(async (fileList) => {
+    const files = [...(fileList || [])].filter(Boolean)
+    if (!files.length) return
+    // 只处理图片；混合粘贴里的其它类型静默忽略（不打断文本粘贴语义）
+    const picked = files.filter((f) => String(f.type || '').startsWith('image/'))
+    if (!picked.length) return
+    const accepted = picked.filter((f) => isAllowedMime(f.type))
+    if (accepted.length < picked.length) setToast(describeLimitError('bad-type'))
+    if (!accepted.length) return
+
+    // 一次粘贴多张时 setState 尚未落地，故用 ref 快照 + 本地 take 推算剩余名额
+    const remain = MAX_IMAGES - imagesRef.current.length
+    if (remain <= 0) {
+      setToast(describeLimitError('over-count'))
+      return
+    }
+    const take = accepted.slice(0, remain)
+    if (accepted.length > take.length) setToast(describeLimitError('over-count'))
+
+    for (const file of take) {
+      const seq = ++imageSeqRef.current
+      const id = 'img-' + Date.now() + '-' + seq
+      const placeholder = {
+        id,
+        name: suggestName(file.type, seq - 1),
+        mime: normalizeMime(file.type),
+        bytes: 0,
+        width: 0,
+        height: 0,
+        dataUrl: '',
+        status: 'compressing'
+      }
+      setComposerImages((cur) => [...cur, placeholder])
+      try {
+        const out = await compressImageFile(file)
+        setComposerImages((cur) =>
+          cur.map((x) =>
+            x.id === id
+              ? {
+                  ...x,
+                  dataUrl: out.dataUrl,
+                  mime: out.mime,
+                  width: out.width,
+                  height: out.height,
+                  bytes: out.dataUrl.length,
+                  status: 'ready'
+                }
+              : x
+          )
+        )
+      } catch (e) {
+        setComposerImages((cur) => cur.map((x) => (x.id === id ? { ...x, status: 'error', error: e.message } : x)))
+        setToast(e.message || '图片处理失败')
+      }
+    }
+  }, [])
+
+  const removeImage = useCallback((id) => {
+    setComposerImages((cur) => cur.filter((x) => x.id !== id))
+  }, [])
+
+  // textarea 粘贴：只有剪贴板里真有图片才拦截，避免破坏纯文本/表格粘贴
+  const onComposerPaste = useCallback(
+    (e) => {
+      const items = e.clipboardData?.items
+      if (!items || !items.length) return
+      const files = []
+      for (const it of items) {
+        if (it.kind === 'file' && /^image\//.test(String(it.type || ''))) {
+          const f = it.getAsFile()
+          if (f) files.push(f)
+        }
+      }
+      if (!files.length) return
+      e.preventDefault()
+      addImages(files)
+    },
+    [addImages]
+  )
+
+  // 大图预览：Esc 关闭（遮罩点击在 JSX 里处理）
+  useEffect(() => {
+    if (!previewImage) return
+    const onKey = (e) => {
+      if (e.key === 'Escape') setPreviewImage(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [previewImage])
 
   // 右键菜单：记录位置与目标，阻止浏览器默认菜单
   const openCtxMenu = (e, item) => {
@@ -1996,19 +2259,21 @@ export default function App() {
     const el = listRef.current
     if (!el) return
     if (listStickRef.current) {
-      el.scrollTop = el.scrollHeight
-      lastScrollTopRef.current = el.scrollTop
+      followScrollToBottom(el)
       setShowNewHint(false)
     } else {
       setShowNewHint(true)
     }
-  }, [viewMessages, busy])
+  }, [viewMessages, busy, followScrollToBottom])
 
-  // 消息数量/会话变化后刷新目录当前点（布局落定后再查询锚点）
+  // 消息数量/会话变化或返回 Work 后刷新目录当前点（布局落定后再查询锚点）。
+  // 加 page 依赖：Work 常驻挂载后布局仍在，但隐藏期间的增量 / 窗口尺寸变化仍可能
+  // 让当前点与真实滚动位置失配，返回时重算一次最稳。
   useEffect(() => {
+    if (page !== 'chat') return
     const timer = setTimeout(updateOutlineActive, 60)
     return () => clearTimeout(timer)
-  }, [currentID, messages.length, isChildView, updateOutlineActive])
+  }, [currentID, messages.length, isChildView, updateOutlineActive, page])
 
   // 对话区滚动：距底 <30px 视为贴底（恢复跟随），否则上滑（停止跟随）；
   // 「↓ 新消息」提示仅在「上滑中 + 有新消息/busy 变化」（下方 effect）时出现
@@ -2050,14 +2315,13 @@ export default function App() {
   }
 
   // 贴底跟随：只在贴底时滚到底；供揭示层（head/尾每帧长高）与 mermaid 补渲染后调用。
-  // 回调用 useCallback([]) 保持身份稳定，避免 context 变化让所有消息重渲染。
+  // 回调用 useCallback 保持身份稳定，避免 context 变化让所有消息重渲染。
+  // 走平滑跟随（与滚动 effect 同一路径），所以流式逐帧长高也不会瞬移。
   const nudgeScroll = useCallback(() => {
     const el = listRef.current
     if (!el || !listStickRef.current) return
-    if (scrollSuppressUntilRef.current > performance.now()) return
-    el.scrollTop = el.scrollHeight
-    lastScrollTopRef.current = el.scrollTop
-  }, [])
+    followScrollToBottom(el)
+  }, [followScrollToBottom])
 
   // 用户主动展开/收起命令卡片：暂停程序化贴底。结束后如果仍在底部才恢复跟随；
   // 展开后通常已不在底部，必须保持 false，否则流式下一帧又会把上方内容顶走。
@@ -2072,15 +2336,16 @@ export default function App() {
       const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30
       listStickRef.current = atBottom
       if (atBottom) {
-        lastScrollTopRef.current = el.scrollTop
         setShowNewHint(false)
+        followScrollToBottom(el) // 恢复跟随时平滑补齐剩余距离（而不是瞬间到底）
       }
     }, ms + 20)
-  }, [])
+  }, [followScrollToBottom])
 
-  // 卸载时取消滚动动画/恢复计时器，避免操作已销毁的列表
+  // 卸载时取消滚动动画 / 跟随帧 / 恢复计时器，避免操作已销毁的列表
   useEffect(() => () => {
     if (scrollAnimRef.current != null) cancelAnimationFrame(scrollAnimRef.current)
+    if (followRafRef.current) cancelAnimationFrame(followRafRef.current)
     if (scrollResumeTimerRef.current) clearTimeout(scrollResumeTimerRef.current)
   }, [])
 
@@ -2128,9 +2393,25 @@ export default function App() {
 
   const send = async () => {
     const text = input.trim()
-    if (!text || busy || compacting) return // 压缩进行中禁止发送
+    // 允许「只发图片不发文字」：文本为空但有可用图片时仍可发送（设计 §6.5）
+    const readyImgs = composerImages.filter((x) => x.status === 'ready' && x.dataUrl)
+    if ((!text && !readyImgs.length) || busy || compacting) return // 压缩进行中禁止发送
     if (!workspace) {
       setToast('请先选择工作区')
+      return
+    }
+    if (hasPending(composerImages)) {
+      setToast('图片正在压缩，请稍候')
+      return
+    }
+    // 单张 / 合计上限复核（压缩完成后才算得准）
+    const limit = checkLimits(composerImages)
+    if (!limit.ok) {
+      setToast(describeLimitError(limit.reason))
+      return
+    }
+    if (countFailed(composerImages)) {
+      setToast('有图片处理失败，请先移除后再发送')
       return
     }
     // 已添加的工作区文件以 opencode @引用语法注入提示词（与引擎原生「@文件名」交互方式一致）
@@ -2147,7 +2428,9 @@ export default function App() {
       setToast('请先在设置中配置模型组并选择模型')
       return
     }
+    const imagePayload = buildPayload(composerImages)
     setInput('')
+    setComposerImages([])
     let sid = currentID
     // 记录发送前最后一条 assistant 消息时间：POST 失败时据此判断引擎是否已受理本次消息（任务是否在推进）
     const assts = messages.filter((m) => m.role === 'assistant')
@@ -2163,7 +2446,14 @@ export default function App() {
         refreshSessions()
       }
       setMessages((ms) => {
-        const next = [...ms, { id: 'local-' + Date.now(), role: 'user', parts: [{ type: 'text', text: finalText }] }]
+        // 本地乐观消息：文本 part 仅在非空时加入，图片按 ready 项映射为 image part
+        // （与 bridge 从引擎回读的整形结果同构，因此切换会话后渲染路径完全一致）
+        const parts = []
+        if (finalText) parts.push({ type: 'text', text: finalText })
+        for (const [i, img] of readyImgs.entries()) {
+          parts.push({ id: `local-img${i}`, type: 'image', mime: img.mime, dataUrl: img.dataUrl, name: img.name })
+        }
+        const next = [...ms, { id: 'local-' + Date.now(), role: 'user', parts }]
         streamCacheRef.current[sid] = next // 流式缓存基线（含本次用户消息），后续增量在此累积
         return next
       })
@@ -2177,7 +2467,8 @@ export default function App() {
         sid,
         finalText,
         { ...modelSel, variant: effortVariantOf(effort, effortEnabled) },
-        agent
+        agent,
+        imagePayload
       )
       // 智能体切换失败不再静默（设计 §5.5(b) / 评审 v2-B-4）：主进程把失败信号带回，这里给用户 toast
       if (result && result.agentSwitchFailed) {
@@ -2879,9 +3170,11 @@ export default function App() {
     setStopping(false)
     // 新建会话：重置对话区贴底状态并隐藏「↓ 新消息」气泡
     listStickRef.current = true
+    snapFollowRef.current = true // 消息清空：直接到底，不做缓动
     setShowNewHint(false)
     setGreeting(pickGreeting())
     setAgent('build') // 新对话默认 build 模式
+    setComposerImages([]) // 图片附件不跨会话携带（同 loadSession）
     // 新会话用设置里的默认档；清空会话回填标记，下次切换会话重新按引擎绑定回填
     effortSidRef.current = null
     setEffort(settingsData?.effort?.default || 'default')
@@ -3327,23 +3620,16 @@ export default function App() {
         </header>
 
         <div className="body">
-        {page === 'chat' ? (
-          !workspaceReady ? (
-            <div className="workspace-gate is-booting">
-              <div className="workspace-gate-boot">
-                <span className="ws-spinner" />
-                <span>正在载入工作区…</span>
-              </div>
-            </div>
-          ) : !workspace ? (
-            <WorkspaceGate
-              onPick={openWorkspace}
-              onOpen={switchTo}
-              recent={gateWs}
-              switching={!!wsSwitching}
-            />
-          ) : (
-        <>
+        {/* Work 常驻挂载：切页只切换 visibility，不卸载消息树。
+            否则每次从定时任务 / Hub / 设置返回都要重建整棵消息 DOM 并重新布局
+            （实测 3 万像素级会话约 250ms 长任务，表现为切页停顿），
+            且滚动位置会随卸载丢失、点状目录与滚动位置对不上。 */}
+        {workspaceReady && workspace ? (
+          <div
+            ref={chatPaneRef}
+            className={`chat-pane${page === 'chat' ? ' active' : ''}`}
+            aria-hidden={page !== 'chat'}
+          >
         <aside className="sidebar" style={{ width: dragW ?? sidebarW }}>
           <div
             className="resize-handle"
@@ -3674,34 +3960,38 @@ export default function App() {
                       setChildPopOpen((v) => !v)
                     }}
                     title={isChildView ? '切换子智能体会话' : `${childSessions.length} 个子智能体会话`}
+                    aria-haspopup="true"
+                    aria-expanded={childPopOpen}
                   >
                     <Bot size={13} strokeWidth={1.8} aria-hidden="true" />
                     {isChildView ? childViewTitle : childSessions.length}
                   </button>
-                  {childPopOpen && (
-                    <div className="chat-head-pop">
-                      {childSessions.map((c) => (
-                        <div
-                          key={c.sid}
-                          className={`chat-head-item${c.sid === childViewSid ? ' active' : ''}`}
-                          onClick={() => {
-                            setChildViewSid(c.sid)
-                            setChildPopOpen(false)
-                          }}
-                          title={childSessionLabel(c)}
-                        >
-                          <div className="chat-head-item-title">{childSessionLabel(c)}</div>
-                          <div className="chat-head-item-meta">
-                            <span className={`tool-status ${statusClassOf(c.phase || PHASE.unknown)}`}>
-                              {phaseLabel(c.phase || PHASE.unknown)}
-                            </span>
-                            {c.agent ? <span className="chat-head-item-agent">{c.agent}</span> : null}
-                            <span className="chat-head-item-sid">{shortSid(c.sid)}</span>
-                          </div>
+                  {/* 常驻挂载，靠 .visible 切换透明度/位移；关闭时保留 180ms 播完退出动画 */}
+                  <div
+                    className={`chat-head-pop${childPopOpen ? ' visible' : ''}`}
+                    aria-hidden={!childPopOpen}
+                  >
+                    {childSessions.map((c) => (
+                      <div
+                        key={c.sid}
+                        className={`chat-head-item${c.sid === childViewSid ? ' active' : ''}`}
+                        onClick={() => {
+                          setChildViewSid(c.sid)
+                          setChildPopOpen(false)
+                        }}
+                        title={childSessionLabel(c)}
+                      >
+                        <div className="chat-head-item-title">{childSessionLabel(c)}</div>
+                        <div className="chat-head-item-meta">
+                          <span className={`tool-status ${statusClassOf(c.phase || PHASE.unknown)}`}>
+                            {phaseLabel(c.phase || PHASE.unknown)}
+                          </span>
+                          {c.agent ? <span className="chat-head-item-agent">{c.agent}</span> : null}
+                          <span className="chat-head-item-sid">{shortSid(c.sid)}</span>
                         </div>
-                      ))}
-                    </div>
-                  )}
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
                 </div>
@@ -3744,6 +4034,7 @@ export default function App() {
                   showName={mi === 0 || arr[mi - 1].role !== 'assistant'}
                   onCopy={copyText}
                   onUndo={openUndoConfirm}
+                  onPreviewImage={setPreviewImage}
                   canUndo={!isChildView && m.role === 'user' && hasToolChangeAfter(messages, mi)}
                   gitAvailable={gitState.available}
                   busy={busy}
@@ -3838,11 +4129,55 @@ export default function App() {
                   ))}
                 </div>
               )}
+              {composerImages.length > 0 && (
+                <div className="composer-images">
+                  {composerImages.map((img) => {
+                    const tip =
+                      img.status === 'compressing'
+                        ? '正在压缩…'
+                        : img.status === 'error'
+                          ? img.error || '图片处理失败'
+                          : `${img.name} · ${img.width}×${img.height} · ${formatBytes(img.bytes)}（点击查看大图）`
+                    return (
+                      <div
+                        key={img.id}
+                        className={'ci-thumb ' + img.status}
+                        title={tip}
+                        onClick={() => img.status === 'ready' && img.dataUrl && setPreviewImage(img)}
+                      >
+                        {img.status === 'compressing' ? (
+                          <>
+                            <span className="ci-skeleton" />
+                            <span className="ci-spinner" />
+                          </>
+                        ) : img.dataUrl ? (
+                          <img src={img.dataUrl} alt={img.name} />
+                        ) : (
+                          <span className="ci-skeleton" />
+                        )}
+                        {img.status === 'error' && <span className="ci-badge">!</span>}
+                        <button
+                          type="button"
+                          className="ci-del"
+                          title="移除"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            removeImage(img.id)
+                          }}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
               <textarea
                 value={input}
-                placeholder={'继续追问，或描述下一步…\nEnter 发送 · Shift + Enter 换行'}
+                placeholder={'继续追问，或描述下一步…\nEnter 发送 · Shift + Enter 换行 · 可直接粘贴截图'}
                 rows={2}
                 onChange={(e) => setInput(e.target.value)}
+                onPaste={onComposerPaste}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && !e.shiftKey) {
                     e.preventDefault()
@@ -3892,7 +4227,7 @@ export default function App() {
                   {/* 发送 → 中止：同一个按钮 + 同一个 svg，形状逐帧变形（不换元素，动画不闪）*/}
                   <button
                     className={`send-btn${busy ? ' stop' : ''}`}
-                    disabled={busy ? stopping : !input.trim()}
+                    disabled={busy ? stopping : !input.trim() && !canSendImage}
                     onClick={busy ? stop : send}
                     title={busy ? (stopping ? '正在停止…' : '停止任务') : '发送'}
                     aria-label={busy ? '停止任务' : '发送'}
@@ -3926,9 +4261,25 @@ export default function App() {
             </div>
           )}
         </main>
-        </>
+          </div>
+        ) : page === 'chat' ? (
+          !workspaceReady ? (
+            <div className="workspace-gate is-booting">
+              <div className="workspace-gate-boot">
+                <span className="ws-spinner" />
+                <span>正在载入工作区…</span>
+              </div>
+            </div>
+          ) : (
+            <WorkspaceGate
+              onPick={openWorkspace}
+              onOpen={switchTo}
+              recent={gateWs}
+              switching={!!wsSwitching}
+            />
           )
-        ) : page === 'tasks' ? (
+        ) : null}
+        {page === 'tasks' ? (
           <TasksPage notify={setToast} setConfirm={setConfirm} settingsData={settingsData} workspace={workspace} />
         ) : page === 'hub' ? (
           <section className="skill-hub-page">
@@ -4258,6 +4609,23 @@ export default function App() {
                 知道了
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* 图片大图预览：输入区缩略图与消息内图片共用；点击遮罩 / Esc 关闭 */}
+      {previewImage && (
+        <div className="img-preview-mask" onClick={() => setPreviewImage(null)}>
+          <img
+            className="img-preview-img"
+            src={previewImage.dataUrl}
+            alt={previewImage.name || '图片'}
+            onClick={(e) => e.stopPropagation()}
+          />
+          <div className="img-preview-cap">
+            {previewImage.name || '图片'}
+            {previewImage.width ? ` · ${previewImage.width}×${previewImage.height}` : ''}
+            {previewImage.bytes ? ` · ${formatBytes(previewImage.bytes)}` : ''}
           </div>
         </div>
       )}
@@ -7921,7 +8289,7 @@ const SubagentCard = memo(function SubagentCard({ part, parentSid }) {
   )
 })
 
-const MessageView = memo(function MessageView({ m, showName = true, onCopy, onUndo, canUndo, gitAvailable, busy, readOnly, parentSid }) {
+const MessageView = memo(function MessageView({ m, showName = true, onCopy, onUndo, canUndo, gitAvailable, busy, readOnly, parentSid, onPreviewImage }) {
   const mdText = m.parts.filter((p) => p.type === 'text').map((p) => p.text || '').join('\n')
   // 子智能体通知条必须在 user/assistant 分支【之前】返回：否则 role='system' 会落进 assistant 分支，
   // 由于它没有 text part（mdText 为空）而渲染成一个空白气泡（设计 §5.4(d) 第 2 点 / v3-B-3）
@@ -7959,6 +8327,22 @@ const MessageView = memo(function MessageView({ m, showName = true, onCopy, onUn
         )}
         <div className="bubble user">
           {m.parts.map((p, i) => (p.type === 'text' ? <div key={i}>{p.text}</div> : null))}
+          {m.parts.some((p) => p.type === 'image') ? (
+            <div className="bubble-images">
+              {m.parts
+                .filter((p) => p.type === 'image' && p.dataUrl)
+                .map((p, i) => (
+                  <img
+                    key={'img' + i}
+                    className="bubble-image"
+                    src={p.dataUrl}
+                    alt={p.name || '图片'}
+                    title={`${p.name || '图片'}（点击查看大图）`}
+                    onClick={() => onPreviewImage && onPreviewImage(p)}
+                  />
+                ))}
+            </div>
+          ) : null}
         </div>
       </div>
     )
@@ -7972,7 +8356,16 @@ const MessageView = memo(function MessageView({ m, showName = true, onCopy, onUn
             XWORK
           </div>
         ) : null}
-        {m.error && !m.aborted && <div className="msg-error">回复失败：{m.error}</div>}
+        {m.error && !m.aborted && (
+          <div className="msg-error">
+            回复失败：{m.error}
+            {/* 模型不支持图片时的可读提示（设计 §10.2）：只在错误文案命中视觉相关关键词时补一句，
+                避免把普通错误也归因到图片上 */}
+            {/image|vision|multimodal|content[- ]type|unsupported.*(media|modality)/i.test(String(m.error)) ? (
+              <div className="msg-error-hint">当前模型可能不支持图片输入，请在设置中换用支持视觉的模型。</div>
+            ) : null}
+          </div>
+        )}
         {m.parts.map((p, i) => {
           if (p.type === 'text') return null // 文本统一由下方 TextBlock 渲染
           if (p.type === 'reasoning') {

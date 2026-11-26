@@ -280,13 +280,19 @@ class Bridge {
   // 体形自适应：V2 各构建 prompt 体不同 —— opencode2 2.6+ 为扁平 {text}；
   // 1.18.x 的 V2 兼容层为嵌套 {prompt:{text}}（实测报错 Missing key at ["prompt"]）。
   // 首次调用探测并记住可用形态，后续直接使用。
-  // skills：可选，显式附件技能列表（传 [] 用于尝试抑制引擎按提示词意图自动注入的 prompt-mode 技能，见 R11）
-  async prompt(sessionID, text, skills) {
+  // opts.files：图片等附件 [{uri:'data:image/...;base64,...', name}]。两种体形都必须带，
+  //   否则旧构建上图片会被静默丢弃（设计文档 §7.4）。
+  // opts.skills：可选，显式附件技能列表（传 [] 用于尝试抑制引擎按提示词意图自动注入的 prompt-mode 技能，见 R11）
+  async prompt(sessionID, text, opts = {}) {
+    // 兼容旧的「直接传 skills 数组」调用形态
+    const o = Array.isArray(opts) ? { skills: opts } : opts || {}
+    const { files, skills } = o
     const styles = this._promptStyle ? [this._promptStyle] : ['flat', 'nested']
     let lastErr = null
     for (const style of styles) {
       try {
         const body = style === 'flat' ? { text } : { prompt: { text } }
+        if (Array.isArray(files) && files.length) body.files = files
         if (Array.isArray(skills)) body.skills = skills
         const data = await this._req('POST', `/api/session/${sessionID}/prompt`, body)
         if (this._promptStyle !== style) {
@@ -305,10 +311,10 @@ class Bridge {
 
   // 同步发送消息（V1 兼容入口）：确保模型/agent 绑定 → prompt → 等待首个 step 完成 → 返回该 assistant 消息（V1 形状）
   // 实时过程仍由全局事件流推送；多 turn 任务由 session.idle（归一化自 execution.succeeded）收尾
-  async sendMessage(sessionID, text, model, agent) {
+  async sendMessage(sessionID, text, model, agent, files) {
     if (model && model.providerID && model.modelID) await this.switchModel(sessionID, model)
     const agentSwitchFailed = agent ? await this._switchAgentSafe(sessionID, agent) : null
-    await this.prompt(sessionID, text)
+    await this.prompt(sessionID, text, { files })
     // 等待首个 step 完成：优先事件等待（SSE 存活时），否则轮询兜底
     let asstID = null
     if (this._sseConnected) {
@@ -413,9 +419,22 @@ class Bridge {
     if (!e || typeof e !== 'object') return null
     const created = e.time?.created
     if (e.type === 'user') {
+      // 图片附件：引擎把 inline 附件存成 {data: 纯 base64, mime, source:{type:'inline'}, name}，
+      // 这里还原成 data URL 的 image part，渲染层与「乐观消息」走同一套渲染（设计 §7.5）
+      const parts = [{ id: e.id + '-text', type: 'text', text: e.text || '' }]
+      for (const [i, f] of (Array.isArray(e.files) ? e.files : []).entries()) {
+        if (!f || !f.data || !String(f.mime || '').startsWith('image/')) continue
+        parts.push({
+          id: `${e.id}-img${i}`,
+          type: 'image',
+          mime: String(f.mime),
+          name: f.name || '',
+          dataUrl: `data:${f.mime};base64,${f.data}`
+        })
+      }
       return {
         info: { id: e.id, role: 'user', time: { created }, sessionID: e.sessionID },
-        parts: [{ id: e.id + '-text', type: 'text', text: e.text || '' }]
+        parts
       }
     }
     if (e.type === 'assistant') {

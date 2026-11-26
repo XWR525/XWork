@@ -175,7 +175,7 @@ const taskRunner = new TaskRunner({
   notify: taskNotify, // 任务通知：任务通知开关 + 仅窗口不在前台时弹（与 maybeNotify 同决策）
   settings,
   effectiveConfig,
-  ensureGit: (dir, opts) => ensureWorkdirGit(dir, opts),
+  // 不再注入 ensureGit：任务引擎已关闭快照，任务工作区既不做 git init 也不需要 git 兜底
   mainXdgHome: xdgHome,
   onStatusChange: () => statsCounters.increment('taskRuns')
 })
@@ -1643,9 +1643,62 @@ ipcMain.handle('settings:save', async (_e, raw, restart = true) => {
   return { ok: true, applied: 'restart', reason: hot.reason }
 })
 
+// ---- 图片附件入参校验（不信任渲染层；与渲染层 imageAttach.mjs 的常量保持一致）----
+// 单位是「data URL 字符长度」（≈ base64 膨胀后的字符数），与渲染层用同一把尺子，
+// 避免两边算出不同的余量。设计文档 v1.1 §6.3：
+//   · 产品默认：单张 ≤ 4 MB、合计 ≤ 7 MB、单条 ≤ 10 张
+//   · 引擎硬约束：单图 base64 ≤ 5 MiB、单次请求体约 8 MB
+const IMAGE_MAX_COUNT = 10
+const IMAGE_MAX_ONE = 4 * 1024 * 1024
+const IMAGE_MAX_TOTAL = 8 * 1024 * 1024 // 给 7 MB 图片 + 文本/元数据留余量，仍低于引擎 ~8 MB 上限
+const IMAGE_ALLOWED_MIME = ['image/png', 'image/jpeg', 'image/webp']
+
+function sanitizeImages(raw) {
+  if (!Array.isArray(raw) || !raw.length) return []
+  const out = []
+  let total = 0
+  for (const it of raw) {
+    if (out.length >= IMAGE_MAX_COUNT) {
+      console.warn('[message:send] 图片数量超限，已丢弃多余项:', raw.length)
+      break
+    }
+    if (!it || typeof it !== 'object') continue
+    const uri = typeof it.uri === 'string' ? it.uri : ''
+    const m = /^data:(image\/[a-z]+);base64,/i.exec(uri)
+    if (!m) {
+      console.warn('[message:send] 丢弃非 data:image 附件')
+      continue
+    }
+    const mime = m[1].toLowerCase()
+    if (!IMAGE_ALLOWED_MIME.includes(mime)) {
+      console.warn('[message:send] 丢弃不支持的图片格式:', mime)
+      continue
+    }
+    if (uri.length > IMAGE_MAX_ONE) {
+      console.warn('[message:send] 丢弃超限图片，长度=', uri.length)
+      continue
+    }
+    if (total + uri.length > IMAGE_MAX_TOTAL) {
+      console.warn('[message:send] 图片合计超限，已截断')
+      break
+    }
+    total += uri.length
+    const name =
+      String(it.name || '')
+        .slice(0, 80)
+        .replace(/[\\/:*?"<>|]/g, '_') || 'image.png'
+    out.push({ uri, name })
+  }
+  if (out.length) {
+    // 只记数量与体量，绝不打印 base64（设计文档 §9）
+    console.log(`[message:send] 图片附件 ${out.length} 张，合计 ${Math.round(total / 1024)} KB`)
+  }
+  return out
+}
+
 // 发送消息：模型必须由渲染层显式指定（会话级模型，来自模型组下拉）；无有效模型时拒绝
 // 首次对话是工作区「正式成立」的节点：在此工作区发起对话即登记到注册表（幂等，重复发送只刷新最近时间）
-ipcMain.handle('message:send', async (_e, sessionID, text, model, agent) => {
+ipcMain.handle('message:send', async (_e, sessionID, text, model, agent, images) => {
   if (!model || typeof model !== 'object' || !model.providerID || !model.modelID) {
     return { ok: false, error: '未配置模型，请先在设置中配置模型组并选择模型' }
   }
@@ -1655,8 +1708,9 @@ ipcMain.handle('message:send', async (_e, sessionID, text, model, agent) => {
     console.warn('[message:send] 非法 effort variant，已丢弃:', JSON.stringify(model.variant))
     safeModel = { ...model, variant: undefined }
   }
+  const files = sanitizeImages(images)
   wsRecord(engine.workspace())
-  const result = await bridge.sendMessage(sessionID, text, safeModel, agent)
+  const result = await bridge.sendMessage(sessionID, text, safeModel, agent, files)
   settings.recordModelUsage(safeModel) // 仅成功发送的消息计入使用统计（新对话默认最常用模型）
   return result
 })
